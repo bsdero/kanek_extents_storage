@@ -7,7 +7,7 @@
  * Copyright (C) 2025 KANEK Project
  */
 
-#include "../include/kes/kes_bitmap.h"
+#include <kes/kes_bitmap.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>

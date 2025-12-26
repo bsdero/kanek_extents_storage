@@ -15,7 +15,9 @@
  * Copyright (C) 2025 KANEK Project
  */
 
-#include "kes_cache.h"
+#define _GNU_SOURCE  /* For usleep */
+
+#include <kes/kes_cache.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,7 +39,6 @@ typedef struct {
 } test_data_t;
 
 /* Global test variables */
-static kes_cache_t* g_cache = NULL;
 static int g_test_failures = 0;
 
 /* =================================================================

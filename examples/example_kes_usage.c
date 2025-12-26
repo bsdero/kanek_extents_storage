@@ -7,7 +7,7 @@
  * Copyright (C) 2025 KANEK Project
  */
 
-#include "include/kes/kes_storage.h"
+#include <kes/kes_storage.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

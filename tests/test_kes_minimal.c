@@ -9,8 +9,8 @@
 
 #define _GNU_SOURCE  /* For ftruncate */
 
-#include "../include/kes/kes_storage.h"
-#include "../include/kes/kes_bitmap.h"
+#include <kes/kes_storage.h>
+#include <kes/kes_bitmap.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

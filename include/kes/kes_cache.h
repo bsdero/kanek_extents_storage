@@ -19,10 +19,13 @@
 #ifndef KES_CACHE_H
 #define KES_CACHE_H
 
+#define _GNU_SOURCE  /* For aligned_alloc, clock_gettime */
+
 #include <stdint.h>
 #include <stddef.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {

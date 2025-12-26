@@ -16,7 +16,9 @@
  * Copyright (C) 2025 KANEK Project
  */
 
-#include "kes_cache.h"
+#define _GNU_SOURCE  /* For aligned_alloc, clock_gettime */
+
+#include <kes/kes_cache.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -214,7 +216,7 @@ static void hash_insert(kes_cache_t* cache, kes_extent_entry_t* entry) {
 /**
  * Remove extent entry from hash table
  */
-static void hash_remove(kes_cache_t* cache, kes_extent_entry_t* entry) {
+static void __attribute__((unused)) hash_remove(kes_cache_t* cache, kes_extent_entry_t* entry) {
     uint32_t hash = kes_extent_hash(&entry->id);
     uint32_t bucket_idx = hash & cache->bucket_mask;
     kes_cache_bucket_t* bucket = &cache->buckets[bucket_idx];
@@ -582,6 +584,38 @@ int kes_cache_pin_extent(kes_cache_t* cache,
 }
 
 /**
+ * Unpin extent (allow eviction)
+ */
+int kes_cache_unpin_extent(kes_cache_t* cache,
+                          const kes_extent_id_t* id) {
+    if (!cache || !id) {
+        return KES_ERROR_INVALID;
+    }
+    
+    kes_extent_entry_t* entry = hash_find(cache, id);
+    if (!entry) {
+        return KES_ERROR_NOTFOUND;
+    }
+    
+    pthread_mutex_lock(&entry->lock);
+    
+    if (entry->pin_count > 0) {
+        entry->pin_count--;
+        if (entry->pin_count == 0) {
+            entry->state &= ~KES_EXTENT_PINNED;
+            
+            pthread_mutex_lock(&cache->cache_lock);
+            cache->stats.entries_pinned--;
+            pthread_mutex_unlock(&cache->cache_lock);
+        }
+    }
+    
+    pthread_mutex_unlock(&entry->lock);
+    
+    return KES_SUCCESS;
+}
+
+/**
  * Get cache statistics
  */
 int kes_cache_get_stats(kes_cache_t* cache, kes_cache_stats_t* stats) {
@@ -592,6 +626,70 @@ int kes_cache_get_stats(kes_cache_t* cache, kes_cache_stats_t* stats) {
     pthread_mutex_lock(&cache->cache_lock);
     memcpy(stats, &cache->stats, sizeof(kes_cache_stats_t));
     pthread_mutex_unlock(&cache->cache_lock);
+    
+    return KES_SUCCESS;
+}
+
+/**
+ * Flush specific extent to disk
+ */
+int kes_cache_flush_extent(kes_cache_t* cache,
+                          const kes_extent_id_t* id) {
+    if (!cache || !id) {
+        return KES_ERROR_INVALID;
+    }
+    
+    kes_extent_entry_t* entry = hash_find(cache, id);
+    if (!entry) {
+        return KES_ERROR_NOTFOUND;
+    }
+    
+    pthread_mutex_lock(&entry->lock);
+    
+    if (entry->state & KES_EXTENT_DIRTY) {
+        if (cache->write_extent) {
+            int result = cache->write_extent(cache->config.device_handle, 
+                                           id, entry->data, entry->data_size);
+            if (result == KES_SUCCESS) {
+                entry->state &= ~KES_EXTENT_DIRTY;
+                entry->state |= KES_EXTENT_CLEAN;
+                cache->stats.bytes_written += entry->data_size;
+                cache->stats.flushes++;
+                
+                pthread_mutex_lock(&cache->cache_lock);
+                cache->stats.entries_dirty--;
+                pthread_mutex_unlock(&cache->cache_lock);
+            } else {
+                pthread_mutex_unlock(&entry->lock);
+                return KES_ERROR_IO;
+            }
+        }
+    }
+    
+    pthread_mutex_unlock(&entry->lock);
+    
+    return KES_SUCCESS;
+}
+
+/**
+ * Stop background threads and prepare for shutdown
+ */
+int kes_cache_stop(kes_cache_t* cache) {
+    if (!cache) {
+        return KES_ERROR_INVALID;
+    }
+    
+    pthread_mutex_lock(&cache->cache_lock);
+    cache->shutdown = true;
+    pthread_cond_broadcast(&cache->bg_cond);
+    pthread_mutex_unlock(&cache->cache_lock);
+    
+    /* Join background threads if they exist */
+    if (cache->bg_threads) {
+        for (int i = 0; i < cache->config.background_threads; i++) {
+            pthread_join(cache->bg_threads[i], NULL);
+        }
+    }
     
     return KES_SUCCESS;
 }
