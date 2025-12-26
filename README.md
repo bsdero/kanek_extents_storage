@@ -1,11 +1,29 @@
 # KANEK EXTENTS STORAGE (KES)
-This is a library designed for low level block/extents storage management. 
-
+This is a library designed for low level block/extents storage management. Ideal
+for filesystems, object storage, and new designs which we are exploring. 
 
 ###        KES Design and features.
 For the design of the Extents Caching Library, some features and functionalities
 will be worked on. 
 
+
+###        OBJECTIVES
+To provide a low level block/extents storage interface for data storage,
+including file systems, object storage and others new designs under exploration
+like vector storage and graph file system. 
+
+so we need to create a library which works in both x86, ARM as minimal. Also the 
+code must run in both servers and Edge Devices, like phones, tablets and others,
+providing a single and simple interface for upper layers. 
+
+### Supported Devices
+- We need this project to provide a block/extents layer, including cache for the
+next hardware:
+  -Edge devices ( tablets, smartphones, laptops)
+  -Posix Operating systems ( linux, Ios, others). Windows support is discarded.
+  -CPUs: ARM, x86 as minimum. Software should be processor and OS agnostic. 
+
+To support this is the first priority. 
 
 ####       KES Internal design      
 An extent is a group of contiguous blocks. In order to get access to an 
@@ -120,4 +138,18 @@ Operations with cache
 - alloc cache
 - free cache
  
+### Supported Devices
+- We need this project to provide a block/extents layer, including cache for the
+next hardware:
+  -Edge devices ( tablets, smartphones, laptops)
+  -Posix Operating systems ( linux, Ios, others). Windows support is discarded.
+  -CPUs: ARM, x86 as minimum
+  
+  
+### software development tools
+The provided interface should be used among all the supported platforms.
+Considerations for Edge Devices and low consumption memory is a priority.
+Build system is preferently based in GNU ( gcc, Gnu make, and others), but 
+we can use other alternatives if the first priority of the project are in 
+conflict. 
 
