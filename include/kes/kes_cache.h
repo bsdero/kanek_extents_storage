@@ -1,21 +1,3 @@
-/*
- * kes_cache.h - KANEK Extents Storage Cache Interface
- * 
- * This file defines the core caching system for KES, providing efficient
- * in-memory caching of disk extents with support for various platforms
- * including edge devices and servers.
- *
- * Features:
- * - Platform agnostic (ARM, x86, POSIX systems)
- * - Memory efficient with adaptive sizing
- * - Thread-safe operations
- * - Background cache management
- * - Configurable eviction policies (LRU, LFU)
- * - Support for pinned and dirty extents
- *
- * Copyright (C) 2025 KANEK Project
- */
-
 #ifndef KES_CACHE_H
 #define KES_CACHE_H
 
@@ -84,7 +66,7 @@ typedef struct {
     int sync_interval_ms;        /* Background sync interval */
     bool enable_prefetch;        /* Enable read-ahead prefetching */
     bool enable_compression;     /* Enable extent compression */
-    void* device_handle;         /* Storage device handle */
+    void *device_handle;         /* Storage device handle */
 } kes_cache_config_t;
 
 /* Cache statistics */
@@ -104,29 +86,29 @@ typedef struct {
 /* Extent entry (internal structure, opaque to users) */
 struct kes_extent_entry {
     kes_extent_id_t id;          /* Extent identifier */
-    void* data;                  /* Cached data buffer */
+    void *data;                  /* Cached data buffer */
     kes_extent_state_t state;    /* Current state flags */
     uint32_t ref_count;          /* Reference count */
     uint32_t pin_count;          /* Pin count */
     uint64_t access_time;        /* Last access timestamp */
     uint64_t access_count;       /* Total access count */
     size_t data_size;            /* Size of cached data */
-    
+
     /* Hash table linkage */
-    struct kes_extent_entry* hash_next;
-    struct kes_extent_entry* hash_prev;
-    
+    struct kes_extent_entry *hash_next;
+    struct kes_extent_entry *hash_prev;
+
     /* LRU/LFU list linkage */
-    struct kes_extent_entry* list_next;
-    struct kes_extent_entry* list_prev;
-    
+    struct kes_extent_entry *list_next;
+    struct kes_extent_entry *list_prev;
+
     pthread_mutex_t lock;        /* Entry-specific lock */
     pthread_cond_t cond;         /* Condition variable */
 };
 
 /* Hash table bucket */
 typedef struct {
-    kes_extent_entry_t* head;    /* First entry in bucket */
+    kes_extent_entry_t *head;    /* First entry in bucket */
     pthread_rwlock_t lock;       /* Bucket lock */
 } kes_cache_bucket_t;
 
@@ -134,33 +116,33 @@ typedef struct {
 struct kes_cache {
     kes_cache_config_t config;   /* Cache configuration */
     kes_cache_stats_t stats;     /* Runtime statistics */
-    
+
     /* Hash table for fast lookup */
-    kes_cache_bucket_t* buckets; /* Hash table buckets */
+    kes_cache_bucket_t *buckets; /* Hash table buckets */
     uint32_t bucket_count;       /* Number of buckets */
     uint32_t bucket_mask;        /* Bucket mask for hashing */
-    
+
     /* LRU/LFU lists */
-    kes_extent_entry_t* mru_head; /* Most recently used */
-    kes_extent_entry_t* lru_tail; /* Least recently used */
-    
+    kes_extent_entry_t *mru_head; /* Most recently used */
+    kes_extent_entry_t *lru_tail; /* Least recently used */
+
     /* Memory management */
-    void* memory_pool;           /* Pre-allocated memory pool */
+    void *memory_pool;           /* Pre-allocated memory pool */
     size_t pool_size;            /* Size of memory pool */
-    void* free_list;             /* Free entry list */
-    
+    void *free_list;             /* Free entry list */
+
     /* Background thread management */
-    pthread_t* bg_threads;       /* Background threads */
+    pthread_t *bg_threads;       /* Background threads */
     bool shutdown;               /* Shutdown flag */
     pthread_mutex_t cache_lock;  /* Cache-wide lock */
     pthread_cond_t bg_cond;      /* Background thread condition */
-    
+
     /* I/O callback functions */
-    int (*read_extent)(void* device, const kes_extent_id_t* id, 
-                      void* buffer, size_t size);
-    int (*write_extent)(void* device, const kes_extent_id_t* id,
-                       const void* buffer, size_t size);
-    int (*sync_device)(void* device);
+    int (*read_extent)( void *device, const kes_extent_id_t *id,
+                         void *buffer, size_t size);
+    int (*write_extent)( void *device, const kes_extent_id_t *id,
+                          const void *buffer, size_t size);
+    int (*sync_device)( void *device);
 };
 
 /* =================================================================
@@ -172,28 +154,28 @@ struct kes_cache {
  * @param config Cache configuration
  * @return Cache handle or NULL on error
  */
-kes_cache_t* kes_cache_create(const kes_cache_config_t* config);
+kes_cache_t *kes_cache_create( const kes_cache_config_t *config);
 
 /**
  * Destroy cache and free all resources
  * @param cache Cache handle
  * @return KES_SUCCESS or error code
  */
-int kes_cache_destroy(kes_cache_t* cache);
+int kes_cache_destroy( kes_cache_t *cache);
 
 /**
  * Start background cache management threads
  * @param cache Cache handle
  * @return KES_SUCCESS or error code
  */
-int kes_cache_start(kes_cache_t* cache);
+int kes_cache_start( kes_cache_t *cache);
 
 /**
  * Stop background threads and prepare for shutdown
  * @param cache Cache handle
  * @return KES_SUCCESS or error code
  */
-int kes_cache_stop(kes_cache_t* cache);
+int kes_cache_stop( kes_cache_t *cache);
 
 /* =================================================================
  * Extent Operations
@@ -206,9 +188,9 @@ int kes_cache_stop(kes_cache_t* cache);
  * @param buffer Pointer to receive data buffer
  * @return KES_SUCCESS or error code
  */
-int kes_cache_get_extent(kes_cache_t* cache, 
-                        const kes_extent_id_t* id,
-                        void** buffer);
+int kes_cache_get_extent( kes_cache_t *cache,
+                           const kes_extent_id_t *id,
+                           void **buffer);
 
 /**
  * Release extent reference (decrement ref count)
@@ -216,8 +198,8 @@ int kes_cache_get_extent(kes_cache_t* cache,
  * @param id Extent identifier
  * @return KES_SUCCESS or error code
  */
-int kes_cache_put_extent(kes_cache_t* cache,
-                        const kes_extent_id_t* id);
+int kes_cache_put_extent( kes_cache_t *cache,
+                           const kes_extent_id_t *id);
 
 /**
  * Pin extent in memory (prevent eviction)
@@ -225,8 +207,8 @@ int kes_cache_put_extent(kes_cache_t* cache,
  * @param id Extent identifier
  * @return KES_SUCCESS or error code
  */
-int kes_cache_pin_extent(kes_cache_t* cache,
-                        const kes_extent_id_t* id);
+int kes_cache_pin_extent( kes_cache_t *cache,
+                           const kes_extent_id_t *id);
 
 /**
  * Unpin extent (allow eviction)
@@ -234,8 +216,8 @@ int kes_cache_pin_extent(kes_cache_t* cache,
  * @param id Extent identifier
  * @return KES_SUCCESS or error code
  */
-int kes_cache_unpin_extent(kes_cache_t* cache,
-                          const kes_extent_id_t* id);
+int kes_cache_unpin_extent( kes_cache_t *cache,
+                             const kes_extent_id_t *id);
 
 /**
  * Mark extent as dirty (needs to be written to disk)
@@ -243,8 +225,8 @@ int kes_cache_unpin_extent(kes_cache_t* cache,
  * @param id Extent identifier
  * @return KES_SUCCESS or error code
  */
-int kes_cache_mark_dirty(kes_cache_t* cache,
-                        const kes_extent_id_t* id);
+int kes_cache_mark_dirty( kes_cache_t *cache,
+                           const kes_extent_id_t *id);
 
 /**
  * Flush specific extent to disk
@@ -252,15 +234,15 @@ int kes_cache_mark_dirty(kes_cache_t* cache,
  * @param id Extent identifier
  * @return KES_SUCCESS or error code
  */
-int kes_cache_flush_extent(kes_cache_t* cache,
-                          const kes_extent_id_t* id);
+int kes_cache_flush_extent( kes_cache_t *cache,
+                             const kes_extent_id_t *id);
 
 /**
  * Flush all dirty extents to disk (sync operation)
  * @param cache Cache handle
  * @return KES_SUCCESS or error code
  */
-int kes_cache_sync(kes_cache_t* cache);
+int kes_cache_sync( kes_cache_t *cache);
 
 /**
  * Invalidate extent (remove from cache)
@@ -268,8 +250,8 @@ int kes_cache_sync(kes_cache_t* cache);
  * @param id Extent identifier
  * @return KES_SUCCESS or error code
  */
-int kes_cache_invalidate(kes_cache_t* cache,
-                        const kes_extent_id_t* id);
+int kes_cache_invalidate( kes_cache_t *cache,
+                           const kes_extent_id_t *id);
 
 /* =================================================================
  * Cache Management and Statistics
@@ -281,14 +263,14 @@ int kes_cache_invalidate(kes_cache_t* cache,
  * @param stats Statistics structure to fill
  * @return KES_SUCCESS or error code
  */
-int kes_cache_get_stats(kes_cache_t* cache, kes_cache_stats_t* stats);
+int kes_cache_get_stats( kes_cache_t *cache, kes_cache_stats_t *stats);
 
 /**
  * Reset cache statistics
  * @param cache Cache handle
  * @return KES_SUCCESS or error code
  */
-int kes_cache_reset_stats(kes_cache_t* cache);
+int kes_cache_reset_stats( kes_cache_t *cache);
 
 /**
  * Set I/O callback functions
@@ -298,12 +280,12 @@ int kes_cache_reset_stats(kes_cache_t* cache);
  * @param sync_func Function to sync storage device
  * @return KES_SUCCESS or error code
  */
-int kes_cache_set_io_callbacks(kes_cache_t* cache,
-    int (*read_func)(void* device, const kes_extent_id_t* id,
-                    void* buffer, size_t size),
-    int (*write_func)(void* device, const kes_extent_id_t* id,
-                     const void* buffer, size_t size),
-    int (*sync_func)(void* device));
+int kes_cache_set_io_callbacks( kes_cache_t *cache,
+    int (*read_func)( void *device, const kes_extent_id_t *id,
+                       void *buffer, size_t size),
+    int (*write_func)( void *device, const kes_extent_id_t *id,
+                        const void *buffer, size_t size),
+    int (*sync_func)( void *device));
 
 /* =================================================================
  * Utility Functions
@@ -314,7 +296,7 @@ int kes_cache_set_io_callbacks(kes_cache_t* cache,
  * @param id Extent identifier
  * @return Hash value
  */
-uint32_t kes_extent_hash(const kes_extent_id_t* id);
+uint32_t kes_extent_hash( const kes_extent_id_t *id);
 
 /**
  * Compare two extent identifiers for equality
@@ -322,16 +304,16 @@ uint32_t kes_extent_hash(const kes_extent_id_t* id);
  * @param id2 Second extent identifier
  * @return true if equal, false otherwise
  */
-bool kes_extent_equal(const kes_extent_id_t* id1, 
-                     const kes_extent_id_t* id2);
+bool kes_extent_equal( const kes_extent_id_t *id1,
+                        const kes_extent_id_t *id2);
 
 /**
  * Get default cache configuration for platform
  * @param config Configuration structure to fill
  * @param is_edge_device true for edge devices, false for servers
  */
-void kes_cache_get_default_config(kes_cache_config_t* config,
-                                 bool is_edge_device);
+void kes_cache_get_default_config( kes_cache_config_t *config,
+                                    bool is_edge_device);
 
 #ifdef __cplusplus
 }

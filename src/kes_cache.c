@@ -1,21 +1,3 @@
-/*
- * kes_cache.c - KANEK Extents Storage Cache Implementation
- *
- * This file implements the core caching system for KES, providing
- * efficient in-memory caching of disk extents with thread-safe
- * operations and background cache management.
- *
- * Key features implemented:
- * - Hash table based extent lookup
- * - LRU eviction policy
- * - Thread-safe operations with fine-grained locking
- * - Background sync thread
- * - Memory pool management
- * - Adaptive cache sizing
- *
- * Copyright (C) 2025 KANEK Project
- */
-
 #define _GNU_SOURCE  /* For aligned_alloc, clock_gettime */
 
 #include <kes/kes_cache.h>
@@ -39,7 +21,7 @@
     (((size) + (align) - 1) & ~((align) - 1))
 
 #define KES_CONTAINER_OF(ptr, type, member) \
-    ((type*)((char*)(ptr) - offsetof(type, member)))
+    ((type *)((char *)(ptr) - offsetof(type, member)))
 
 /* =================================================================
  * Internal Helper Functions
@@ -48,68 +30,68 @@
 /**
  * Get current timestamp in microseconds
  */
-static uint64_t get_timestamp(void) {
+static uint64_t get_timestamp( void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+    clock_gettime( CLOCK_MONOTONIC, &ts);
+    return((uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000);
 }
 
 /**
  * Simple hash function for extent IDs
  */
-uint32_t kes_extent_hash(const kes_extent_id_t* id) {
+uint32_t kes_extent_hash( const kes_extent_id_t *id) {
     uint32_t hash = KES_CACHE_HASH_SEED;
     hash ^= (uint32_t)(id->start_block & 0xFFFFFFFF);
     hash ^= (uint32_t)(id->start_block >> 32);
     hash ^= id->block_count;
     hash ^= id->block_size;
-    
+
     /* Simple mixing to reduce collisions */
     hash = ((hash >> 16) ^ hash) * 0x45d9f3b;
     hash = ((hash >> 16) ^ hash) * 0x45d9f3b;
     hash = (hash >> 16) ^ hash;
-    
-    return hash;
+
+    return(hash);
 }
 
 /**
  * Compare extent identifiers
  */
-bool kes_extent_equal(const kes_extent_id_t* id1, 
-                     const kes_extent_id_t* id2) {
-    return (id1->start_block == id2->start_block &&
-            id1->block_count == id2->block_count &&
-            id1->block_size == id2->block_size);
+bool kes_extent_equal( const kes_extent_id_t *id1,
+                        const kes_extent_id_t *id2) {
+    return(id1->start_block == id2->start_block &&
+           id1->block_count == id2->block_count &&
+           id1->block_size == id2->block_size);
 }
 
 /**
  * Calculate extent data size
  */
-static size_t extent_data_size(const kes_extent_id_t* id) {
-    return (size_t)id->block_count * id->block_size;
+static size_t extent_data_size( const kes_extent_id_t *id) {
+    return((size_t)id->block_count * id->block_size);
 }
 
 /**
  * Initialize extent entry
  */
-static void init_extent_entry(kes_extent_entry_t* entry,
-                             const kes_extent_id_t* id) {
-    memcpy(&entry->id, id, sizeof(kes_extent_id_t));
+static void init_extent_entry( kes_extent_entry_t *entry,
+                                const kes_extent_id_t *id) {
+    memcpy( &entry->id, id, sizeof(kes_extent_id_t));
     entry->data = NULL;
     entry->state = 0;
     entry->ref_count = 0;
     entry->pin_count = 0;
     entry->access_time = get_timestamp();
     entry->access_count = 0;
-    entry->data_size = extent_data_size(id);
-    
+    entry->data_size = extent_data_size( id);
+
     entry->hash_next = NULL;
     entry->hash_prev = NULL;
     entry->list_next = NULL;
     entry->list_prev = NULL;
-    
-    pthread_mutex_init(&entry->lock, NULL);
-    pthread_cond_init(&entry->cond, NULL);
+
+    pthread_mutex_init( &entry->lock, NULL);
+    pthread_cond_init( &entry->cond, NULL);
 }
 
 /* =================================================================
@@ -119,16 +101,16 @@ static void init_extent_entry(kes_extent_entry_t* entry,
 /**
  * Add entry to head of LRU list (most recently used)
  */
-static void lru_add_head(kes_cache_t* cache, kes_extent_entry_t* entry) {
+static void lru_add_head( kes_cache_t *cache, kes_extent_entry_t *entry) {
     entry->list_next = cache->mru_head;
     entry->list_prev = NULL;
-    
-    if (cache->mru_head) {
+
+    if ( cache->mru_head != NULL) {
         cache->mru_head->list_prev = entry;
     }
     cache->mru_head = entry;
-    
-    if (!cache->lru_tail) {
+
+    if ( cache->lru_tail == NULL) {
         cache->lru_tail = entry;
     }
 }
@@ -136,19 +118,19 @@ static void lru_add_head(kes_cache_t* cache, kes_extent_entry_t* entry) {
 /**
  * Remove entry from LRU list
  */
-static void lru_remove(kes_cache_t* cache, kes_extent_entry_t* entry) {
-    if (entry->list_prev) {
+static void lru_remove( kes_cache_t *cache, kes_extent_entry_t *entry) {
+    if ( entry->list_prev != NULL) {
         entry->list_prev->list_next = entry->list_next;
     } else {
         cache->mru_head = entry->list_next;
     }
-    
-    if (entry->list_next) {
+
+    if ( entry->list_next != NULL) {
         entry->list_next->list_prev = entry->list_prev;
     } else {
         cache->lru_tail = entry->list_prev;
     }
-    
+
     entry->list_next = NULL;
     entry->list_prev = NULL;
 }
@@ -156,13 +138,13 @@ static void lru_remove(kes_cache_t* cache, kes_extent_entry_t* entry) {
 /**
  * Move entry to head of LRU list
  */
-static void lru_touch(kes_cache_t* cache, kes_extent_entry_t* entry) {
-    if (entry == cache->mru_head) {
+static void lru_touch( kes_cache_t *cache, kes_extent_entry_t *entry) {
+    if ( entry == cache->mru_head) {
         return;  /* Already at head */
     }
-    
-    lru_remove(cache, entry);
-    lru_add_head(cache, entry);
+
+    lru_remove( cache, entry);
+    lru_add_head( cache, entry);
 }
 
 /* =================================================================
@@ -172,71 +154,72 @@ static void lru_touch(kes_cache_t* cache, kes_extent_entry_t* entry) {
 /**
  * Find extent entry in hash table
  */
-static kes_extent_entry_t* hash_find(kes_cache_t* cache,
-                                     const kes_extent_id_t* id) {
-    uint32_t hash = kes_extent_hash(id);
+static kes_extent_entry_t *hash_find( kes_cache_t *cache,
+                                       const kes_extent_id_t *id) {
+    uint32_t hash = kes_extent_hash( id);
     uint32_t bucket_idx = hash & cache->bucket_mask;
-    kes_cache_bucket_t* bucket = &cache->buckets[bucket_idx];
-    
-    pthread_rwlock_rdlock(&bucket->lock);
-    
-    kes_extent_entry_t* entry = bucket->head;
-    while (entry) {
-        if (kes_extent_equal(&entry->id, id)) {
+    kes_cache_bucket_t *bucket = &cache->buckets[bucket_idx];
+
+    pthread_rwlock_rdlock( &bucket->lock);
+
+    kes_extent_entry_t *entry = bucket->head;
+    while ( entry != NULL) {
+        if ( kes_extent_equal( &entry->id, id)) {
             break;
         }
         entry = entry->hash_next;
     }
-    
-    pthread_rwlock_unlock(&bucket->lock);
-    return entry;
+
+    pthread_rwlock_unlock( &bucket->lock);
+    return(entry);
 }
 
 /**
  * Insert extent entry into hash table
  */
-static void hash_insert(kes_cache_t* cache, kes_extent_entry_t* entry) {
-    uint32_t hash = kes_extent_hash(&entry->id);
+static void hash_insert( kes_cache_t *cache, kes_extent_entry_t *entry) {
+    uint32_t hash = kes_extent_hash( &entry->id);
     uint32_t bucket_idx = hash & cache->bucket_mask;
-    kes_cache_bucket_t* bucket = &cache->buckets[bucket_idx];
-    
-    pthread_rwlock_wrlock(&bucket->lock);
-    
+    kes_cache_bucket_t *bucket = &cache->buckets[bucket_idx];
+
+    pthread_rwlock_wrlock( &bucket->lock);
+
     entry->hash_next = bucket->head;
     entry->hash_prev = NULL;
-    
-    if (bucket->head) {
+
+    if ( bucket->head != NULL) {
         bucket->head->hash_prev = entry;
     }
     bucket->head = entry;
-    
-    pthread_rwlock_unlock(&bucket->lock);
+
+    pthread_rwlock_unlock( &bucket->lock);
 }
 
 /**
  * Remove extent entry from hash table
  */
-static void __attribute__((unused)) hash_remove(kes_cache_t* cache, kes_extent_entry_t* entry) {
-    uint32_t hash = kes_extent_hash(&entry->id);
+static void __attribute__((unused)) hash_remove( kes_cache_t *cache,
+                                          kes_extent_entry_t *entry) {
+    uint32_t hash = kes_extent_hash( &entry->id);
     uint32_t bucket_idx = hash & cache->bucket_mask;
-    kes_cache_bucket_t* bucket = &cache->buckets[bucket_idx];
-    
-    pthread_rwlock_wrlock(&bucket->lock);
-    
-    if (entry->hash_prev) {
+    kes_cache_bucket_t *bucket = &cache->buckets[bucket_idx];
+
+    pthread_rwlock_wrlock( &bucket->lock);
+
+    if ( entry->hash_prev != NULL) {
         entry->hash_prev->hash_next = entry->hash_next;
     } else {
         bucket->head = entry->hash_next;
     }
-    
-    if (entry->hash_next) {
+
+    if ( entry->hash_next != NULL) {
         entry->hash_next->hash_prev = entry->hash_prev;
     }
-    
+
     entry->hash_next = NULL;
     entry->hash_prev = NULL;
-    
-    pthread_rwlock_unlock(&bucket->lock);
+
+    pthread_rwlock_unlock( &bucket->lock);
 }
 
 /* =================================================================
@@ -246,25 +229,35 @@ static void __attribute__((unused)) hash_remove(kes_cache_t* cache, kes_extent_e
 /**
  * Allocate memory for extent data
  */
-static void* extent_alloc_data(kes_cache_t* cache, size_t size) {
+/*
+ * Allocates the data buffer only -- does NOT touch
+ * cache->stats.memory_used. That accounting is cache-wide state and
+ * must be updated under cache_lock by the caller; this function's
+ * only current caller (the get_extent miss path) does not hold
+ * cache_lock across the allocation itself, so updating the stat in
+ * here raced when two misses allocated concurrently (confirmed by
+ * TSan: src/kes_cache.c:239, "data race ... in extent_alloc_data").
+ */
+static void *extent_alloc_data( kes_cache_t *cache, size_t size) {
     /* For now, use regular malloc. In production, this would use
      * the memory pool or mmap for large allocations */
+    (void)cache;
     size_t aligned_size = KES_ALIGN(size, KES_CACHE_ALIGNMENT);
-    void* ptr = aligned_alloc(KES_CACHE_ALIGNMENT, aligned_size);
-    
-    if (ptr) {
-        cache->stats.memory_used += aligned_size;
-    }
-    
-    return ptr;
+
+    return( aligned_alloc( KES_CACHE_ALIGNMENT, aligned_size));
 }
 
-/**
- * Free extent data memory
+/*
+ * Frees the data buffer and updates cache->stats.memory_used.
+ * Unlike extent_alloc_data(), this does its own stats update
+ * in-place because its only current caller (kes_cache_destroy)
+ * already holds cache_lock across the whole call; a future caller
+ * that does not hold cache_lock must take it before calling this.
  */
-static void extent_free_data(kes_cache_t* cache, void* ptr, size_t size) {
-    if (ptr) {
-        free(ptr);
+static void extent_free_data( kes_cache_t *cache, void *ptr,
+                               size_t size) {
+    if ( ptr != NULL) {
+        free( ptr);
         size_t aligned_size = KES_ALIGN(size, KES_CACHE_ALIGNMENT);
         cache->stats.memory_used -= aligned_size;
     }
@@ -277,11 +270,11 @@ static void extent_free_data(kes_cache_t* cache, void* ptr, size_t size) {
 /**
  * Get default cache configuration
  */
-void kes_cache_get_default_config(kes_cache_config_t* config,
-                                 bool is_edge_device) {
-    memset(config, 0, sizeof(kes_cache_config_t));
-    
-    if (is_edge_device) {
+void kes_cache_get_default_config( kes_cache_config_t *config,
+                                    bool is_edge_device) {
+    memset( config, 0, sizeof(kes_cache_config_t));
+
+    if ( is_edge_device) {
         config->max_memory = 8 * 1024 * 1024;      /* 8MB */
         config->min_memory = 2 * 1024 * 1024;      /* 2MB */
         config->max_entries = 256;
@@ -294,7 +287,7 @@ void kes_cache_get_default_config(kes_cache_config_t* config,
         config->background_threads = 4;
         config->sync_interval_ms = 1000;           /* 1 second */
     }
-    
+
     config->policy = KES_CACHE_LRU;
     config->enable_prefetch = true;
     config->enable_compression = false;
@@ -304,415 +297,450 @@ void kes_cache_get_default_config(kes_cache_config_t* config,
 /**
  * Create cache instance
  */
-kes_cache_t* kes_cache_create(const kes_cache_config_t* config) {
-    if (!config || config->max_memory < KES_CACHE_MIN_MEMORY ||
+kes_cache_t *kes_cache_create( const kes_cache_config_t *config) {
+    if ( config == NULL || config->max_memory < KES_CACHE_MIN_MEMORY ||
         config->max_entries < KES_CACHE_MIN_ENTRIES) {
-        return NULL;
+        return(NULL);
     }
-    
-    kes_cache_t* cache = calloc(1, sizeof(kes_cache_t));
-    if (!cache) {
-        return NULL;
+
+    kes_cache_t *cache = calloc( 1, sizeof(kes_cache_t));
+    if ( cache == NULL) {
+        return(NULL);
     }
-    
+
     /* Copy configuration */
-    memcpy(&cache->config, config, sizeof(kes_cache_config_t));
-    
+    memcpy( &cache->config, config, sizeof(kes_cache_config_t));
+
     /* Initialize hash table */
     cache->bucket_count = KES_CACHE_DEFAULT_BUCKETS;
     cache->bucket_mask = cache->bucket_count - 1;
-    cache->buckets = calloc(cache->bucket_count, 
-                           sizeof(kes_cache_bucket_t));
-    if (!cache->buckets) {
-        free(cache);
-        return NULL;
+    cache->buckets = calloc( cache->bucket_count,
+                              sizeof(kes_cache_bucket_t));
+    if ( cache->buckets == NULL) {
+        free( cache);
+        return(NULL);
     }
-    
+
     /* Initialize bucket locks */
-    for (uint32_t i = 0; i < cache->bucket_count; i++) {
-        pthread_rwlock_init(&cache->buckets[i].lock, NULL);
+    for ( uint32_t i = 0; i < cache->bucket_count; i++) {
+        pthread_rwlock_init( &cache->buckets[i].lock, NULL);
     }
-    
+
     /* Initialize cache lock and condition variables */
-    pthread_mutex_init(&cache->cache_lock, NULL);
-    pthread_cond_init(&cache->bg_cond, NULL);
-    
+    pthread_mutex_init( &cache->cache_lock, NULL);
+    pthread_cond_init( &cache->bg_cond, NULL);
+
     /* Initialize LRU list pointers */
     cache->mru_head = NULL;
     cache->lru_tail = NULL;
-    
+
     /* Initialize statistics */
-    memset(&cache->stats, 0, sizeof(kes_cache_stats_t));
-    
+    memset( &cache->stats, 0, sizeof(kes_cache_stats_t));
+
     cache->shutdown = false;
-    
-    return cache;
+
+    return(cache);
 }
 
 /**
  * Destroy cache
  */
-int kes_cache_destroy(kes_cache_t* cache) {
-    if (!cache) {
-        return KES_ERROR_INVALID;
+int kes_cache_destroy( kes_cache_t *cache) {
+    if ( cache == NULL) {
+        return(KES_ERROR_INVALID);
     }
-    
+
     /* Stop background threads first */
-    kes_cache_stop(cache);
-    
+    kes_cache_stop( cache);
+
     /* Free all cached entries */
-    pthread_mutex_lock(&cache->cache_lock);
-    
-    kes_extent_entry_t* entry = cache->mru_head;
-    while (entry) {
-        kes_extent_entry_t* next = entry->list_next;
-        
+    pthread_mutex_lock( &cache->cache_lock);
+
+    kes_extent_entry_t *entry = cache->mru_head;
+    while ( entry != NULL) {
+        kes_extent_entry_t *next = entry->list_next;
+
         /* Free entry data */
-        if (entry->data) {
-            extent_free_data(cache, entry->data, entry->data_size);
+        if ( entry->data != NULL) {
+            extent_free_data( cache, entry->data, entry->data_size);
         }
-        
+
         /* Cleanup entry locks */
-        pthread_mutex_destroy(&entry->lock);
-        pthread_cond_destroy(&entry->cond);
-        
-        free(entry);
+        pthread_mutex_destroy( &entry->lock);
+        pthread_cond_destroy( &entry->cond);
+
+        free( entry);
         entry = next;
     }
-    
-    pthread_mutex_unlock(&cache->cache_lock);
-    
+
+    pthread_mutex_unlock( &cache->cache_lock);
+
     /* Cleanup hash table */
-    for (uint32_t i = 0; i < cache->bucket_count; i++) {
-        pthread_rwlock_destroy(&cache->buckets[i].lock);
+    for ( uint32_t i = 0; i < cache->bucket_count; i++) {
+        pthread_rwlock_destroy( &cache->buckets[i].lock);
     }
-    free(cache->buckets);
-    
+    free( cache->buckets);
+
     /* Cleanup cache locks */
-    pthread_mutex_destroy(&cache->cache_lock);
-    pthread_cond_destroy(&cache->bg_cond);
-    
+    pthread_mutex_destroy( &cache->cache_lock);
+    pthread_cond_destroy( &cache->bg_cond);
+
     /* Free background threads array */
-    if (cache->bg_threads) {
-        free(cache->bg_threads);
+    if ( cache->bg_threads != NULL) {
+        free( cache->bg_threads);
     }
-    
-    free(cache);
-    return KES_SUCCESS;
+
+    free( cache);
+    return(KES_SUCCESS);
 }
 
 /**
  * Get extent from cache
  */
-int kes_cache_get_extent(kes_cache_t* cache, 
-                        const kes_extent_id_t* id,
-                        void** buffer) {
-    if (!cache || !id || !buffer) {
-        return KES_ERROR_INVALID;
+int kes_cache_get_extent( kes_cache_t *cache,
+                           const kes_extent_id_t *id,
+                           void **buffer) {
+    if ( cache == NULL || id == NULL || buffer == NULL) {
+        return(KES_ERROR_INVALID);
     }
-    
+
     *buffer = NULL;
-    
+
     /* Look up extent in hash table */
-    kes_extent_entry_t* entry = hash_find(cache, id);
-    
-    if (entry) {
+    kes_extent_entry_t *entry = hash_find( cache, id);
+
+    if ( entry != NULL) {
         /* Cache hit */
-        pthread_mutex_lock(&entry->lock);
-        
+        pthread_mutex_lock( &entry->lock);
+
         /* Wait if entry is being loaded */
-        while (entry->state & KES_EXTENT_LOADING) {
-            pthread_cond_wait(&entry->cond, &entry->lock);
+        while ( entry->state & KES_EXTENT_LOADING) {
+            pthread_cond_wait( &entry->cond, &entry->lock);
         }
-        
-        if (entry->state & KES_EXTENT_ERROR) {
-            pthread_mutex_unlock(&entry->lock);
-            return KES_ERROR_IO;
+
+        if ( entry->state & KES_EXTENT_ERROR) {
+            pthread_mutex_unlock( &entry->lock);
+            return(KES_ERROR_IO);
         }
-        
+
         entry->ref_count++;
         entry->access_time = get_timestamp();
         entry->access_count++;
         *buffer = entry->data;
-        
-        pthread_mutex_unlock(&entry->lock);
-        
+
+        pthread_mutex_unlock( &entry->lock);
+
         /* Update LRU position */
-        pthread_mutex_lock(&cache->cache_lock);
-        lru_touch(cache, entry);
+        pthread_mutex_lock( &cache->cache_lock);
+        lru_touch( cache, entry);
         cache->stats.hits++;
-        pthread_mutex_unlock(&cache->cache_lock);
-        
-        return KES_SUCCESS;
+        pthread_mutex_unlock( &cache->cache_lock);
+
+        return(KES_SUCCESS);
     }
-    
-    /* Cache miss - need to load from disk */
+
+    /*
+     * Cache miss - need to load from disk. stats.misses is
+     * cache-wide state and must be updated under cache_lock; it was
+     * previously incremented with no lock at all, racing against
+     * concurrent hits/misses on other entries.
+     */
+    pthread_mutex_lock( &cache->cache_lock);
     cache->stats.misses++;
-    
+    pthread_mutex_unlock( &cache->cache_lock);
+
     /* Create new entry */
-    entry = calloc(1, sizeof(kes_extent_entry_t));
-    if (!entry) {
-        return KES_ERROR_NOMEM;
+    entry = calloc( 1, sizeof(kes_extent_entry_t));
+    if ( entry == NULL) {
+        return(KES_ERROR_NOMEM);
     }
-    
-    init_extent_entry(entry, id);
+
+    init_extent_entry( entry, id);
     entry->state = KES_EXTENT_LOADING;
     entry->ref_count = 1;
-    
+
     /* Allocate data buffer */
-    entry->data = extent_alloc_data(cache, entry->data_size);
-    if (!entry->data) {
-        free(entry);
-        return KES_ERROR_NOMEM;
+    entry->data = extent_alloc_data( cache, entry->data_size);
+    if ( entry->data == NULL) {
+        free( entry);
+        return(KES_ERROR_NOMEM);
     }
-    
+
     /* Insert into hash table and LRU list */
-    hash_insert(cache, entry);
-    
-    pthread_mutex_lock(&cache->cache_lock);
-    lru_add_head(cache, entry);
+    hash_insert( cache, entry);
+
+    /*
+     * entries_cached and memory_used are also cache-wide state;
+     * memory_used was previously updated inside extent_alloc_data()
+     * with no lock held at all at this call site (see comments on
+     * extent_alloc_data() above) -- same bug class as stats.misses.
+     */
+    pthread_mutex_lock( &cache->cache_lock);
+    lru_add_head( cache, entry);
     cache->stats.entries_cached++;
-    pthread_mutex_unlock(&cache->cache_lock);
-    
+    cache->stats.memory_used +=
+        KES_ALIGN( entry->data_size, KES_CACHE_ALIGNMENT);
+    pthread_mutex_unlock( &cache->cache_lock);
+
     /* Load data from disk */
     int result = KES_SUCCESS;
-    if (cache->read_extent) {
-        result = cache->read_extent(cache->config.device_handle, id,
-                                   entry->data, entry->data_size);
+    if ( cache->read_extent != NULL) {
+        result = cache->read_extent( cache->config.device_handle, id,
+                                      entry->data, entry->data_size);
     }
-    
-    pthread_mutex_lock(&entry->lock);
-    
-    if (result == KES_SUCCESS) {
+
+    pthread_mutex_lock( &entry->lock);
+
+    if ( result == KES_SUCCESS) {
         entry->state = KES_EXTENT_CLEAN;
-        cache->stats.bytes_read += entry->data_size;
         *buffer = entry->data;
     } else {
         entry->state = KES_EXTENT_ERROR;
         result = KES_ERROR_IO;
     }
-    
+
     /* Wake up any waiting threads */
-    pthread_cond_broadcast(&entry->cond);
-    pthread_mutex_unlock(&entry->lock);
-    
-    return result;
+    pthread_cond_broadcast( &entry->cond);
+    pthread_mutex_unlock( &entry->lock);
+
+    /*
+     * stats.bytes_read is cache-wide, not per-entry -- it must be
+     * protected by cache_lock, not entry->lock. Updating it while
+     * only entry->lock was held let two threads populating
+     * different misses race on the same counter (confirmed by
+     * TSan: src/kes_cache.c:472, "data race ... in
+     * kes_cache_get_extent").
+     */
+    if ( result == KES_SUCCESS) {
+        pthread_mutex_lock( &cache->cache_lock);
+        cache->stats.bytes_read += entry->data_size;
+        pthread_mutex_unlock( &cache->cache_lock);
+    }
+
+    return(result);
 }
 
 /**
  * Release extent reference
  */
-int kes_cache_put_extent(kes_cache_t* cache,
-                        const kes_extent_id_t* id) {
-    if (!cache || !id) {
-        return KES_ERROR_INVALID;
+int kes_cache_put_extent( kes_cache_t *cache,
+                           const kes_extent_id_t *id) {
+    if ( cache == NULL || id == NULL) {
+        return(KES_ERROR_INVALID);
     }
-    
-    kes_extent_entry_t* entry = hash_find(cache, id);
-    if (!entry) {
-        return KES_ERROR_NOTFOUND;
+
+    kes_extent_entry_t *entry = hash_find( cache, id);
+    if ( entry == NULL) {
+        return(KES_ERROR_NOTFOUND);
     }
-    
-    pthread_mutex_lock(&entry->lock);
-    
-    if (entry->ref_count > 0) {
+
+    pthread_mutex_lock( &entry->lock);
+
+    if ( entry->ref_count > 0) {
         entry->ref_count--;
     }
-    
-    pthread_mutex_unlock(&entry->lock);
-    
-    return KES_SUCCESS;
+
+    pthread_mutex_unlock( &entry->lock);
+
+    return(KES_SUCCESS);
 }
 
 /**
  * Mark extent as dirty
  */
-int kes_cache_mark_dirty(kes_cache_t* cache,
-                        const kes_extent_id_t* id) {
-    if (!cache || !id) {
-        return KES_ERROR_INVALID;
+int kes_cache_mark_dirty( kes_cache_t *cache,
+                           const kes_extent_id_t *id) {
+    if ( cache == NULL || id == NULL) {
+        return(KES_ERROR_INVALID);
     }
-    
-    kes_extent_entry_t* entry = hash_find(cache, id);
-    if (!entry) {
-        return KES_ERROR_NOTFOUND;
+
+    kes_extent_entry_t *entry = hash_find( cache, id);
+    if ( entry == NULL) {
+        return(KES_ERROR_NOTFOUND);
     }
-    
-    pthread_mutex_lock(&entry->lock);
-    
-    if (!(entry->state & KES_EXTENT_DIRTY)) {
+
+    pthread_mutex_lock( &entry->lock);
+
+    if ( !(entry->state & KES_EXTENT_DIRTY)) {
         entry->state |= KES_EXTENT_DIRTY;
-        
-        pthread_mutex_lock(&cache->cache_lock);
+
+        pthread_mutex_lock( &cache->cache_lock);
         cache->stats.entries_dirty++;
-        pthread_mutex_unlock(&cache->cache_lock);
+        pthread_mutex_unlock( &cache->cache_lock);
     }
-    
-    pthread_mutex_unlock(&entry->lock);
-    
-    return KES_SUCCESS;
+
+    pthread_mutex_unlock( &entry->lock);
+
+    return(KES_SUCCESS);
 }
 
 /**
  * Pin extent in memory
  */
-int kes_cache_pin_extent(kes_cache_t* cache,
-                        const kes_extent_id_t* id) {
-    if (!cache || !id) {
-        return KES_ERROR_INVALID;
+int kes_cache_pin_extent( kes_cache_t *cache,
+                           const kes_extent_id_t *id) {
+    if ( cache == NULL || id == NULL) {
+        return(KES_ERROR_INVALID);
     }
-    
-    kes_extent_entry_t* entry = hash_find(cache, id);
-    if (!entry) {
-        return KES_ERROR_NOTFOUND;
+
+    kes_extent_entry_t *entry = hash_find( cache, id);
+    if ( entry == NULL) {
+        return(KES_ERROR_NOTFOUND);
     }
-    
-    pthread_mutex_lock(&entry->lock);
-    
-    if (entry->pin_count == 0) {
+
+    pthread_mutex_lock( &entry->lock);
+
+    if ( entry->pin_count == 0) {
         entry->state |= KES_EXTENT_PINNED;
-        
-        pthread_mutex_lock(&cache->cache_lock);
+
+        pthread_mutex_lock( &cache->cache_lock);
         cache->stats.entries_pinned++;
-        pthread_mutex_unlock(&cache->cache_lock);
+        pthread_mutex_unlock( &cache->cache_lock);
     }
     entry->pin_count++;
-    
-    pthread_mutex_unlock(&entry->lock);
-    
-    return KES_SUCCESS;
+
+    pthread_mutex_unlock( &entry->lock);
+
+    return(KES_SUCCESS);
 }
 
 /**
  * Unpin extent (allow eviction)
  */
-int kes_cache_unpin_extent(kes_cache_t* cache,
-                          const kes_extent_id_t* id) {
-    if (!cache || !id) {
-        return KES_ERROR_INVALID;
+int kes_cache_unpin_extent( kes_cache_t *cache,
+                             const kes_extent_id_t *id) {
+    if ( cache == NULL || id == NULL) {
+        return(KES_ERROR_INVALID);
     }
-    
-    kes_extent_entry_t* entry = hash_find(cache, id);
-    if (!entry) {
-        return KES_ERROR_NOTFOUND;
+
+    kes_extent_entry_t *entry = hash_find( cache, id);
+    if ( entry == NULL) {
+        return(KES_ERROR_NOTFOUND);
     }
-    
-    pthread_mutex_lock(&entry->lock);
-    
-    if (entry->pin_count > 0) {
+
+    pthread_mutex_lock( &entry->lock);
+
+    if ( entry->pin_count > 0) {
         entry->pin_count--;
-        if (entry->pin_count == 0) {
+        if ( entry->pin_count == 0) {
             entry->state &= ~KES_EXTENT_PINNED;
-            
-            pthread_mutex_lock(&cache->cache_lock);
+
+            pthread_mutex_lock( &cache->cache_lock);
             cache->stats.entries_pinned--;
-            pthread_mutex_unlock(&cache->cache_lock);
+            pthread_mutex_unlock( &cache->cache_lock);
         }
     }
-    
-    pthread_mutex_unlock(&entry->lock);
-    
-    return KES_SUCCESS;
+
+    pthread_mutex_unlock( &entry->lock);
+
+    return(KES_SUCCESS);
 }
 
 /**
  * Get cache statistics
  */
-int kes_cache_get_stats(kes_cache_t* cache, kes_cache_stats_t* stats) {
-    if (!cache || !stats) {
-        return KES_ERROR_INVALID;
+int kes_cache_get_stats( kes_cache_t *cache, kes_cache_stats_t *stats) {
+    if ( cache == NULL || stats == NULL) {
+        return(KES_ERROR_INVALID);
     }
-    
-    pthread_mutex_lock(&cache->cache_lock);
-    memcpy(stats, &cache->stats, sizeof(kes_cache_stats_t));
-    pthread_mutex_unlock(&cache->cache_lock);
-    
-    return KES_SUCCESS;
+
+    pthread_mutex_lock( &cache->cache_lock);
+    memcpy( stats, &cache->stats, sizeof(kes_cache_stats_t));
+    pthread_mutex_unlock( &cache->cache_lock);
+
+    return(KES_SUCCESS);
 }
 
 /**
  * Flush specific extent to disk
  */
-int kes_cache_flush_extent(kes_cache_t* cache,
-                          const kes_extent_id_t* id) {
-    if (!cache || !id) {
-        return KES_ERROR_INVALID;
+int kes_cache_flush_extent( kes_cache_t *cache,
+                             const kes_extent_id_t *id) {
+    if ( cache == NULL || id == NULL) {
+        return(KES_ERROR_INVALID);
     }
-    
-    kes_extent_entry_t* entry = hash_find(cache, id);
-    if (!entry) {
-        return KES_ERROR_NOTFOUND;
+
+    kes_extent_entry_t *entry = hash_find( cache, id);
+    if ( entry == NULL) {
+        return(KES_ERROR_NOTFOUND);
     }
-    
-    pthread_mutex_lock(&entry->lock);
-    
-    if (entry->state & KES_EXTENT_DIRTY) {
-        if (cache->write_extent) {
-            int result = cache->write_extent(cache->config.device_handle, 
-                                           id, entry->data, entry->data_size);
-            if (result == KES_SUCCESS) {
+
+    pthread_mutex_lock( &entry->lock);
+
+    if ( entry->state & KES_EXTENT_DIRTY) {
+        if ( cache->write_extent != NULL) {
+            int result = cache->write_extent( cache->config.device_handle,
+                                               id, entry->data,
+                                               entry->data_size);
+            if ( result == KES_SUCCESS) {
                 entry->state &= ~KES_EXTENT_DIRTY;
                 entry->state |= KES_EXTENT_CLEAN;
+
+                /*
+                 * bytes_written/flushes/entries_dirty are all
+                 * cache-wide state; bytes_written and flushes were
+                 * previously updated outside cache_lock (same bug
+                 * class fixed elsewhere in this file for
+                 * bytes_read/misses/memory_used).
+                 */
+                pthread_mutex_lock( &cache->cache_lock);
                 cache->stats.bytes_written += entry->data_size;
                 cache->stats.flushes++;
-                
-                pthread_mutex_lock(&cache->cache_lock);
                 cache->stats.entries_dirty--;
-                pthread_mutex_unlock(&cache->cache_lock);
+                pthread_mutex_unlock( &cache->cache_lock);
             } else {
-                pthread_mutex_unlock(&entry->lock);
-                return KES_ERROR_IO;
+                pthread_mutex_unlock( &entry->lock);
+                return(KES_ERROR_IO);
             }
         }
     }
-    
-    pthread_mutex_unlock(&entry->lock);
-    
-    return KES_SUCCESS;
+
+    pthread_mutex_unlock( &entry->lock);
+
+    return(KES_SUCCESS);
 }
 
 /**
  * Stop background threads and prepare for shutdown
  */
-int kes_cache_stop(kes_cache_t* cache) {
-    if (!cache) {
-        return KES_ERROR_INVALID;
+int kes_cache_stop( kes_cache_t *cache) {
+    if ( cache == NULL) {
+        return(KES_ERROR_INVALID);
     }
-    
-    pthread_mutex_lock(&cache->cache_lock);
+
+    pthread_mutex_lock( &cache->cache_lock);
     cache->shutdown = true;
-    pthread_cond_broadcast(&cache->bg_cond);
-    pthread_mutex_unlock(&cache->cache_lock);
-    
+    pthread_cond_broadcast( &cache->bg_cond);
+    pthread_mutex_unlock( &cache->cache_lock);
+
     /* Join background threads if they exist */
-    if (cache->bg_threads) {
-        for (int i = 0; i < cache->config.background_threads; i++) {
-            pthread_join(cache->bg_threads[i], NULL);
+    if ( cache->bg_threads != NULL) {
+        for ( int i = 0; i < cache->config.background_threads; i++) {
+            pthread_join( cache->bg_threads[i], NULL);
         }
     }
-    
-    return KES_SUCCESS;
+
+    return(KES_SUCCESS);
 }
 
 /**
  * Set I/O callback functions
  */
-int kes_cache_set_io_callbacks(kes_cache_t* cache,
-    int (*read_func)(void* device, const kes_extent_id_t* id,
-                    void* buffer, size_t size),
-    int (*write_func)(void* device, const kes_extent_id_t* id,
-                     const void* buffer, size_t size),
-    int (*sync_func)(void* device)) {
-    
-    if (!cache) {
-        return KES_ERROR_INVALID;
+int kes_cache_set_io_callbacks( kes_cache_t *cache,
+    int (*read_func)( void *device, const kes_extent_id_t *id,
+                       void *buffer, size_t size),
+    int (*write_func)( void *device, const kes_extent_id_t *id,
+                        const void *buffer, size_t size),
+    int (*sync_func)( void *device)) {
+    if ( cache == NULL) {
+        return(KES_ERROR_INVALID);
     }
-    
+
     cache->read_extent = read_func;
     cache->write_extent = write_func;
     cache->sync_device = sync_func;
-    
-    return KES_SUCCESS;
+
+    return(KES_SUCCESS);
 }
 
 /* Background thread and other functions would be implemented here...

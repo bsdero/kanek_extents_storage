@@ -13,14 +13,23 @@ TEST_DIR = tests
 EXAMPLES_DIR = examples
 DOCS_DIR = docs
 
+# kanek_foundations (KFL) sibling repo -- provides trace.h and other
+# foundation facilities. Cloned automatically by the foundations-fetch
+# target if not already checked out next to this repo.
+FOUNDATIONS_DIR = ../kanek_foundations
+FOUNDATIONS_SRC = $(FOUNDATIONS_DIR)/src
+FOUNDATIONS_LIB = $(FOUNDATIONS_SRC)/libkfl.a
+FOUNDATIONS_REPO = https://github.com/bsdero/kanek_foundations.git
+FOUNDATIONS_CFLAGS = -Wall -DUSER_SPACE -g
+
 # Compiler and flags
 CC = gcc
 CFLAGS = -std=c99 -Wall -Wextra -Werror -fPIC
-LDFLAGS = 
+LDFLAGS =
 LIBS = -lpthread
 
 # Include paths
-INCLUDES = -I$(INC_DIR)
+INCLUDES = -I$(INC_DIR) -I$(FOUNDATIONS_SRC)
 
 # Build configuration
 ifdef DEBUG
@@ -54,7 +63,27 @@ EXAMPLE_TARGETS = $(EXAMPLE_SOURCES:$(EXAMPLES_DIR)/%.c=$(BUILD_DIR)/examples/%)
 
 # Default target
 .PHONY: all
-all: $(STATIC_LIB) $(SHARED_LIB)
+all: foundations-fetch $(STATIC_LIB) $(SHARED_LIB)
+
+# Clone kanek_foundations next to this repo if it isn't there yet.
+# Only fetches -- does not build it. Needed so -I$(FOUNDATIONS_SRC)
+# resolves (e.g. trace.h) even before any code links libkfl.a.
+.PHONY: foundations-fetch
+foundations-fetch:
+	@if [ ! -d $(FOUNDATIONS_DIR) ]; then \
+		echo "kanek_foundations not found at $(FOUNDATIONS_DIR)," \
+		     "cloning..."; \
+		git clone $(FOUNDATIONS_REPO) $(FOUNDATIONS_DIR); \
+	fi
+
+# Build libkfl.a from the sibling checkout, using whichever CFLAGS
+# this invocation needs (plain, ASan, or TSan) so instrumentation
+# matches whatever KES itself is being built with. Not a prerequisite
+# of "all" -- only built on demand once code actually links it.
+.PHONY: foundations
+foundations: foundations-fetch
+	$(MAKE) -C $(FOUNDATIONS_SRC) clean all \
+	    CFLAGS="$(FOUNDATIONS_CFLAGS)"
 
 # Create build directories
 $(BUILD_DIR):
@@ -130,6 +159,76 @@ run-example: examples
 .PHONY: debug
 debug:
 	$(MAKE) DEBUG=1
+
+# Sanitizer build variants (KES_HARDENING_PLAN.md Phase 2). ASan and
+# TSan cannot share a binary, so each does a full clean rebuild with
+# its own flags, then actually runs every test binary -- a variant
+# that "builds clean" but was never executed proves nothing.
+ASAN_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer -g
+TSAN_FLAGS = -fsanitize=thread -fno-omit-frame-pointer -g
+
+.PHONY: asan
+asan:
+	$(MAKE) clean
+	$(MAKE) all tests CFLAGS="$(CFLAGS) $(ASAN_FLAGS)" \
+	    LDFLAGS="$(LDFLAGS) $(ASAN_FLAGS)"
+	@echo "Running tests under ASan+UBSan..."
+	@for test in $(TEST_TARGETS); do \
+		testname=$$(basename $$test); \
+		echo "--- $$testname (asan) ---"; \
+		$$test || exit 1; \
+	done
+
+.PHONY: tsan
+tsan:
+	$(MAKE) clean
+	$(MAKE) all tests CFLAGS="$(CFLAGS) $(TSAN_FLAGS)" \
+	    LDFLAGS="$(LDFLAGS) $(TSAN_FLAGS)"
+	@echo "Running tests under TSan..."
+	@for test in $(TEST_TARGETS); do \
+		testname=$$(basename $$test); \
+		echo "--- $$testname (tsan) ---"; \
+		setarch $$(uname -m) -R $$test || exit 1; \
+	done
+
+.PHONY: sanitize-all
+sanitize-all: asan tsan
+	$(MAKE) clean
+	$(MAKE) all
+
+# Valgrind pass: independent leak/error checker on a plain (non-
+# sanitized) build -- ASan and Valgrind's instrumentation conflict,
+# so this always starts from a clean, unsanitized rebuild.
+.PHONY: valgrind
+valgrind:
+	$(MAKE) clean
+	$(MAKE) tests
+	@echo "Running tests under Valgrind..."
+	@for test in $(TEST_TARGETS); do \
+		testname=$$(basename $$test); \
+		echo "--- $$testname (valgrind) ---"; \
+		valgrind --leak-check=full --error-exitcode=1 \
+		    --track-origins=yes $$test || exit 1; \
+	done
+
+# Single gate: normal build+tests, ASan, TSan, Valgrind, in sequence.
+# Any failing step aborts (non-zero exit) via make's default
+# stop-on-error behavior plus the explicit "|| exit 1" inside each
+# tool's own test loop above.
+.PHONY: check-all
+check-all:
+	@echo "=== [1/4] Normal build + tests ==="
+	$(MAKE) clean
+	$(MAKE) test
+	@echo "=== [2/4] ASan + UBSan ==="
+	$(MAKE) asan
+	@echo "=== [3/4] TSan ==="
+	$(MAKE) tsan
+	@echo "=== [4/4] Valgrind ==="
+	$(MAKE) valgrind
+	$(MAKE) clean
+	$(MAKE) all
+	@echo "check-all: ALL CHECKS PASSED"
 
 # Install library
 .PHONY: install
@@ -214,9 +313,21 @@ help:
 	@echo "  tree        - Show directory structure"
 	@echo "  help        - Show this help"
 	@echo ""
+	@echo "Sanitizer/verification targets:"
+	@echo "  asan          - Clean rebuild + run tests under ASan+UBSan"
+	@echo "  tsan          - Clean rebuild + run tests under TSan"
+	@echo "  sanitize-all  - asan + tsan, then a plain rebuild"
+	@echo "  valgrind      - Clean rebuild + run tests under Valgrind"
+	@echo "  check-all     - normal + asan + tsan + valgrind, gated"
+	@echo ""
+	@echo "kanek_foundations (KFL) sibling repo:"
+	@echo "  foundations-fetch - clone KFL next to this repo if" \
+	     "missing"
+	@echo "  foundations       - build KFL's libkfl.a on demand"
+	@echo ""
 	@echo "Test Information:"
 	@echo "  test-core   - Recommended: Runs 9 core tests (all pass)"
-	@echo "  test        - All tests including cache (cache has 2/6 failing)"
+	@echo "  test        - All tests including cache (6/6 passing)"
 	@echo ""
 	@echo "Environment variables:"
 	@echo "  DEBUG=1     - Build with debug symbols"

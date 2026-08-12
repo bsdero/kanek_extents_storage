@@ -69,14 +69,6 @@ static void generate_test_data(test_data_t* data, uint32_t seed) {
 }
 
 /**
- * Validate test data
- */
-static bool validate_test_data(const test_data_t* data) {
-    uint32_t checksum = calc_checksum(data->pattern, TEST_BLOCK_SIZE);
-    return checksum == data->checksum;
-}
-
-/**
  * Test assertion macro
  */
 #define TEST_ASSERT(condition, message) \
@@ -168,6 +160,23 @@ static int mock_sync_device(void* device) {
     return 0;
 }
 
+/*
+ * Validate a cached buffer against the mock storage's checksum.
+ * Takes the raw buffer and the extent's start_block rather than
+ * casting the buffer to test_data_t: the cache only ever allocates
+ * exactly block_count * block_size bytes for an entry, which is
+ * smaller than sizeof(test_data_t) (its trailing checksum field
+ * would read 4 bytes past the end of that allocation). The expected
+ * checksum is looked up from g_mock_storage instead.
+ */
+static bool
+validate_test_data( const uint8_t *buffer, uint64_t start_block) {
+    uint32_t checksum;
+
+    checksum = calc_checksum( buffer, TEST_BLOCK_SIZE);
+    return( checksum == g_mock_storage[start_block].checksum);
+}
+
 /* =================================================================
  * Test Cases
  * ================================================================= */
@@ -222,8 +231,9 @@ static bool test_basic_operations() {
     TEST_ASSERT(buffer != NULL, "Buffer is NULL");
     
     /* Validate data */
-    test_data_t* data = (test_data_t*)buffer;
-    TEST_ASSERT(validate_test_data(data), "Data validation failed");
+    TEST_ASSERT(
+        validate_test_data( (const uint8_t *)buffer, id.start_block),
+        "Data validation failed");
     
     /* Test extent put operation */
     result = kes_cache_put_extent(cache, &id);
@@ -399,8 +409,8 @@ static void* concurrent_access_thread(void* arg) {
         }
         
         /* Validate data */
-        test_data_t* test_data = (test_data_t*)buffer;
-        if (!validate_test_data(test_data)) {
+        if ( !validate_test_data( (const uint8_t *)buffer,
+                                   id.start_block)) {
             data->success = false;
             break;
         }

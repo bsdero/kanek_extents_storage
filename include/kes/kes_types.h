@@ -1,13 +1,3 @@
-/*
- * kes_types.h - KANEK Extents Storage Core Types and Constants
- *
- * This file defines the fundamental data types, constants, and enumerations
- * used throughout the KES library. This minimal implementation provides
- * the essential types needed for basic storage operations.
- *
- * Copyright (C) 2025 KANEK Project
- */
-
 #ifndef KES_TYPES_H
 #define KES_TYPES_H
 
@@ -84,25 +74,25 @@ typedef struct {
     uint16_t version_minor;          /* Minor version */
     uint32_t block_size;             /* Block size in bytes */
     uint64_t total_blocks;           /* Total blocks in storage */
-    
+
     /* Layout information */
     uint64_t bitmap_start_block;     /* Bitmap start block */
     uint64_t bitmap_blocks;          /* Bitmap blocks count */
     uint64_t user_start_block;       /* User data start block */
     uint64_t user_blocks;            /* User data blocks count */
-    
+
     /* Statistics */
     uint64_t free_blocks;            /* Current free blocks */
     uint64_t used_blocks;            /* Current used blocks */
     uint64_t next_extent_id;         /* Next extent ID to allocate */
-    
+
     /* Reserved for future use */
     uint8_t reserved[32];
 } kes_storage_descriptor_t;
 
 /* Storage configuration */
 typedef struct {
-    const char* device_path;         /* Path to storage device/file */
+    const char *device_path;         /* Path to storage device/file */
     uint64_t device_size;            /* Total device size in bytes */
     uint32_t block_size;             /* Block size */
     uint32_t flags;                  /* Storage flags */
@@ -124,7 +114,7 @@ typedef struct {
     uint64_t used_blocks;            /* Used blocks */
     uint64_t allocated_extents;      /* Allocated extents */
     uint64_t fragmentation;          /* Fragmentation percentage */
-    
+
     /* I/O statistics */
     uint64_t reads_completed;        /* Read operations */
     uint64_t writes_completed;       /* Write operations */
