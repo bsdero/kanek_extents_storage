@@ -40,17 +40,32 @@ aspirational and wrong. Concretely, as of this writing:
   `kes_cache_get_extent()` unconditionally grows the cache on every
   miss. The LRU list (`mru_head`/`lru_tail`) is maintained correctly
   but nothing ever consults it to evict.
-- The two current `test_kes_cache` failures trace to a real
-  heap-buffer-overflow bug in the *test harness* (a struct cast past
-  the end of the cache's actual buffer allocation), not to cache logic
-  — see `KES_HARDENING_PLAN.md` §1–2 for the exact fix required before
-  treating those tests as green again.
+- The heap-buffer-overflow bug that used to fail `test_kes_cache` (a
+  struct cast past the end of the cache's actual buffer allocation,
+  `KES_HARDENING_PLAN.md` §1–2) is fixed — all 6/6 cache tests and
+  9/9 minimal tests currently pass (`make check-all`: normal build +
+  ASan+UBSan + TSan + Valgrind, 15/15 tests, 0 leaks, 0 races). Don't
+  assume that stays true without rerunning it.
 
 Treat everything else under `docs/` (design docs, project structure,
 edge-device prompts) as design-intent / marketing copy written ahead
-of the implementation, not a description of current behavior. When in
-doubt about whether a feature exists, grep `src/*.c` for the function
-name rather than trusting a doc.
+of the implementation, not a description of current behavior — this
+includes `README.md`'s status badges and feature list (LFU/Clock
+eviction, buddy-system allocation, flash optimization are all
+aspirational, not implemented). When in doubt about whether a feature
+exists, grep `src/*.c` for the function name rather than trusting a
+doc.
+
+**`PENDING_ITEMS.md` is the current work tracker** — read it alongside
+`KES_HARDENING_PLAN.md` (which is still the design spec/ground-truth
+for *how* to implement each piece correctly) before picking up cache
+work. It lists, in priority order: a known but unfixed P0 concurrency
+bug (`kes_cache_get_extent()` miss path can create duplicate
+hash-table entries for the same extent id under concurrent access —
+no lock spans the `hash_find`/`hash_insert` pair), the four
+unimplemented `kes_cache.h` functions (Phase 3), eviction/capacity
+enforcement (Phase 4), test expansion (Phase 5), and a docs truth pass
+(Phase 6) to do last.
 
 ## `CODING_STYLE.md` is binding for all new/edited code
 
@@ -92,15 +107,21 @@ specifically:
 - space after `(`, none before `)`
 - anonymous struct typedefs, no `_s` tag, for any new typedef'd struct
 
-**Rule 11 (log before every early-return failure path) cannot be
-mechanically satisfied here yet**: it names `TRACE_ERR`/`TRACE_SYSERR`/
-`TRACE_ERRNO`, and this repo has no `trace.h` or any logging facility
-at all — `grep -rn "TRACE_\|trace.h" src/ include/` returns nothing,
-and existing KES code fails silently (returns an error code, prints
-nothing). Don't invent an ad hoc logging macro or start calling
-`fprintf(stderr, ...)` on error paths to satisfy this rule without
-asking first — surface the gap and let the user decide whether to add
-a small trace facility or explicitly waive Rule 11 for this repo.
+**Rule 11 (log before every early-return failure path) is still
+unaddressed in existing KES code**: it names `TRACE_ERR`/
+`TRACE_SYSERR`/`TRACE_ERRNO`, and `grep -rn "TRACE_\|trace.h" src/
+include/` returns nothing — existing early-return paths in
+`kes_bitmap.c`/`kes_storage.c`/`kes_cache.c` fail silently (return an
+error code, print nothing). The macros themselves are no longer
+missing, though: `../kanek_foundations/src/trace.h` (see the sibling
+KFL checkout above) provides exactly these macros and is header-only
+for that subset, and the include path already resolves it. Nothing in
+`src/` includes or links it yet. Per this repo's "no drive-by
+rewrites" rule, don't retrofit `TRACE_*` calls into existing functions
+just to satisfy Rule 11 — apply it to new functions you write (Phase 3
+of `PENDING_ITEMS.md` is the natural starting point), and only touch
+an existing function's error paths when you're already rewriting that
+function's body for another reason.
 
 ## Building and Testing
 
@@ -110,7 +131,7 @@ into — unlike KFL).
 ```bash
 make all          # build build/libkes.a and build/libkes.so.1.0.0
 make test-core    # build + run test_kes_minimal only — 9/9 pass, stable
-make test         # build + run all tests, including cache (2/6 known failing)
+make test         # build + run all tests, including cache (6/6 passing)
 make debug        # DEBUG=1: -g3 -O0 -DDEBUG build
 make examples     # build examples/example_kes_usage.c
 make run-example  # build and run the example program
@@ -118,6 +139,12 @@ make clean        # remove build/
 make install      # copies to /usr/local/{lib,include/kes} (sudo)
 make info         # print resolved build config
 make help         # list all targets
+
+make asan         # clean rebuild + run tests under ASan+UBSan
+make tsan         # clean rebuild + run tests under TSan
+make sanitize-all # asan + tsan, then a plain rebuild
+make valgrind     # clean rebuild + run tests under Valgrind
+make check-all    # normal + asan + tsan + valgrind, gated on all passing
 ```
 
 There is no per-test filtering flag — each `tests/test_*.c` maps to
@@ -129,12 +156,21 @@ workaround to remove.
 Build flags: `-std=c99 -Wall -Wextra -Werror -fPIC`, `-O2 -DNDEBUG` by
 default. `-Werror` means any new warning fails the build.
 
-There are currently no sanitizer, Valgrind, or `check-all` targets in
-the Makefile — `KES_HARDENING_PLAN.md` §3 specifies adding them
-(ASan+UBSan and TSan as separate build variants, since they can't
-share a binary) as a prerequisite for the cache-layer hardening work.
-Check whether that phase has landed before assuming these targets
-exist.
+ASan and TSan can't share a binary, so `asan`/`tsan`/`valgrind` each do
+a full `clean` + rebuild with their own flags before running every
+test binary. In this WSL2 environment, TSan binaries must run under
+`setarch $(uname -m) -R` or they crash with an unrelated "unexpected
+memory mapping" error — the `tsan` target already does this, so use it
+rather than invoking a TSan-built test binary directly.
+
+`make all`/`make asan`/`make tsan` first run `foundations-fetch`,
+which clones the sibling `kanek_foundations` (KFL) repo to
+`../kanek_foundations` if it isn't already checked out there —
+`-I../kanek_foundations/src` is on the include path so `trace.h` is
+reachable. `make foundations` builds `libkfl.a` from that checkout
+on demand (not a prerequisite of `all`). As of this writing nothing in
+`src/` actually includes or links KFL yet — see the Rule 11 note
+below.
 
 ## Architecture
 
