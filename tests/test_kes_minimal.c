@@ -11,6 +11,7 @@
 
 #include <kes/kes_storage.h>
 #include <kes/kes_bitmap.h>
+#include <kes/kes_cache.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

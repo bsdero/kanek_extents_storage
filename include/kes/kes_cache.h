@@ -3,6 +3,7 @@
 
 #define _GNU_SOURCE  /* For aligned_alloc, clock_gettime */
 
+#include "kes_types.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <pthread.h>
@@ -16,14 +17,6 @@ extern "C" {
 /* Forward declarations */
 typedef struct kes_cache kes_cache_t;
 typedef struct kes_extent_entry kes_extent_entry_t;
-
-/* Return codes */
-#define KES_SUCCESS          0
-#define KES_ERROR_NOMEM     -1
-#define KES_ERROR_NOTFOUND  -2
-#define KES_ERROR_INVALID   -3
-#define KES_ERROR_IO        -4
-#define KES_ERROR_BUSY      -5
 
 /* Cache limits */
 #define KES_CACHE_MIN_MEMORY    (1024 * 1024)      /* 1MB minimum */

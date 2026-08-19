@@ -27,7 +27,8 @@ static const char *error_strings[] = {
     "Resource already exists",         /* KES_ERROR_EXISTS */
     "I/O error",                       /* KES_ERROR_IO */
     "No space available",              /* KES_ERROR_NOSPACE */
-    "Data corruption detected"         /* KES_ERROR_CORRUPT */
+    "Data corruption detected",        /* KES_ERROR_CORRUPT */
+    "Resource busy"                    /* KES_ERROR_BUSY */
 };
 
 /* =================================================================

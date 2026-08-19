@@ -27,6 +27,10 @@ typedef struct kes_bitmap kes_bitmap_t;
 #define KES_ERROR_IO        -5
 #define KES_ERROR_NOSPACE   -6
 #define KES_ERROR_CORRUPT   -7
+#define KES_ERROR_BUSY      -8   /* Resource busy (e.g. referenced or
+                                   * pinned); shared with the cache
+                                   * module, which is the only current
+                                   * user of this code. */
 
 /* Magic numbers and constants */
 #define KES_MAGIC_NUMBER     0x4B455353  /* "KESS" */
