@@ -1,7 +1,14 @@
 #ifndef KES_CACHE_H
 #define KES_CACHE_H
 
-#define _GNU_SOURCE  /* For aligned_alloc, clock_gettime */
+/* This header uses pthread_rwlock_t, which on glibc requires a
+ * feature-test macro (e.g. _GNU_SOURCE) to be defined before the
+ * FIRST libc header is included anywhere in the translation unit --
+ * defining it here would only work by luck of include order (see
+ * debugging_plan.md fix #2). Every .c file that includes this
+ * header must define _GNU_SOURCE (or _POSIX_C_SOURCE >= 200112L) as
+ * its own first line, before any #include. src/kes_cache.c and
+ * tests/test_kes_cache.c already do this. */
 
 #include "kes_types.h"
 #include <stdint.h>

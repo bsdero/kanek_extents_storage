@@ -9,11 +9,16 @@
 
 #define _GNU_SOURCE  /* For ftruncate */
 
+/* stdlib.h included before kes/kes_cache.h on purpose -- proves
+ * kes_cache.h no longer depends on include order for the feature-test
+ * macro it needs (see debugging_plan.md fix #2); with _GNU_SOURCE
+ * defined above as this file's own first line, an unrelated system
+ * header may freely appear before kes_cache.h now. */
+#include <stdlib.h>
 #include <kes/kes_storage.h>
 #include <kes/kes_bitmap.h>
 #include <kes/kes_cache.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <assert.h>
 #include <unistd.h>
