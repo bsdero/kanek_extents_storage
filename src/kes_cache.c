@@ -463,6 +463,12 @@ int kes_cache_get_extent( kes_cache_t *cache,
     /* Allocate data buffer */
     entry->data = extent_alloc_data( cache, entry->data_size);
     if ( entry->data == NULL) {
+        /* init_extent_entry() already initialized entry->lock/cond;
+         * this entry was never inserted into the hash table or LRU
+         * list (that happens further below), so nothing else will
+         * ever destroy them if we don't do it here before freeing. */
+        pthread_mutex_destroy( &entry->lock);
+        pthread_cond_destroy( &entry->cond);
         free( entry);
         return(KES_ERROR_NOMEM);
     }
