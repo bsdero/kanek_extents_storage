@@ -158,14 +158,13 @@ static int mock_write_extent(void* device, const kes_extent_id_t* id,
  * ran and failed" -- a real I/O-failure return of -1 from this mock
  * would be misclassified as the former.
  */
-static int mock_read_extent_always_fail(void* device,
-                                       const kes_extent_id_t* id,
-                                       void* buffer, size_t size) {
+static int mock_read_extent_always_fail( void *device,
+    const kes_extent_id_t *id, void *buffer, size_t size) {
     (void)device;
     (void)id;
     (void)buffer;
     (void)size;
-    return -100;
+    return( -100);
 }
 
 /**
@@ -411,7 +410,7 @@ static bool test_ref_count_leak_on_load_failure() {
     kes_cache_config_t config;
     kes_cache_get_default_config(&config, false);
 
-    kes_cache_t* cache = kes_cache_create(&config);
+    kes_cache_t *cache = kes_cache_create(&config);
     TEST_ASSERT(cache != NULL, "Cache creation failed");
 
     kes_cache_set_io_callbacks(cache, mock_read_extent_always_fail,
@@ -425,7 +424,7 @@ static bool test_ref_count_leak_on_load_failure() {
 
     /* First get: the load fails, so this must return an I/O error
      * and leave *buffer NULL. */
-    void* buffer = NULL;
+    void *buffer = NULL;
     int result = kes_cache_get_extent(cache, &id, &buffer);
     TEST_ASSERT(result == KES_ERROR_IO, "Expected I/O error on load");
 
@@ -433,7 +432,7 @@ static bool test_ref_count_leak_on_load_failure() {
      * never received a valid reference. Second get on the same id
      * must still cleanly return an error, not hang/crash/behave
      * differently due to a leaked ref_count. */
-    void* buffer2 = NULL;
+    void *buffer2 = NULL;
     result = kes_cache_get_extent(cache, &id, &buffer2);
     TEST_ASSERT(result == KES_ERROR_IO,
                "Second get on same id should still cleanly error");
@@ -451,7 +450,7 @@ static bool test_get_extent_no_read_callback() {
     kes_cache_config_t config;
     kes_cache_get_default_config(&config, false);
 
-    kes_cache_t* cache = kes_cache_create(&config);
+    kes_cache_t *cache = kes_cache_create(&config);
     TEST_ASSERT(cache != NULL, "Cache creation failed");
 
     /* Deliberately do not call kes_cache_set_io_callbacks() at all --
@@ -463,7 +462,7 @@ static bool test_get_extent_no_read_callback() {
         .block_size = TEST_BLOCK_SIZE
     };
 
-    void* buffer = (void*)0x1; /* sentinel, must be cleared to NULL */
+    void *buffer = (void *)0x1; /* sentinel, must be cleared to NULL */
     int result = kes_cache_get_extent(cache, &id, &buffer);
     TEST_ASSERT(result == KES_ERROR_INVALID,
                "Expected KES_ERROR_INVALID with no read_extent callback");
@@ -483,7 +482,7 @@ static bool test_flush_extent_no_write_callback() {
     kes_cache_config_t config;
     kes_cache_get_default_config(&config, false);
 
-    kes_cache_t* cache = kes_cache_create(&config);
+    kes_cache_t *cache = kes_cache_create(&config);
     TEST_ASSERT(cache != NULL, "Cache creation failed");
 
     /* A working read_extent is needed for the initial get_extent;
@@ -502,7 +501,7 @@ static bool test_flush_extent_no_write_callback() {
         .block_size = TEST_BLOCK_SIZE
     };
 
-    void* buffer = NULL;
+    void *buffer = NULL;
     int result = kes_cache_get_extent(cache, &id, &buffer);
     TEST_ASSERT(result == KES_SUCCESS, "Failed to get extent");
 
