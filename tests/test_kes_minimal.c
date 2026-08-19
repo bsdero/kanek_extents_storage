@@ -261,7 +261,30 @@ static bool test_extent_allocation(void) {
     /* Test freeing extents */
     result = kes_extent_free(storage, &extent);
     TEST_ASSERT(result == KES_SUCCESS, "Extent free failed");
-    
+
+    /* Test double-free is rejected and leaves stats unchanged */
+    kes_storage_stats_t stats_after_first_free;
+    result = kes_storage_get_stats(storage, &stats_after_first_free);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to get stats after free");
+
+    result = kes_extent_free(storage, &extent);
+    TEST_ASSERT(result == KES_ERROR_NOTFOUND,
+               "Double-free should return KES_ERROR_NOTFOUND");
+
+    kes_storage_stats_t stats_after_double_free;
+    result = kes_storage_get_stats(storage, &stats_after_double_free);
+    TEST_ASSERT(result == KES_SUCCESS,
+               "Failed to get stats after double-free");
+    TEST_ASSERT(stats_after_double_free.used_blocks ==
+               stats_after_first_free.used_blocks,
+               "Double-free changed used_blocks");
+    TEST_ASSERT(stats_after_double_free.free_blocks ==
+               stats_after_first_free.free_blocks,
+               "Double-free changed free_blocks");
+    TEST_ASSERT(stats_after_double_free.allocated_extents ==
+               stats_after_first_free.allocated_extents,
+               "Double-free changed allocated_extents");
+
     /* Test allocating after free */
     kes_extent_descriptor_t new_extent;
     result = kes_extent_allocate(storage, &request, &new_extent);

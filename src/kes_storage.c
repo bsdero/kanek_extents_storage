@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/stat.h>
+#include "trace.h"
 
 /* Internal helper functions */
 static int validate_config( const kes_storage_config_t *config);
@@ -293,6 +294,26 @@ int kes_extent_free( kes_storage_t *storage,
     }
 
     pthread_mutex_lock( &storage->lock);
+
+    /* Verify every block in the range is currently allocated before
+     * changing anything. kes_bitmap_clear_range() is idempotent (a
+     * no-op on already-clear bits), so without this check a
+     * double-free would silently desync desc.used_blocks/
+     * free_blocks/stats.allocated_extents from the bitmap's actual
+     * state instead of being rejected. */
+    for ( uint32_t i = 0; i < extent->block_count; i++) {
+        if ( !kes_bitmap_test( storage->bitmap,
+                                extent->start_block + i)) {
+            TRACE_ERR( "double-free or invalid extent: block %llu "
+                       "(of %u) in range starting at %llu is not "
+                       "currently allocated",
+                       (unsigned long long)(extent->start_block + i),
+                       extent->block_count,
+                       (unsigned long long)extent->start_block);
+            pthread_mutex_unlock( &storage->lock);
+            return(KES_ERROR_NOTFOUND);
+        }
+    }
 
     /* Clear bits in bitmap */
     int result = kes_bitmap_clear_range( storage->bitmap,
