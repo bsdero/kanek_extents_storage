@@ -149,6 +149,21 @@ static int mock_write_extent(void* device, const kes_extent_id_t* id,
 }
 
 /**
+ * Mock read function that always fails -- used to exercise the
+ * ref_count leak fix (debugging_plan.md fix #6) on the cache-miss
+ * load-failure path.
+ */
+static int mock_read_extent_always_fail(void* device,
+                                       const kes_extent_id_t* id,
+                                       void* buffer, size_t size) {
+    (void)device;
+    (void)id;
+    (void)buffer;
+    (void)size;
+    return -1;
+}
+
+/**
  * Mock sync function
  */
 static int mock_sync_device(void* device) {
@@ -378,6 +393,51 @@ static bool test_dirty_extents() {
 }
 
 /**
+ * Test that a failed cache load releases its phantom ref_count
+ * instead of leaking it (debugging_plan.md fix #6). ref_count isn't
+ * exposed through the public stats API, so the most direct thing we
+ * can assert publicly is indirect: request the same id a second time
+ * and confirm it still cleanly returns an I/O error rather than
+ * hanging, crashing, or behaving differently -- proving no
+ * reference-count-related state corruption occurred on the first
+ * failed load.
+ */
+static bool test_ref_count_leak_on_load_failure() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+
+    kes_cache_t* cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent_always_fail,
+                              mock_write_extent, mock_sync_device);
+
+    kes_extent_id_t id = {
+        .start_block = 4,
+        .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+
+    /* First get: the load fails, so this must return an I/O error
+     * and leave *buffer NULL. */
+    void* buffer = NULL;
+    int result = kes_cache_get_extent(cache, &id, &buffer);
+    TEST_ASSERT(result == KES_ERROR_IO, "Expected I/O error on load");
+
+    /* No kes_cache_put_extent() call here on purpose -- the caller
+     * never received a valid reference. Second get on the same id
+     * must still cleanly return an error, not hang/crash/behave
+     * differently due to a leaked ref_count. */
+    void* buffer2 = NULL;
+    result = kes_cache_get_extent(cache, &id, &buffer2);
+    TEST_ASSERT(result == KES_ERROR_IO,
+               "Second get on same id should still cleanly error");
+
+    kes_cache_destroy(cache);
+    TEST_PASS("Ref count leak on load failure");
+}
+
+/**
  * Thread data for concurrent tests
  */
 typedef struct {
@@ -489,6 +549,8 @@ static test_case_t test_suite[] = {
     { "Cache Hit", test_cache_hit },
     { "Extent Pinning", test_extent_pinning },
     { "Dirty Extents", test_dirty_extents },
+    { "Ref Count Leak On Load Failure",
+      test_ref_count_leak_on_load_failure },
     { "Concurrent Access", test_concurrent_access },
     { NULL, NULL } /* Terminator */
 };

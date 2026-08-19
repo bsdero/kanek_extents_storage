@@ -7,6 +7,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include "trace.h"
 
 /* Internal constants */
 #define KES_CACHE_DEFAULT_BUCKETS    1024
@@ -497,6 +498,20 @@ int kes_cache_get_extent( kes_cache_t *cache,
     } else {
         entry->state = KES_EXTENT_ERROR;
         result = KES_ERROR_IO;
+        /* The caller never received a valid buffer, so it holds no
+         * logical reference to this entry -- release the ref_count
+         * this function set to 1 at creation time, or this entry
+         * can never be considered unreferenced again (relevant once
+         * kes_cache_invalidate() exists -- see PENDING_ITEMS.md
+         * Phase 3 -- which refuses to touch entries with
+         * ref_count > 0). */
+        if ( entry->ref_count > 0) {
+            entry->ref_count--;
+        }
+        TRACE_ERR( "load failed for extent start_block=%llu "
+                   "block_count=%u, releasing phantom ref_count",
+                   (unsigned long long)id->start_block,
+                   id->block_count);
     }
 
     /* Wake up any waiting threads */
