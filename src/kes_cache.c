@@ -690,30 +690,37 @@ int kes_cache_flush_extent( kes_cache_t *cache,
     pthread_mutex_lock( &entry->lock);
 
     if ( entry->state & KES_EXTENT_DIRTY) {
-        if ( cache->write_extent != NULL) {
-            int result = cache->write_extent( cache->config.device_handle,
-                                               id, entry->data,
-                                               entry->data_size);
-            if ( result == KES_SUCCESS) {
-                entry->state &= ~KES_EXTENT_DIRTY;
-                entry->state |= KES_EXTENT_CLEAN;
+        if ( cache->write_extent == NULL) {
+            TRACE_ERR( "kes_cache_flush_extent: entry is dirty but no "
+                       "write_extent callback is registered (call "
+                       "kes_cache_set_io_callbacks() before using "
+                       "the cache)");
+            pthread_mutex_unlock( &entry->lock);
+            return(KES_ERROR_INVALID);
+        }
 
-                /*
-                 * bytes_written/flushes/entries_dirty are all
-                 * cache-wide state; bytes_written and flushes were
-                 * previously updated outside cache_lock (same bug
-                 * class fixed elsewhere in this file for
-                 * bytes_read/misses/memory_used).
-                 */
-                pthread_mutex_lock( &cache->cache_lock);
-                cache->stats.bytes_written += entry->data_size;
-                cache->stats.flushes++;
-                cache->stats.entries_dirty--;
-                pthread_mutex_unlock( &cache->cache_lock);
-            } else {
-                pthread_mutex_unlock( &entry->lock);
-                return(KES_ERROR_IO);
-            }
+        int result = cache->write_extent( cache->config.device_handle,
+                                           id, entry->data,
+                                           entry->data_size);
+        if ( result == KES_SUCCESS) {
+            entry->state &= ~KES_EXTENT_DIRTY;
+            entry->state |= KES_EXTENT_CLEAN;
+
+            /*
+             * bytes_written/flushes/entries_dirty are all
+             * cache-wide state; bytes_written and flushes were
+             * previously updated outside cache_lock (same bug
+             * class fixed elsewhere in this file for
+             * bytes_read/misses/memory_used).
+             */
+            pthread_mutex_lock( &cache->cache_lock);
+            cache->stats.bytes_written += entry->data_size;
+            cache->stats.flushes++;
+            cache->stats.entries_dirty--;
+            pthread_mutex_unlock( &cache->cache_lock);
+        } else {
+            pthread_mutex_unlock( &entry->lock);
+            return(KES_ERROR_IO);
         }
     }
 

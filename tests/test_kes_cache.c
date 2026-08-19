@@ -474,6 +474,56 @@ static bool test_get_extent_no_read_callback() {
 }
 
 /**
+ * Test that flushing a dirty entry with no write_extent callback
+ * registered returns KES_ERROR_INVALID rather than silently
+ * "succeeding" while leaving the data unwritten and the dirty flag
+ * still set (debugging_plan.md fix #5).
+ */
+static bool test_flush_extent_no_write_callback() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+
+    kes_cache_t* cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    /* A working read_extent is needed for the initial get_extent;
+     * register it, but with write_func == NULL, per
+     * kes_cache_set_io_callbacks()'s straightforward
+     * assign-whatever-was-passed behavior (verified by reading
+     * kes_cache_set_io_callbacks() in src/kes_cache.c -- it takes no
+     * special action for a NULL write_func, so passing NULL here is
+     * sufficient to leave cache->write_extent unset). */
+    kes_cache_set_io_callbacks(cache, mock_read_extent, NULL,
+                              mock_sync_device);
+
+    kes_extent_id_t id = {
+        .start_block = 6,
+        .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+
+    void* buffer = NULL;
+    int result = kes_cache_get_extent(cache, &id, &buffer);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to get extent");
+
+    result = kes_cache_mark_dirty(cache, &id);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to mark dirty");
+
+    result = kes_cache_flush_extent(cache, &id);
+    TEST_ASSERT(result == KES_ERROR_INVALID,
+               "Expected KES_ERROR_INVALID with no write_extent callback");
+
+    kes_cache_stats_t stats;
+    kes_cache_get_stats(cache, &stats);
+    TEST_ASSERT(stats.entries_dirty >= 1,
+               "Dirty flag should not have been silently cleared");
+
+    kes_cache_put_extent(cache, &id);
+    kes_cache_destroy(cache);
+    TEST_PASS("Flush extent with no write callback");
+}
+
+/**
  * Thread data for concurrent tests
  */
 typedef struct {
@@ -589,6 +639,8 @@ static test_case_t test_suite[] = {
       test_ref_count_leak_on_load_failure },
     { "Get Extent With No Read Callback",
       test_get_extent_no_read_callback },
+    { "Flush Extent With No Write Callback",
+      test_flush_extent_no_write_callback },
     { "Concurrent Access", test_concurrent_access },
     { NULL, NULL } /* Terminator */
 };
