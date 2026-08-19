@@ -484,10 +484,15 @@ int kes_cache_get_extent( kes_cache_t *cache,
     pthread_mutex_unlock( &cache->cache_lock);
 
     /* Load data from disk */
-    int result = KES_SUCCESS;
+    int result;
     if ( cache->read_extent != NULL) {
         result = cache->read_extent( cache->config.device_handle, id,
                                       entry->data, entry->data_size);
+    } else {
+        TRACE_ERR( "kes_cache_get_extent: no read_extent callback "
+                   "registered (call kes_cache_set_io_callbacks() "
+                   "before using the cache)");
+        result = KES_ERROR_INVALID;
     }
 
     pthread_mutex_lock( &entry->lock);
@@ -497,7 +502,9 @@ int kes_cache_get_extent( kes_cache_t *cache,
         *buffer = entry->data;
     } else {
         entry->state = KES_EXTENT_ERROR;
-        result = KES_ERROR_IO;
+        if ( result != KES_ERROR_INVALID) {
+            result = KES_ERROR_IO;
+        }
         /* The caller never received a valid buffer, so it holds no
          * logical reference to this entry -- release the ref_count
          * this function set to 1 at creation time, or this entry

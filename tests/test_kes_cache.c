@@ -151,7 +151,12 @@ static int mock_write_extent(void* device, const kes_extent_id_t* id,
 /**
  * Mock read function that always fails -- used to exercise the
  * ref_count leak fix (debugging_plan.md fix #6) on the cache-miss
- * load-failure path.
+ * load-failure path. Returns -100 rather than -1: since fix #1
+ * unified KES_ERROR_* into kes_types.h, KES_ERROR_INVALID is -1, and
+ * kes_cache_get_extent()'s miss path (fix #4) uses that exact value
+ * to distinguish "no read_extent callback registered" from "callback
+ * ran and failed" -- a real I/O-failure return of -1 from this mock
+ * would be misclassified as the former.
  */
 static int mock_read_extent_always_fail(void* device,
                                        const kes_extent_id_t* id,
@@ -160,7 +165,7 @@ static int mock_read_extent_always_fail(void* device,
     (void)id;
     (void)buffer;
     (void)size;
-    return -1;
+    return -100;
 }
 
 /**
@@ -438,6 +443,37 @@ static bool test_ref_count_leak_on_load_failure() {
 }
 
 /**
+ * Test that a cache miss with no read_extent callback registered
+ * returns KES_ERROR_INVALID rather than silently "succeeding" with
+ * an uninitialized buffer (debugging_plan.md fix #4).
+ */
+static bool test_get_extent_no_read_callback() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+
+    kes_cache_t* cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    /* Deliberately do not call kes_cache_set_io_callbacks() at all --
+     * cache->read_extent stays NULL. */
+
+    kes_extent_id_t id = {
+        .start_block = 5,
+        .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+
+    void* buffer = (void*)0x1; /* sentinel, must be cleared to NULL */
+    int result = kes_cache_get_extent(cache, &id, &buffer);
+    TEST_ASSERT(result == KES_ERROR_INVALID,
+               "Expected KES_ERROR_INVALID with no read_extent callback");
+    TEST_ASSERT(buffer == NULL, "Output buffer should be left NULL");
+
+    kes_cache_destroy(cache);
+    TEST_PASS("Get extent with no read callback");
+}
+
+/**
  * Thread data for concurrent tests
  */
 typedef struct {
@@ -551,6 +587,8 @@ static test_case_t test_suite[] = {
     { "Dirty Extents", test_dirty_extents },
     { "Ref Count Leak On Load Failure",
       test_ref_count_leak_on_load_failure },
+    { "Get Extent With No Read Callback",
+      test_get_extent_no_read_callback },
     { "Concurrent Access", test_concurrent_access },
     { NULL, NULL } /* Terminator */
 };
