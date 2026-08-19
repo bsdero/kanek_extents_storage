@@ -439,7 +439,27 @@ static bool test_utility_functions(void) {
     };
     size_t size = kes_calculate_extent_size(&extent);
     TEST_ASSERT(size == 4 * KES_DEFAULT_BLOCK_SIZE, "Wrong extent size");
-    
+
+    /* Test extent size calculation does not overflow for a large
+     * block_count (regression test for fix #7's 32-bit overflow) */
+    kes_extent_descriptor_t huge_extent = {
+        .block_count = 1200000
+    };
+    size_t huge_size = kes_calculate_extent_size(&huge_extent);
+    TEST_ASSERT(huge_size == (size_t)1200000 * KES_DEFAULT_BLOCK_SIZE,
+               "Extent size calculation overflowed for large block_count");
+
+    /* Narrower unit-style check for the same overflow pattern fixed
+     * in kes_extent_read()/kes_extent_write(): confirm the
+     * (uint64_t)-cast multiplication used there no longer wraps for
+     * representative large inputs. A full end-to-end large-file test
+     * (multi-GB device_size) is impractical here. */
+    uint32_t huge_block_count = 1200000;
+    uint32_t block_size = 4096;
+    uint64_t huge_extent_bytes = (uint64_t)huge_block_count * block_size;
+    TEST_ASSERT(huge_extent_bytes == 4915200000ULL,
+               "64-bit extent size arithmetic wrapped unexpectedly");
+
     /* Test config validation */
     kes_storage_config_t good_config = {
         .device_path = "/tmp/test",

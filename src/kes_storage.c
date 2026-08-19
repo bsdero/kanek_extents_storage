@@ -347,7 +347,8 @@ int kes_extent_read( kes_storage_t *storage,
     off_t file_offset = extent_start_byte + offset;
 
     /* Validate bounds */
-    uint64_t extent_size = extent->block_count * storage->desc.block_size;
+    uint64_t extent_size = (uint64_t)extent->block_count *
+                            storage->desc.block_size;
     if ( offset + size > extent_size) {
         return(KES_ERROR_INVALID);
     }
@@ -391,7 +392,8 @@ int kes_extent_write( kes_storage_t *storage,
     off_t file_offset = extent_start_byte + offset;
 
     /* Validate bounds */
-    uint64_t extent_size = extent->block_count * storage->desc.block_size;
+    uint64_t extent_size = (uint64_t)extent->block_count *
+                            storage->desc.block_size;
     if ( offset + size > extent_size) {
         return(KES_ERROR_INVALID);
     }
@@ -497,11 +499,25 @@ uint32_t kes_calculate_blocks_needed( size_t byte_size,
     return((uint32_t)KES_BYTES_TO_BLOCKS(byte_size, block_size));
 }
 
+/**
+ * Calculate total size of extent in bytes
+ * @param extent Extent descriptor
+ * @return Extent size in bytes, computed using KES_DEFAULT_BLOCK_SIZE
+ *
+ * NOTE: this always uses KES_DEFAULT_BLOCK_SIZE, not the actual
+ * block size of any particular storage instance (kes_extent_descriptor_t
+ * doesn't carry block_size). For a storage created with a non-default
+ * block_size, this returns the WRONG answer. Prefer computing extent
+ * size directly as (uint64_t)extent->block_count * storage->desc.block_size
+ * when the storage handle is available. This limitation is tracked,
+ * not silently fixed here, because changing this function's inputs
+ * is a public API signature change outside this fix's scope.
+ */
 size_t kes_calculate_extent_size( const kes_extent_descriptor_t *extent) {
     if ( extent == NULL) {
         return(0);
     }
-    return(extent->block_count * KES_DEFAULT_BLOCK_SIZE);
+    return((size_t)extent->block_count * KES_DEFAULT_BLOCK_SIZE);
 }
 
 int kes_config_validate( const kes_storage_config_t *config) {
