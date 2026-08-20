@@ -299,6 +299,82 @@ static bool test_kes_extent_read_write(void) {
     TEST_SUCCESS( "kes_extent_read/kes_extent_write");
 }
 
+/* kes_extent_read() + kes_extent_write() -- 32-bit overflow
+ * regression test for debugging_plan.md fix #7a.
+ *
+ * The bounds-violation checks in test_kes_extent_read_write() above
+ * use a 2-block extent, nowhere near 32-bit wraparound, so they pass
+ * identically whether or not kes_extent_read()/kes_extent_write()
+ * (src/kes_storage.c) cast to (uint64_t) before multiplying
+ * extent->block_count * storage->desc.block_size. This test picks
+ * numbers that actually distinguish the wrapped 32-bit result from
+ * the true 64-bit one, so a regression of fix #7a would be caught.
+ *
+ * The storage's real runtime block_size is KES_DEFAULT_BLOCK_SIZE
+ * (8192), not whatever block_size was requested in the config -- see
+ * the pre-existing, out-of-scope init_storage_descriptor() bug
+ * documented in test_kes_storage_get_descriptor() above (it hardcodes
+ * KES_DEFAULT_BLOCK_SIZE and ignores config->block_size). Verified
+ * directly below via kes_storage_get_descriptor() rather than assumed.
+ *
+ * Math (block_count = 600000, block_size = 8192):
+ *   true extent_size (uint64_t) = 600000 * 8192 = 4,915,200,000 bytes
+ *   wrapped (32-bit) extent_size = 4,915,200,000 mod 2^32
+ *                                = 4,915,200,000 - 4,294,967,296
+ *                                = 620,232,704 bytes
+ *   offset = 700,000,000, size = 100 => offset + size = 700,000,100
+ *     700,000,100 > 620,232,704 (wrapped) -- bug incorrectly rejects
+ *     700,000,100 < 4,915,200,000 (true)  -- fix correctly lets it
+ *       past the bounds check (the actual seek/read/write against
+ *       the real, much smaller backing file then fails with
+ *       KES_ERROR_IO for read, or succeeds by extending the file as
+ *       a sparse hole for write -- either way NOT KES_ERROR_INVALID,
+ *       which is all this test needs: proof the bounds check itself
+ *       was passed).
+ * The descriptor below is a plain, hand-built struct -- it is never
+ * actually allocated via kes_extent_allocate(), so no multi-GB file
+ * needs to be created or backed by real allocated blocks. */
+static bool test_kes_extent_read_write_32bit_overflow(void) {
+    kes_storage_t *st = NULL;
+    kes_storage_descriptor_t desc;
+    kes_extent_descriptor_t huge_ext = { .start_block = 0,
+                                          .block_count = 600000,
+                                          .flags = 0, .extent_id = 0 };
+    char buf[100];
+    int result;
+
+    memset( buf, 0, sizeof(buf));
+    cleanup();
+    TEST_ASSERT( make_storage( TEST_FILE_A, &st) == KES_SUCCESS, "create");
+
+    TEST_ASSERT( kes_storage_get_descriptor( st, &desc) == KES_SUCCESS,
+                "get_descriptor success");
+    TEST_ASSERT( desc.block_size == 8192,
+                "actual runtime block_size is 8192 "
+                "(KES_DEFAULT_BLOCK_SIZE), verified rather than "
+                "assumed -- see comment above");
+
+    /* offset + size = 700000100: strictly between the wrapped 32-bit
+     * value (620232704) and the true 64-bit value (4915200000). */
+    result = kes_extent_read( st, &huge_ext, buf, sizeof(buf),
+                              700000000);
+    TEST_ASSERT( result != KES_ERROR_INVALID,
+                "read must pass the bounds check once the 32-bit "
+                "overflow is fixed (fix #7a) -- KES_ERROR_INVALID "
+                "here would mean extent_size wrapped back down to "
+                "32 bits");
+
+    result = kes_extent_write( st, &huge_ext, buf, sizeof(buf),
+                               700000000);
+    TEST_ASSERT( result != KES_ERROR_INVALID,
+                "write must pass the bounds check once the 32-bit "
+                "overflow is fixed (fix #7a)");
+
+    kes_storage_close( st);
+    cleanup();
+    TEST_SUCCESS( "kes_extent_read/kes_extent_write (32-bit overflow)");
+}
+
 /* kes_storage_get_stats() */
 static bool test_kes_storage_get_stats(void) {
     kes_storage_t *st = NULL;
@@ -435,6 +511,8 @@ static test_case_t test_cases[] = {
     {"kes_extent_allocate",         test_kes_extent_allocate},
     {"kes_extent_free",             test_kes_extent_free},
     {"kes_extent_read/write",       test_kes_extent_read_write},
+    {"kes_extent_read/write (32-bit overflow)",
+     test_kes_extent_read_write_32bit_overflow},
     {"kes_storage_get_stats",       test_kes_storage_get_stats},
     {"kes_storage_get_descriptor",  test_kes_storage_get_descriptor},
     {"kes_get_version",             test_kes_get_version},
