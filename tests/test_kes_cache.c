@@ -441,6 +441,92 @@ static bool test_ref_count_leak_on_load_failure() {
     TEST_PASS("Ref count leak on load failure");
 }
 
+/*
+ * Test-only helper that looks up a cache entry's ref_count directly.
+ *
+ * Scope note (per debugging_plan.md fix #6's own guidance on this
+ * exact situation): kes_cache_t and kes_extent_entry_t are fully
+ * defined -- not just forward-declared -- in include/kes/kes_cache.h.
+ * The "internal structure, opaque to users" comment on
+ * kes_extent_entry_t there is aspirational; the compiler does not
+ * enforce it, so any translation unit that includes the header
+ * (including this test file) can already see every field. This
+ * helper reimplements the same bucket lookup as kes_cache.c's
+ * private static hash_find() using only that already-public struct
+ * layout plus the already-public kes_extent_hash()/kes_extent_equal()
+ * functions. It adds no new production code and changes no
+ * visibility rules in src/kes_cache.c or include/kes/kes_cache.h --
+ * the alternative named in the plan (a test-only introspection
+ * function added to kes_cache.c under a guard macro) turned out to
+ * be unnecessary once the struct layout was actually checked.
+ */
+static bool
+get_entry_ref_count( kes_cache_t *cache, const kes_extent_id_t *id,
+                      uint32_t *out_ref_count) {
+    uint32_t hash = kes_extent_hash( id);
+    uint32_t bucket_idx = hash & cache->bucket_mask;
+    kes_extent_entry_t *entry = cache->buckets[bucket_idx].head;
+
+    while ( entry != NULL) {
+        if ( kes_extent_equal( &entry->id, id)) {
+            *out_ref_count = entry->ref_count;
+            return( true);
+        }
+        entry = entry->hash_next;
+    }
+    return( false);
+}
+
+/**
+ * Test that a failed cache load actually releases ref_count back to
+ * 0 (debugging_plan.md fix #6), not just that a second get on the
+ * same id "behaves the same". test_ref_count_leak_on_load_failure()
+ * above was found by an independent audit to be fully vacuous: with
+ * fix #6 reverted, that test still passes 9/9, because the second
+ * kes_cache_get_extent() call hits the "entry->state &
+ * KES_EXTENT_ERROR" early-return in kes_cache_get_extent() before any
+ * ref_count logic ever runs -- a leaked ref_count has zero observable
+ * effect on that assertion. This test closes that gap by inspecting
+ * entry->ref_count directly via get_entry_ref_count() above.
+ */
+static bool test_ref_count_actually_released_on_load_failure() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent_always_fail,
+                              mock_write_extent, mock_sync_device);
+
+    kes_extent_id_t id = {
+        .start_block = 41,
+        .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+
+    /* No kes_cache_put_extent() call anywhere in this test -- the
+     * caller never received a valid buffer, so it holds no logical
+     * reference and has no reason to call put_extent(). If fix #6's
+     * decrement didn't run, ref_count would still read 1 below. */
+    void *buffer = NULL;
+    int result = kes_cache_get_extent(cache, &id, &buffer);
+    TEST_ASSERT(result == KES_ERROR_IO, "Expected I/O error on load");
+
+    uint32_t ref_count = 999; /* sentinel, must be overwritten */
+    bool found = get_entry_ref_count(cache, &id, &ref_count);
+    TEST_ASSERT(found, "Entry should still exist in the hash table "
+               "after a failed load -- fix #6 releases the ref, it "
+               "does not remove the entry (that needs "
+               "kes_cache_invalidate(), Phase 3, out of scope here)");
+    TEST_ASSERT(ref_count == 0,
+               "ref_count must be released back to 0 after a failed "
+               "load (debugging_plan.md fix #6)");
+
+    kes_cache_destroy(cache);
+    TEST_PASS("Ref count actually released on load failure");
+}
+
 /**
  * Test that a cache miss with no read_extent callback registered
  * returns KES_ERROR_INVALID rather than silently "succeeding" with
@@ -636,6 +722,8 @@ static test_case_t test_suite[] = {
     { "Dirty Extents", test_dirty_extents },
     { "Ref Count Leak On Load Failure",
       test_ref_count_leak_on_load_failure },
+    { "Ref Count Actually Released On Load Failure",
+      test_ref_count_actually_released_on_load_failure },
     { "Get Extent With No Read Callback",
       test_get_extent_no_read_callback },
     { "Flush Extent With No Write Callback",
