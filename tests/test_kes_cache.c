@@ -31,6 +31,8 @@
 #define TEST_EXTENT_COUNT   100
 #define TEST_NUM_THREADS    4
 #define TEST_ITERATIONS     1000
+#define RACE_TEST_THREADS   24
+#define RACE_TEST_ROUNDS    60
 
 /* Test data structure */
 typedef struct {
@@ -165,6 +167,30 @@ static int mock_read_extent_always_fail( void *device,
     (void)buffer;
     (void)size;
     return( -100);
+}
+
+/*
+ * Target id and hit counter used by
+ * test_concurrent_miss_no_duplicate_entry() below to detect whether
+ * more than one thread ever actually issued a real read_extent I/O
+ * for the same raced extent id -- which is exactly what the P0 fix
+ * (hash_find_or_insert(), src/kes_cache.c) prevents. g_race_read_count
+ * is updated with __atomic builtins since it is written from
+ * multiple threads with no other lock protecting it.
+ */
+static uint64_t g_race_target_block = (uint64_t)-1;
+static unsigned int g_race_read_count = 0;
+
+/**
+ * Mock read function that wraps mock_read_extent() and additionally
+ * counts calls for g_race_target_block.
+ */
+static int mock_read_extent_counting(void* device,
+    const kes_extent_id_t* id, void* buffer, size_t size) {
+    if (id->start_block == g_race_target_block) {
+        __atomic_fetch_add(&g_race_read_count, 1, __ATOMIC_SEQ_CST);
+    }
+    return mock_read_extent(device, id, buffer, size);
 }
 
 /**
@@ -477,6 +503,31 @@ get_entry_ref_count( kes_cache_t *cache, const kes_extent_id_t *id,
     return( false);
 }
 
+/*
+ * Test-only helper: counts how many entries in the cache's hash
+ * table match the given extent id. Unlike get_entry_ref_count()
+ * above, which stops at the first match, this walks the whole
+ * bucket chain, so it is what actually catches the P0 duplicate-
+ * insert bug -- two entries sharing the same id would each satisfy
+ * hash_find()/get_entry_ref_count() individually, but this would
+ * report 2 instead of 1.
+ */
+static uint32_t
+count_entries_for_id( kes_cache_t *cache, const kes_extent_id_t *id) {
+    uint32_t hash = kes_extent_hash( id);
+    uint32_t bucket_idx = hash & cache->bucket_mask;
+    kes_extent_entry_t *entry = cache->buckets[bucket_idx].head;
+    uint32_t count = 0;
+
+    while ( entry != NULL) {
+        if ( kes_extent_equal( &entry->id, id)) {
+            count++;
+        }
+        entry = entry->hash_next;
+    }
+    return( count);
+}
+
 /**
  * Test that a failed cache load actually releases ref_count back to
  * 0 (debugging_plan.md fix #6), not just that a second get on the
@@ -694,6 +745,151 @@ static bool test_concurrent_access() {
     TEST_PASS("Concurrent access");
 }
 
+/**
+ * Thread data for the same-id race regression test below.
+ */
+typedef struct {
+    kes_cache_t* cache;
+    kes_extent_id_t id;
+    pthread_barrier_t* barrier;
+    void* buffer;
+    int result;
+} race_thread_data_t;
+
+/**
+ * Thread function for test_concurrent_miss_no_duplicate_entry():
+ * waits at a barrier so every thread calls kes_cache_get_extent()
+ * for the identical id as close to simultaneously as possible.
+ */
+static void* race_thread_func(void* arg) {
+    race_thread_data_t* data = (race_thread_data_t*)arg;
+
+    pthread_barrier_wait(data->barrier);
+
+    data->result = kes_cache_get_extent(data->cache, &data->id,
+                                       &data->buffer);
+    return NULL;
+}
+
+/**
+ * P0 regression test: concurrent cache misses on the *same* extent
+ * id must not create duplicate hash-table entries.
+ *
+ * Before the src/kes_cache.c fix (hash_find_or_insert()),
+ * kes_cache_get_extent()'s miss path called hash_find() and a
+ * separate insert step as two independently-locked operations, with
+ * no lock spanning both. Two threads racing a miss on the same id
+ * could each build and insert their own kes_extent_entry_t, leaving
+ * two distinct cache entries for one extent -- each issuing its own
+ * read_extent I/O call (see PENDING_ITEMS.md, P0). This test drives
+ * RACE_TEST_THREADS threads through a pthread_barrier so they all
+ * call kes_cache_get_extent() for the identical id together, then
+ * checks for exactly the symptoms that bug produced.
+ *
+ * A single barrier-synchronized race is not reliable enough to
+ * catch this on its own: the pre-fix window between hash_find()
+ * missing and hash_insert() publishing the new entry is narrow
+ * (calloc + struct init + aligned_alloc, no I/O yet), so a lone
+ * race attempt against the un-fixed code was observed to pass ~14
+ * times out of 15 in local testing -- coin-flip odds, not a real
+ * regression guard. This test instead runs RACE_TEST_ROUNDS
+ * independent racing rounds against distinct extent ids in the same
+ * cache and fails on the first round that shows a duplicate; with
+ * RACE_TEST_THREADS=24 and RACE_TEST_ROUNDS=60 this reduces the
+ * chance of a false PASS against the un-fixed code to a small
+ * fraction of a percent.
+ */
+static bool test_concurrent_miss_no_duplicate_entry() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+
+    kes_cache_t* cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent_counting,
+                              mock_write_extent, mock_sync_device);
+
+    pthread_barrier_t barrier;
+    TEST_ASSERT(
+        pthread_barrier_init(&barrier, NULL, RACE_TEST_THREADS) == 0,
+        "Failed to init barrier");
+
+    for (int round = 0; round < RACE_TEST_ROUNDS; round++) {
+        kes_extent_id_t id = {
+            .start_block = (uint64_t)round,
+            .block_count = 1,
+            .block_size = TEST_BLOCK_SIZE
+        };
+
+        g_race_target_block = id.start_block;
+        g_race_read_count = 0;
+
+        pthread_t threads[RACE_TEST_THREADS];
+        race_thread_data_t thread_data[RACE_TEST_THREADS];
+
+        for (int i = 0; i < RACE_TEST_THREADS; i++) {
+            thread_data[i].cache = cache;
+            thread_data[i].id = id;
+            thread_data[i].barrier = &barrier;
+            thread_data[i].buffer = NULL;
+            thread_data[i].result = -1;
+
+            int rc = pthread_create(&threads[i], NULL, race_thread_func,
+                                   &thread_data[i]);
+            TEST_ASSERT(rc == 0, "Failed to create race thread");
+        }
+
+        for (int i = 0; i < RACE_TEST_THREADS; i++) {
+            pthread_join(threads[i], NULL);
+        }
+
+        for (int i = 0; i < RACE_TEST_THREADS; i++) {
+            TEST_ASSERT(thread_data[i].result == KES_SUCCESS,
+                       "A racing get_extent call failed");
+            TEST_ASSERT(thread_data[i].buffer != NULL,
+                       "A racing get_extent call returned a NULL "
+                       "buffer");
+            TEST_ASSERT(thread_data[i].buffer == thread_data[0].buffer,
+                       "Racing threads received different buffers -- "
+                       "implies duplicate cache entries for the same "
+                       "id");
+        }
+
+        uint32_t entry_count = count_entries_for_id(cache, &id);
+        TEST_ASSERT(entry_count == 1,
+                   "Expected exactly 1 hash-table entry for the "
+                   "raced id");
+
+        unsigned int read_count =
+            __atomic_load_n(&g_race_read_count, __ATOMIC_SEQ_CST);
+        TEST_ASSERT(read_count == 1,
+                   "Expected exactly 1 read_extent call for the "
+                   "raced id -- duplicate entries would each issue "
+                   "their own I/O");
+
+        TEST_ASSERT(
+            validate_test_data( (const uint8_t *)thread_data[0].buffer,
+                                 id.start_block),
+            "Data validation failed");
+
+        /* Release each thread's reference before the next round. */
+        for (int i = 0; i < RACE_TEST_THREADS; i++) {
+            kes_cache_put_extent(cache, &id);
+        }
+    }
+
+    pthread_barrier_destroy(&barrier);
+
+    kes_cache_stats_t stats;
+    kes_cache_get_stats(cache, &stats);
+    TEST_ASSERT(stats.entries_cached == RACE_TEST_ROUNDS,
+               "Expected exactly 1 cache entry per round to have "
+               "been created");
+
+    kes_cache_destroy(cache);
+    TEST_PASS("Concurrent miss on same extent creates only one entry");
+}
+
 /* =================================================================
  * Test Runner
  * ================================================================= */
@@ -729,6 +925,8 @@ static test_case_t test_suite[] = {
     { "Flush Extent With No Write Callback",
       test_flush_extent_no_write_callback },
     { "Concurrent Access", test_concurrent_access },
+    { "Concurrent Miss No Duplicate Entry",
+      test_concurrent_miss_no_duplicate_entry },
     { NULL, NULL } /* Terminator */
 };
 

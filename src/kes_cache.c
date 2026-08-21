@@ -176,24 +176,49 @@ static kes_extent_entry_t *hash_find( kes_cache_t *cache,
 }
 
 /**
- * Insert extent entry into hash table
+ * Atomically look up an extent id in the hash table and, if no
+ * entry exists for it yet, insert candidate as that entry -- all
+ * under a single bucket lock. This closes the miss-then-insert race
+ * that hash_find() followed by a separate insert step used to have:
+ * two threads racing a miss on the same id could each independently
+ * decide to insert their own entry, leaving two distinct cache
+ * entries for one extent, each issuing its own read_extent I/O
+ * (see PENDING_ITEMS.md, P0).
+ *
+ * Returns the pre-existing entry if one was already present, in
+ * which case candidate was NOT inserted and is still owned by the
+ * caller. Returns NULL if no existing entry was found, in which
+ * case candidate was inserted and is now owned by the hash table.
  */
-static void hash_insert( kes_cache_t *cache, kes_extent_entry_t *entry) {
-    uint32_t hash = kes_extent_hash( &entry->id);
+static kes_extent_entry_t *hash_find_or_insert(
+    kes_cache_t *cache, kes_extent_entry_t *candidate) {
+    uint32_t hash = kes_extent_hash( &candidate->id);
     uint32_t bucket_idx = hash & cache->bucket_mask;
     kes_cache_bucket_t *bucket = &cache->buckets[bucket_idx];
 
     pthread_rwlock_wrlock( &bucket->lock);
 
-    entry->hash_next = bucket->head;
-    entry->hash_prev = NULL;
-
-    if ( bucket->head != NULL) {
-        bucket->head->hash_prev = entry;
+    kes_extent_entry_t *entry = bucket->head;
+    while ( entry != NULL) {
+        if ( kes_extent_equal( &entry->id, &candidate->id)) {
+            break;
+        }
+        entry = entry->hash_next;
     }
-    bucket->head = entry;
+
+    if ( entry == NULL) {
+        candidate->hash_next = bucket->head;
+        candidate->hash_prev = NULL;
+
+        if ( bucket->head != NULL) {
+            bucket->head->hash_prev = candidate;
+        }
+        bucket->head = candidate;
+    }
 
     pthread_rwlock_unlock( &bucket->lock);
+
+    return(entry);
 }
 
 /**
@@ -407,145 +432,174 @@ int kes_cache_get_extent( kes_cache_t *cache,
 
     *buffer = NULL;
 
-    /* Look up extent in hash table */
+    /* Fast-path lookup: avoids building a candidate entry for the
+     * common case where the extent is already cached. This check is
+     * not itself race-free against a concurrent insert, but that is
+     * fine -- the only operation that must be atomic is the
+     * check-and-insert done below via hash_find_or_insert(), which
+     * is the actual race this function has to close. */
     kes_extent_entry_t *entry = hash_find( cache, id);
 
-    if ( entry != NULL) {
-        /* Cache hit */
-        pthread_mutex_lock( &entry->lock);
-
-        /* Wait if entry is being loaded */
-        while ( entry->state & KES_EXTENT_LOADING) {
-            pthread_cond_wait( &entry->cond, &entry->lock);
-        }
-
-        if ( entry->state & KES_EXTENT_ERROR) {
-            pthread_mutex_unlock( &entry->lock);
-            return(KES_ERROR_IO);
-        }
-
-        entry->ref_count++;
-        entry->access_time = get_timestamp();
-        entry->access_count++;
-        *buffer = entry->data;
-
-        pthread_mutex_unlock( &entry->lock);
-
-        /* Update LRU position */
-        pthread_mutex_lock( &cache->cache_lock);
-        lru_touch( cache, entry);
-        cache->stats.hits++;
-        pthread_mutex_unlock( &cache->cache_lock);
-
-        return(KES_SUCCESS);
-    }
-
-    /*
-     * Cache miss - need to load from disk. stats.misses is
-     * cache-wide state and must be updated under cache_lock; it was
-     * previously incremented with no lock at all, racing against
-     * concurrent hits/misses on other entries.
-     */
-    pthread_mutex_lock( &cache->cache_lock);
-    cache->stats.misses++;
-    pthread_mutex_unlock( &cache->cache_lock);
-
-    /* Create new entry */
-    entry = calloc( 1, sizeof(kes_extent_entry_t));
     if ( entry == NULL) {
-        return(KES_ERROR_NOMEM);
+        /*
+         * Cache miss on the fast lookup. Build a candidate entry and
+         * publish it via hash_find_or_insert(), which holds a
+         * single bucket lock across the "does an entry already
+         * exist" check and the insert. That is what prevents two
+         * threads that both missed above from each inserting their
+         * own entry for the same extent id.
+         */
+        kes_extent_entry_t *candidate = calloc( 1,
+                                             sizeof(kes_extent_entry_t));
+        if ( candidate == NULL) {
+            return(KES_ERROR_NOMEM);
+        }
+
+        init_extent_entry( candidate, id);
+        candidate->state = KES_EXTENT_LOADING;
+        candidate->ref_count = 1;
+
+        candidate->data = extent_alloc_data( cache, candidate->data_size);
+        if ( candidate->data == NULL) {
+            /* init_extent_entry() already initialized
+             * candidate->lock/cond; candidate was never inserted
+             * into the hash table or LRU list, so nothing else will
+             * ever destroy them if we don't do it here. */
+            pthread_mutex_destroy( &candidate->lock);
+            pthread_cond_destroy( &candidate->cond);
+            free( candidate);
+            return(KES_ERROR_NOMEM);
+        }
+
+        entry = hash_find_or_insert( cache, candidate);
+
+        if ( entry == NULL) {
+            /* We won the race: candidate is now the published entry
+             * for this id and this call is responsible for loading
+             * it from disk. */
+            entry = candidate;
+
+            /*
+             * entries_cached and memory_used are cache-wide state;
+             * memory_used was previously updated inside
+             * extent_alloc_data() with no lock held at all -- same
+             * bug class as stats.misses below.
+             */
+            pthread_mutex_lock( &cache->cache_lock);
+            cache->stats.misses++;
+            lru_add_head( cache, entry);
+            cache->stats.entries_cached++;
+            cache->stats.memory_used +=
+                KES_ALIGN( entry->data_size, KES_CACHE_ALIGNMENT);
+            pthread_mutex_unlock( &cache->cache_lock);
+
+            /* Load data from disk */
+            int result;
+            if ( cache->read_extent != NULL) {
+                result = cache->read_extent( cache->config.device_handle,
+                                              id, entry->data,
+                                              entry->data_size);
+            } else {
+                TRACE_ERR( "kes_cache_get_extent: no read_extent "
+                           "callback registered (call "
+                           "kes_cache_set_io_callbacks() before "
+                           "using the cache)");
+                result = KES_ERROR_INVALID;
+            }
+
+            pthread_mutex_lock( &entry->lock);
+
+            if ( result == KES_SUCCESS) {
+                entry->state = KES_EXTENT_CLEAN;
+                *buffer = entry->data;
+            } else {
+                entry->state = KES_EXTENT_ERROR;
+                if ( result != KES_ERROR_INVALID) {
+                    result = KES_ERROR_IO;
+                }
+                /* The caller never received a valid buffer, so it
+                 * holds no logical reference to this entry --
+                 * release the ref_count this function set to 1 at
+                 * creation time, or this entry can never be
+                 * considered unreferenced again (relevant once
+                 * kes_cache_invalidate() exists -- see
+                 * PENDING_ITEMS.md Phase 3 -- which refuses to touch
+                 * entries with ref_count > 0). */
+                if ( entry->ref_count > 0) {
+                    entry->ref_count--;
+                }
+                TRACE_ERR( "load failed for extent start_block=%llu "
+                           "block_count=%u, releasing phantom "
+                           "ref_count",
+                           (unsigned long long)id->start_block,
+                           id->block_count);
+            }
+
+            /* Wake up any waiting threads */
+            pthread_cond_broadcast( &entry->cond);
+            pthread_mutex_unlock( &entry->lock);
+
+            /*
+             * stats.bytes_read is cache-wide, not per-entry -- it
+             * must be protected by cache_lock, not entry->lock.
+             * Updating it while only entry->lock was held let two
+             * threads populating different misses race on the same
+             * counter (confirmed by TSan: src/kes_cache.c:472,
+             * "data race ... in kes_cache_get_extent").
+             */
+            if ( result == KES_SUCCESS) {
+                pthread_mutex_lock( &cache->cache_lock);
+                cache->stats.bytes_read += entry->data_size;
+                pthread_mutex_unlock( &cache->cache_lock);
+            }
+
+            return(result);
+        }
+
+        /*
+         * We lost the race: another thread published an entry for
+         * this id between our fast hash_find() miss and now. Our
+         * candidate was never published, so its data_size was never
+         * added to cache->stats.memory_used -- discard it with a
+         * plain free() rather than extent_free_data(), which
+         * assumes the buffer it is freeing was already accounted
+         * for and would wrongly decrement memory_used here.
+         */
+        free( candidate->data);
+        pthread_mutex_destroy( &candidate->lock);
+        pthread_cond_destroy( &candidate->cond);
+        free( candidate);
     }
 
-    init_extent_entry( entry, id);
-    entry->state = KES_EXTENT_LOADING;
-    entry->ref_count = 1;
-
-    /* Allocate data buffer */
-    entry->data = extent_alloc_data( cache, entry->data_size);
-    if ( entry->data == NULL) {
-        /* init_extent_entry() already initialized entry->lock/cond;
-         * this entry was never inserted into the hash table or LRU
-         * list (that happens further below), so nothing else will
-         * ever destroy them if we don't do it here before freeing. */
-        pthread_mutex_destroy( &entry->lock);
-        pthread_cond_destroy( &entry->cond);
-        free( entry);
-        return(KES_ERROR_NOMEM);
-    }
-
-    /* Insert into hash table and LRU list */
-    hash_insert( cache, entry);
-
-    /*
-     * entries_cached and memory_used are also cache-wide state;
-     * memory_used was previously updated inside extent_alloc_data()
-     * with no lock held at all at this call site (see comments on
-     * extent_alloc_data() above) -- same bug class as stats.misses.
-     */
-    pthread_mutex_lock( &cache->cache_lock);
-    lru_add_head( cache, entry);
-    cache->stats.entries_cached++;
-    cache->stats.memory_used +=
-        KES_ALIGN( entry->data_size, KES_CACHE_ALIGNMENT);
-    pthread_mutex_unlock( &cache->cache_lock);
-
-    /* Load data from disk */
-    int result;
-    if ( cache->read_extent != NULL) {
-        result = cache->read_extent( cache->config.device_handle, id,
-                                      entry->data, entry->data_size);
-    } else {
-        TRACE_ERR( "kes_cache_get_extent: no read_extent callback "
-                   "registered (call kes_cache_set_io_callbacks() "
-                   "before using the cache)");
-        result = KES_ERROR_INVALID;
-    }
-
+    /* Cache hit -- either a real hit from the fast lookup above, or
+     * this call lost the insert race and is attaching to the entry
+     * that won it. Either way, wait out any in-progress load the
+     * same way. */
     pthread_mutex_lock( &entry->lock);
 
-    if ( result == KES_SUCCESS) {
-        entry->state = KES_EXTENT_CLEAN;
-        *buffer = entry->data;
-    } else {
-        entry->state = KES_EXTENT_ERROR;
-        if ( result != KES_ERROR_INVALID) {
-            result = KES_ERROR_IO;
-        }
-        /* The caller never received a valid buffer, so it holds no
-         * logical reference to this entry -- release the ref_count
-         * this function set to 1 at creation time, or this entry
-         * can never be considered unreferenced again (relevant once
-         * kes_cache_invalidate() exists -- see PENDING_ITEMS.md
-         * Phase 3 -- which refuses to touch entries with
-         * ref_count > 0). */
-        if ( entry->ref_count > 0) {
-            entry->ref_count--;
-        }
-        TRACE_ERR( "load failed for extent start_block=%llu "
-                   "block_count=%u, releasing phantom ref_count",
-                   (unsigned long long)id->start_block,
-                   id->block_count);
+    while ( entry->state & KES_EXTENT_LOADING) {
+        pthread_cond_wait( &entry->cond, &entry->lock);
     }
 
-    /* Wake up any waiting threads */
-    pthread_cond_broadcast( &entry->cond);
+    if ( entry->state & KES_EXTENT_ERROR) {
+        pthread_mutex_unlock( &entry->lock);
+        return(KES_ERROR_IO);
+    }
+
+    entry->ref_count++;
+    entry->access_time = get_timestamp();
+    entry->access_count++;
+    *buffer = entry->data;
+
     pthread_mutex_unlock( &entry->lock);
 
-    /*
-     * stats.bytes_read is cache-wide, not per-entry -- it must be
-     * protected by cache_lock, not entry->lock. Updating it while
-     * only entry->lock was held let two threads populating
-     * different misses race on the same counter (confirmed by
-     * TSan: src/kes_cache.c:472, "data race ... in
-     * kes_cache_get_extent").
-     */
-    if ( result == KES_SUCCESS) {
-        pthread_mutex_lock( &cache->cache_lock);
-        cache->stats.bytes_read += entry->data_size;
-        pthread_mutex_unlock( &cache->cache_lock);
-    }
+    /* Update LRU position */
+    pthread_mutex_lock( &cache->cache_lock);
+    lru_touch( cache, entry);
+    cache->stats.hits++;
+    pthread_mutex_unlock( &cache->cache_lock);
 
-    return(result);
+    return(KES_SUCCESS);
 }
 
 /**
