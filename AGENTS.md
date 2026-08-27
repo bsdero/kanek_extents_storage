@@ -44,12 +44,28 @@ and wrong. Concretely, as of this writing:
   still no LFU or Clock eviction logic anywhere, despite both being
   described as complete in older versions of `docs/CONTINUATION_PROMPT.md`.
 - Verified as of this writing: `make check-all` (normal build +
-  ASan+UBSan + TSan + Valgrind) passes clean — 69/69 tests across all
-  five test binaries (`test_kes_minimal`, `test_kes_bitmap_full`,
-  `test_kes_storage_full`, `test_kes_cache`, `test_kes_cache_full`),
-  0 leaks, 0 races. **Don't assume that stays true without rerunning
-  it** — this is exactly the failure mode `KES_HARDENING_PLAN.md` §0
-  warns about, and it applies to this file too.
+  ASan+UBSan + TSan + Valgrind) passes clean — 70/70 tests across all
+  six test binaries (`test_kes_minimal`, `test_kes_bitmap_full`,
+  `test_kes_storage_full`, `test_kes_cache`, `test_kes_cache_full`,
+  `test_kes_multiprocess`), 0 leaks, 0 races. **Don't assume that
+  stays true without rerunning it** — this is exactly the failure
+  mode `KES_HARDENING_PLAN.md` §0 warns about, and it applies to this
+  file too.
+- `test_kes_multiprocess` covers a case none of the other binaries
+  do: two independent OS processes (a real `fork()`, not threads),
+  each with its own `kes_storage_open()` handle on the same backing
+  file — a `pthread_mutex_t` inside `kes_storage_t` cannot coordinate
+  across processes, so this exercises the storage layer's on-disk I/O
+  path (`kes_extent_write`/`kes_extent_read`, which read/write by raw
+  file offset and don't consult the in-memory bitmap) rather than its
+  in-process locking. Two POSIX semaphores in an anonymous
+  `MAP_SHARED` mapping enforce strict turn-taking across 8 steps, each
+  side verifying the other's previous write before writing its own.
+  This only proves *externally synchronized* cross-process access
+  round-trips correctly — it deliberately does not race the two
+  processes against each other. **Unsynchronized concurrent access to
+  the same storage file from two `kes_storage_t*` instances remains an
+  open, unguarded gap** — see the matching item in `PENDING_ITEMS.md`.
 - Getting the cache-layer concurrency right required going *beyond*
   `KES_HARDENING_PLAN.md` §4's literal suggestions in a few places
   (its "bump `ref_count` to pin the traversal node" pattern turned out
@@ -146,11 +162,13 @@ into — unlike KFL).
 ```bash
 make all          # build build/libkes.a and build/libkes.so.1.0.0
 make test-core    # build + run test_kes_minimal only — 9/9 pass, stable
-make test         # build + run all 5 test binaries — 69/69 passing
+make test         # build + run all 6 test binaries — 70/70 passing
 make debug        # DEBUG=1: -g3 -O0 -DDEBUG build
 make examples     # build examples/example_kes_usage.c
 make run-example  # build and run the example program
-make clean        # remove build/
+make clean        # remove build/, plus stray /tmp binary copies
+                   # left by test/test-core/run-example and any
+                   # package tarball
 make install      # copies to /usr/local/{lib,include/kes} (sudo)
 make info         # print resolved build config
 make help         # list all targets
@@ -166,7 +184,9 @@ There is no per-test filtering flag — each `tests/test_*.c` maps to
 one binary under `build/tests/`. `test` and `test-core` both copy the
 built binary to `/tmp` before executing it (see the Makefile's `test`/
 `test-core` recipes) — this is existing, intentional behavior, not a
-workaround to remove.
+workaround to remove. `make clean` removes those `/tmp` copies too
+(by name, derived from `$(TEST_TARGETS)`), so they don't accumulate
+across runs.
 
 Build flags: `-std=c99 -Wall -Wextra -Werror -fPIC`, `-O2 -DNDEBUG` by
 default. `-Werror` means any new warning fails the build.

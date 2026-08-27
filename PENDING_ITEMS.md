@@ -12,12 +12,12 @@ implement each piece correctly, even though most of it now describes
 work already done.
 
 Verified state as of this writing: `make check-all` (normal build +
-ASan+UBSan + TSan + Valgrind) passes clean -- 69/69 tests across
+ASan+UBSan + TSan + Valgrind) passes clean -- 70/70 tests across
 `test_kes_minimal`, `test_kes_bitmap_full`, `test_kes_storage_full`,
-`test_kes_cache`, `test_kes_cache_full`; 0 leaks (Valgrind), 0 races
-(TSan), 0 memory-safety errors (ASan+UBSan). Do not assume that stays
-true without rerunning it -- see `KES_HARDENING_PLAN.md` §0's
-standing rule about pasted evidence.
+`test_kes_cache`, `test_kes_cache_full`, `test_kes_multiprocess`; 0
+leaks (Valgrind), 0 races (TSan), 0 memory-safety errors (ASan+UBSan).
+Do not assume that stays true without rerunning it -- see
+`KES_HARDENING_PLAN.md` §0's standing rule about pasted evidence.
 
 ---
 
@@ -139,6 +139,29 @@ hazards described in the Phase 3 entry above; it's
 codebase. Passing under ASan+UBSan and TSan (5+ consecutive clean
 runs each during development).
 
+### Cross-process synchronized extent I/O test (ADDED)
+
+`tests/test_kes_multiprocess.c` (`Cross Process Sync IO`, 1/1) covers
+part of the §6.B "concurrent open of the same storage file from two
+`kes_storage_t*` instances" gap called out below: a real `fork()` (two
+OS processes, not threads) each independently call
+`kes_storage_open()` on the same backing file, then take turns
+writing/reading a distinguishable payload through
+`kes_extent_write()`/`kes_extent_read()`, with turns strictly ordered
+by two POSIX semaphores in an anonymous `MAP_SHARED` mapping. Confirms
+content one process writes is correctly observed by another process's
+independently opened handle once access is externally synchronized.
+Passing 20/20 consecutive runs, and clean under ASan+UBSan and TSan.
+
+**This does not close the §6.B item** -- it only proves the
+synchronized case; the two processes are never allowed to race each
+other, so it says nothing about what happens if they do (each has its
+own in-memory bitmap loaded once at `open()` time and only flushed on
+`kes_storage_sync()`/`close()`, so unsynchronized concurrent
+allocation from two processes against the same file is still expected
+to corrupt bitmap/descriptor state -- this remains untested and
+unguarded).
+
 ### Phase 6 -- documentation truth pass (PARTIALLY DONE)
 
 `README.md` and `docs/CONTINUATION_PROMPT.md` were corrected to
@@ -170,7 +193,10 @@ function, satisfying most of §6.A. `test_kes_cache.c` (23/23) adds
 edge-case and concurrency coverage beyond that, including several
 items from §6.B/§6.C: no-callback-registered paths, ref_count-leak-
 on-load-failure, the P0 duplicate-insert race, and the Phase 3/4
-concurrency regression test above.
+concurrency regression test above. `test_kes_multiprocess.c` (1/1,
+see "Cross-process synchronized extent I/O test" above) adds the
+first real multi-process (`fork()`-based) coverage, distinct from
+every other test binary's thread-based concurrency.
 
 **Not done** -- see `KES_HARDENING_PLAN.md` §6 for full detail on
 each:
@@ -187,10 +213,14 @@ each:
   operations on a cache between `kes_cache_stop()` and
   `kes_cache_destroy()`; hash-collision disambiguation
   (`kes_extent_equal()` actually used, not just the hash); storage
-  layer at 100%-full-then-free-one-block; concurrent open of the same
-  storage file from two `kes_storage_t*` instances (undocumented,
-  unguarded -- needs at minimum a test recording current behavior as
-  a known limitation per §6.B's own guidance).
+  layer at 100%-full-then-free-one-block; *unsynchronized* concurrent
+  open/access of the same storage file from two `kes_storage_t*`
+  instances (still undocumented, unguarded -- the *synchronized* case
+  is now covered by `tests/test_kes_multiprocess.c`, see "Cross-process
+  synchronized extent I/O test" above, but that test deliberately never
+  lets the two processes race; a version that does race them and
+  records the resulting corruption/behavior as a known limitation per
+  §6.B's own guidance is still needed).
 - §6.C further concurrency/stress: scaling the existing tests to more
   threads than CPU cores and higher iteration counts; a dedicated
   `kes_cache_destroy()`-during-concurrent-access test; running the

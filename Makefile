@@ -260,10 +260,22 @@ docs:
 	@echo "  - $(DOCS_DIR)/kes_cache_design.md"
 
 # Clean build artifacts
+#
+# Removes $(BUILD_DIR) (all binaries/libraries built by this
+# Makefile) plus the /tmp copies that "test", "test-core", and
+# "run-example" leave behind for execution -- without this, those
+# copies persist indefinitely across "make clean" since they live
+# outside $(BUILD_DIR).
 .PHONY: clean
 clean:
 	@echo "Cleaning build artifacts"
 	rm -rf $(BUILD_DIR)
+	@echo "Cleaning temporary /tmp binary copies"
+	@for test in $(TEST_TARGETS); do \
+		rm -f /tmp/$$(basename $$test); \
+	done
+	rm -f /tmp/test_kes_minimal_run /tmp/kes_example_test
+	rm -f $(PROJECT_NAME)-$(VERSION).tar.gz
 
 # Show build information
 .PHONY: info
