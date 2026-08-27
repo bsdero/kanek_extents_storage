@@ -2,7 +2,7 @@
 
 **A minimal, efficient, and cross-platform extent-based storage management library**
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]() [![Tests](https://img.shields.io/badge/tests-9%2F9%20passing-brightgreen.svg)]() [![Platform](https://img.shields.io/badge/platform-POSIX-blue.svg)]()
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg)]() [![Tests](https://img.shields.io/badge/tests-69%2F69%20passing-brightgreen.svg)]() [![Platform](https://img.shields.io/badge/platform-POSIX-blue.svg)]()
 
 ## 🎯 Overview
 
@@ -16,10 +16,17 @@ database backends.
 
 - **Cross-Platform**: POSIX-compliant (Linux, macOS, embedded systems)
 - **Thread-Safe**: Full mutex protection for concurrent operations
-- **Efficient Allocation**: Multiple allocation strategies (first-fit, best-fit, buddy system)
+- **Block Allocation**: First-fit extent allocation today; best-fit/
+  worst-fit/next-fit/buddy-system are declared in the config API but
+  not yet wired up (see Known Limitations)
+- **Extent Caching**: LRU cache with real capacity enforcement
+  (eviction on miss) and an automatic background flush thread
 - **Flash-Aware**: Designed with flash storage optimization in mind
+  (optimization itself is future work, not implemented yet)
 - **Minimal Footprint**: Suitable for both edge devices and servers
-- **Production-Ready**: Comprehensive test coverage and error handling
+- **Tested**: 69 tests passing (normal build, plus ASan+UBSan, TSan,
+  and Valgrind clean runs) -- see Known Limitations for coverage
+  gaps
 
 ## 🚀 Quick Start
 
@@ -97,7 +104,10 @@ make test
 ./build/tests/test_kes_cache      # Cache layer
 ```
 
-**Test Coverage**: 9/9 core tests + cache tests passing ✅
+**Test Coverage**: 69/69 tests passing across all five test binaries
+(`test_kes_minimal`, `test_kes_bitmap_full`, `test_kes_storage_full`,
+`test_kes_cache`, `test_kes_cache_full`) ✅ -- also passing under
+`make check-all` (ASan+UBSan, TSan, Valgrind)
 
 ## 📚 Documentation
 
@@ -109,20 +119,56 @@ make test
 ## 🔧 Advanced Features
 
 ### Allocation Strategies
-- **First-Fit**: Fast allocation for general use
-- **Best-Fit**: Minimize fragmentation
-- **Buddy System**: Power-of-2 allocation with coalescing
+- **First-Fit**: implemented, and the only strategy currently wired
+  up regardless of what `kes_storage_config_t.strategy` requests
+- **Best-Fit / Worst-Fit / Next-Fit / Buddy System**: declared in
+  `kes_types.h`'s `kes_allocation_strategy_t`, not implemented
 
 ### Caching Layer
-- Multi-policy eviction (LRU, LFU, Clock)
-- Background dirty page sync
-- Thread-safe concurrent access
-- Memory pressure handling
+- **LRU eviction**: implemented -- `kes_cache_get_extent()` evicts
+  from the LRU tail as needed to stay within `config.max_entries`/
+  `config.max_memory`, returning `KES_ERROR_BUSY` if it can't free
+  enough room
+- **LFU / Custom eviction policies**: declared in
+  `kes_cache_policy_t`, not implemented --
+  `kes_cache_create()` rejects a config requesting either rather
+  than silently falling back to LRU
+- **Background dirty-page sync**: implemented --
+  `kes_cache_start()` runs a background thread per
+  `config.background_threads` that flushes dirty entries every
+  `config.sync_interval_ms`
+- Thread-safe concurrent access (get/put/pin/mark_dirty/flush/sync/
+  invalidate/eviction can all run concurrently; verified under TSan)
+- Memory pressure handling via the LRU eviction above
 
 ### Flash Optimization (Future)
 - Hot/cold data separation
 - Wear leveling algorithms
 - Garbage collection strategies
+
+## ⚠️ Known Limitations
+
+- Extent allocation is first-fit only; `kes_allocation_strategy_t`'s
+  other strategies (best-fit, worst-fit, next-fit, buddy system) are
+  declared but not implemented.
+- Cache eviction is LRU only; `KES_CACHE_LFU`/`KES_CACHE_CUSTOM` are
+  rejected at `kes_cache_create()` rather than implemented.
+- No multi-device or multi-writer protection: opening the same
+  underlying storage file/device from two `kes_storage_t*` instances
+  concurrently is unguarded/undefined behavior.
+- Cache-miss capacity enforcement (`config.max_entries`/
+  `config.max_memory`) is not strictly atomic under concurrent
+  misses -- a burst of simultaneous misses can transiently overshoot
+  the configured limit by a small, bounded amount rather than
+  enforcing it with a single global lock across every miss.
+- Test coverage is solid for the paths exercised by the current
+  suite (functional coverage, several targeted concurrency/race
+  regression tests under ASan+UBSan/TSan/Valgrind) but does not yet
+  include the full matrix described in `KES_HARDENING_PLAN.md` §6:
+  systematic edge-case sweeps (NULL/zero/overflow per parameter),
+  fault injection (I/O failures, allocation failures, partial I/O),
+  storage-layer crash-consistency tests, randomized/fuzz-adjacent
+  testing, and a long-run soak test.
 
 ## 🤝 Contributing
 
@@ -140,7 +186,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - ✅ Core storage operations
 - ✅ Bitmap allocation
-- ✅ Multi-policy caching
+- ✅ LRU caching with real eviction and background sync
+- 🔄 Best-fit / worst-fit / next-fit / buddy-system allocation
+- 🔄 LFU / Clock eviction policies
 - 🔄 Flash zone management
 - 🔄 Garbage collection
 - 🔄 Wear leveling

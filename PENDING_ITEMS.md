@@ -1,130 +1,216 @@
 # Pending Items
 
-Work items identified but deliberately **not** implemented in the
-session that fixed `KES_HARDENING_PLAN.md` Phase 1 (bug fix) and
-Phase 2 (sanitizer tooling). Each item below was flagged rather than
-fixed, per that plan's "no drive-by rewrites" / "flag deviations
-explicitly" rules, because it exceeded the agreed Phase 1+2 scope.
-Read `KES_HARDENING_PLAN.md` in full before starting any of these --
-it is still the ground-truth work order; this file only tracks what's
-left against it.
+Tracks progress against `KES_HARDENING_PLAN.md`'s phases. As of this
+writing, Phases 1-4 are complete (bug fix, sanitizer tooling, the
+four missing cache functions, capacity enforcement/eviction) and the
+P0 concurrency bug is fixed; Phase 5 (test expansion) and Phase 6
+(docs truth pass) are partially done -- see their sections below for
+exactly what's covered and what's still missing. Read
+`KES_HARDENING_PLAN.md` in full before picking up any remaining
+item -- it is still the ground-truth work order for *how* to
+implement each piece correctly, even though most of it now describes
+work already done.
 
-Verified state as of this writing: `make check-all` passes clean
-(normal build + ASan+UBSan + TSan + Valgrind, 15/15 tests, 0 leaks,
-0 races). Do not assume that stays true without rerunning it -- see
-`KES_HARDENING_PLAN.md` §0's standing rule about pasted evidence.
+Verified state as of this writing: `make check-all` (normal build +
+ASan+UBSan + TSan + Valgrind) passes clean -- 69/69 tests across
+`test_kes_minimal`, `test_kes_bitmap_full`, `test_kes_storage_full`,
+`test_kes_cache`, `test_kes_cache_full`; 0 leaks (Valgrind), 0 races
+(TSan), 0 memory-safety errors (ASan+UBSan). Do not assume that stays
+true without rerunning it -- see `KES_HARDENING_PLAN.md` §0's
+standing rule about pasted evidence.
 
 ---
 
-## P0 -- known correctness bug, found but not fixed
+## Resolved
+
+### P0 -- concurrent cache-miss duplicate hash-table entries (FIXED)
 
 **Concurrent cache-miss on the same extent ID creates duplicate
-hash-table entries.**
+hash-table entries.** Fixed in commit `dd39a85` ("Fixed race
+conditions").
 
-- Where: `kes_cache_get_extent()` in `src/kes_cache.c`, the miss path
-  starting around line 410 (`hash_find` returns NULL) through the
-  `hash_insert( cache, entry)` call around line 470.
-- What's wrong: `hash_find()` (src/kes_cache.c:157) and `hash_insert()`
-  (src/kes_cache.c:180) are two independent operations with no lock
-  held across both. If two threads call `kes_cache_get_extent()` for
-  the same uncached `id` at nearly the same time, both can miss in
-  `hash_find`, both `calloc` + `init_extent_entry` a new
-  `kes_extent_entry_t`, and both call `hash_insert()` -- which is a
-  blind prepend onto the bucket's linked list with **no check for an
-  existing entry with the same id**. Result: two separate cache
-  entries for one extent, each independently issuing a `read_extent`
-  I/O call, each tracked separately in stats/LRU. This is a logic bug
-  (wasted I/O, incorrect caching semantics, a stale/duplicate entry
-  that can outlive the "real" one), not a data race in the TSan sense
-  -- the two entries are distinct objects, so ThreadSanitizer does not
-  flag this on its own. It needs a dedicated correctness test to
-  surface, which is exactly what the plan already asks for in
-  `KES_HARDENING_PLAN.md` §6.C ("Two threads racing to be the one
-  that populates a cache miss for the *same* extent ID
-  simultaneously ... confirm only one actually issues the
-  `read_extent` I/O call and the other correctly waits").
-- Why it wasn't fixed here: a correct fix is a real design change (a
-  get-or-create protocol: insert a placeholder entry in
-  `KES_EXTENT_LOADING` state while holding the bucket lock across
-  both the lookup and the insert, so a second racing thread finds the
-  placeholder instead of creating a duplicate, then waits on it the
-  same way the existing cache-hit path already waits out
-  `KES_EXTENT_LOADING` at src/kes_cache.c:415-417). That's
-  Phase 3/4-shaped work (it should share the same locking discipline
-  §4.1 asks for in `kes_cache_sync()`), not a one-line lock-placement
-  fix like the races already fixed this session.
-- Existing test coverage: `test_concurrent_access` in
-  `tests/test_kes_cache.c` already drives overlapping `start_block`
-  ranges across its 4 threads (thread N covers blocks
-  `N*10 .. N*10+49 mod 100`), so misses on the same id are already
-  being exercised today -- it just isn't asserting anything that
-  would catch the duplicate-entry outcome. A real fix needs its own
-  assertion (e.g. hash-table entry count after the race, or asserting
-  only one `read_extent` call happened for a given id) in addition to
-  the locking fix.
+- Was: `hash_find()` and `hash_insert()` were two independent
+  operations with no lock held across both, so two threads racing a
+  miss on the same uncached `id` could each build and insert their
+  own `kes_extent_entry_t`, leaving two distinct cache entries (and
+  two `read_extent` I/O calls) for one extent.
+- Fix: `hash_find()`/`hash_insert()` were replaced by
+  `hash_find_or_insert()` (`src/kes_cache.c`), which holds a single
+  bucket lock across the "does an entry already exist" check and the
+  insert. `kes_cache_get_extent()`'s miss path now builds a candidate
+  entry in `KES_EXTENT_LOADING` state and publishes it through that
+  function; a thread that loses the race gets back the winner's
+  entry instead of inserting its own, and waits it out the same way
+  the cache-hit path already waits out `KES_EXTENT_LOADING`.
+- Test coverage: `Concurrent Miss No Duplicate Entry` in
+  `tests/test_kes_cache.c` asserts only one entry/one `read_extent`
+  call results from a multi-thread race on the same id.
+
+### Phase 3 -- four missing `kes_cache.c` functions (FIXED)
+
+`kes_cache_sync()`, `kes_cache_invalidate()`, `kes_cache_reset_stats()`,
+and `kes_cache_start()` are all implemented in `src/kes_cache.c`,
+matching `KES_HARDENING_PLAN.md` §4's specified semantics. Notable
+deviations from a naive reading of §4, each because testing under
+ASan/TSan surfaced a real hazard the plan didn't spell out:
+
+- The shared flush-then-evict sweep (§4.1/§4.4's "factor into one
+  internal static function") is `cache_sweep()` plus a per-entry
+  helper `sweep_flush_and_maybe_evict()`, and a related helper
+  `make_room_for_new_entry()` for Phase 4's eviction-on-miss (same
+  per-entry flush/evict primitive, `try_evict_entry_locked()`, reused
+  by both).
+- The plan's suggested pattern -- "bump `ref_count` to pin the node
+  you're mid-walk on" -- is NOT what the code does. Doing exactly
+  that produced a real, ASan-confirmed heap-use-after-free during
+  development: `ref_count` is modified under `entry->lock` by
+  pre-existing code (`kes_cache_get_extent()`'s hit path,
+  `kes_cache_put_extent()`, `kes_cache_mark_dirty()`,
+  `kes_cache_pin_extent()`/`kes_cache_unpin_extent()`), so pinning it
+  under `cache_lock` too was a genuine data race between two
+  independent lock domains on the same field, not just a logic
+  error. The traversal pin uses a new field, `lookup_pins`
+  (`kes_extent_entry_t`, `include/kes/kes_cache.h`), which is only
+  ever touched via `__atomic_*` builtins and is also what
+  `hash_find()`/`hash_find_or_insert()` use to protect a
+  found-but-not-yet-locked entry from a concurrent evictor. See the
+  `try_evict_entry_locked()` doc comment (`src/kes_cache.c`) for the
+  full three-hazard explanation (lookup-race, traversal-race, and a
+  third one below) and why the eligibility check happens once, under
+  both the bucket lock and `cache_lock` simultaneously.
+- A third, unrelated hazard TSan caught separately:
+  `pthread_cond_wait()` (the `KES_EXTENT_LOADING` wait loop in
+  `kes_cache_get_extent()`) internally unlocks `entry->lock` while
+  parked, so a waiter does not continuously hold the lock the way the
+  code's structure suggests -- `ref_count` can independently reach 0
+  during exactly that window. A new `cond_waiters` counter
+  (`kes_extent_entry_t`) closes this; `try_evict_entry_locked()`
+  refuses to evict while it's nonzero.
+- `kes_cache_create()` rejecting `KES_CACHE_LFU`/`KES_CACHE_CUSTOM`
+  (originally a Phase 4/§5.3 item, implemented alongside Phase 3)
+  returns `NULL`, not `KES_ERROR_INVALID` as §5.3 literally says --
+  `kes_cache_create()`'s signature returns `kes_cache_t *`, not
+  `int`, so `NULL` is its only failure signal, consistent with every
+  other validation failure in that function.
+
+Test coverage: `Cache Sync`, `Cache Sync Keeps Referenced Entries`,
+`Cache Invalidate`, `Cache Invalidate Discards Dirty Data`,
+`Cache Reset Stats`, `Cache Start Background Flush` (proves automatic
+flushing actually happens, not just that the thread doesn't crash),
+`Cache Start Rejects Zero Threads` in `tests/test_kes_cache.c`.
+Passing under normal build, ASan+UBSan, TSan (5 consecutive clean
+runs during development), and Valgrind.
+
+### Phase 4 -- eviction / capacity enforcement (FIXED)
+
+`kes_cache_get_extent()`'s miss path calls `make_room_for_new_entry()`
+before allocating a new entry, which walks the LRU list from
+`lru_tail` toward `mru_head`, flushing and evicting entries with
+`ref_count == 0 && pin_count == 0` until `config.max_entries`/
+`config.max_memory` are satisfied, incrementing `stats.evictions` per
+eviction. Returns `KES_ERROR_BUSY` (not a silent overshoot) if it
+can't free enough room -- matching §5.2's recommendation.
+
+Documented, deliberate deviation from strict atomicity (§5.2 allows
+this as an alternative to a global lock): the check-then-evict-then-
+insert sequence is not atomic against *other* concurrent misses on
+*different* ids, so a burst of simultaneous misses can transiently
+overshoot the configured limit by a small, bounded amount. See
+`make_room_for_new_entry()`'s doc comment in `src/kes_cache.c`.
+
+Test coverage: `Cache Eviction Respects Max Entries` (fills a
+16-entry cache with 40 distinct extents, asserts `entries_cached`
+never exceeds `max_entries` and `evictions > 0`),
+`Cache Pinned Entries Never Evicted` (4 pinned entries survive being
+pushed 40 entries past `max_entries` by other traffic),
+`Cache Get Extent Busy When Full And Pinned` (BUSY when eviction
+truly can't free room), `Cache Create Rejects Unimplemented Policy`
+(LFU/CUSTOM rejected, LRU accepted) -- all in `tests/test_kes_cache.c`.
+
+### Concurrency regression coverage added alongside Phases 3/4
+
+`Concurrent Sync vs Get/Put` in `tests/test_kes_cache.c` -- 4 threads
+doing get/put and 2 threads calling `kes_cache_sync()` in a loop, all
+against a small, overlapping pool of extent ids under a
+`max_entries`-constrained cache (forcing real eviction pressure, not
+just flushing). This is the test that actually found the three
+hazards described in the Phase 3 entry above; it's
+`KES_HARDENING_PLAN.md` §6.C's "highest-value single test" for this
+codebase. Passing under ASan+UBSan and TSan (5+ consecutive clean
+runs each during development).
+
+### Phase 6 -- documentation truth pass (PARTIALLY DONE)
+
+`README.md` and `docs/CONTINUATION_PROMPT.md` were corrected to
+match the state above (badges, feature lists, a "Known Limitations"
+section in each). `docs/CONTINUATION_PROMPT.md` in particular was
+substantially rewritten -- it previously claimed flash zones, GC,
+and wear leveling as complete, which was never true at any point in
+this project's history.
+
+Not done: a pass over the other `docs/` files
+(`KES_API_Reference.md`, `KES_Design_Document.md`,
+`KES_Project_Structure.md`, `kes_cache_design.md`,
+`README_Implementation.md`, `EDGE_DEVICE_OPTIMIZATION_PROMPT.md`,
+`PROJECT_OVERVIEW_KES.md`, `TESTS_AND_EXAMPLES.md`) -- these likely
+still contain aspirational claims (flash zones, GC, wear leveling,
+multi-policy eviction) inherited from the same source as the old
+`CONTINUATION_PROMPT.md`. AGENTS.md's existing guidance to treat
+`docs/` as design-intent rather than ground truth still applies to
+whichever of these haven't been checked.
 
 ---
 
-## Phase 3 -- four missing `kes_cache.c` functions (P0/P1)
+## Phase 5 -- test expansion (P1/P2, PARTIALLY DONE)
 
-Not started. Full semantics are specified in
-`KES_HARDENING_PLAN.md` §4 -- follow them precisely, they were
-deliberately designed (the doc calls out real correctness hazards a
-plausible-looking alternative would reintroduce):
+Functional coverage per public function now exists for all three
+headers: `test_kes_bitmap_full.c` (10/10), `test_kes_storage_full.c`
+(15/15), `test_kes_cache_full.c` (12/12) -- one direct test per
+function, satisfying most of §6.A. `test_kes_cache.c` (23/23) adds
+edge-case and concurrency coverage beyond that, including several
+items from §6.B/§6.C: no-callback-registered paths, ref_count-leak-
+on-load-failure, the P0 duplicate-insert race, and the Phase 3/4
+concurrency regression test above.
 
-- `kes_cache_sync()` -- §4.1. Note the locking discipline required
-  (drop `cache_lock` before calling into `write_extent`, bump
-  `ref_count` to pin the node you're mid-walk on so a concurrent free
-  can't yank it out from under you). The stats-locking bugs fixed
-  this session in `kes_cache_get_extent`/`kes_cache_flush_extent`
-  are exactly the class of mistake this section is warning about --
-  reread them before writing this function.
-- `kes_cache_invalidate()` -- §4.2. Discards dirty data
-  unconditionally, no implicit flush. Returns `KES_ERROR_BUSY` (not a
-  new code) if `ref_count > 0 || pin_count > 0`.
-- `kes_cache_reset_stats()` -- §4.3. Resets only cumulative counters
-  (`hits`, `misses`, `evictions`, `flushes`, `bytes_read`,
-  `bytes_written`); state counters (`memory_used`, `entries_cached`,
-  `entries_dirty`, `entries_pinned`) must survive unchanged. Write
-  the test that specifically checks this distinction.
-- `kes_cache_start()` -- §4.4. Requires switching `bg_cond`'s clock
-  attribute to `CLOCK_MONOTONIC` (via `pthread_condattr_setclock`)
-  before the first timed wait is ever added -- do this as part of the
-  same change, not as an afterthought, per the doc's explicit warning
-  about retrofitting it later. Factor the flush-then-conditionally-
-  free sweep into one internal static function shared by both
-  `kes_cache_sync()` and the background thread loop.
+**Not done** -- see `KES_HARDENING_PLAN.md` §6 for full detail on
+each:
 
-Acceptance: unit tests for each function passing under normal build,
-ASan, and TSan (the `check-all` target built this session is ready
-for this). `kes_cache_start` specifically needs a test that proves
-automatic background flushing happens, not just that the thread
-doesn't crash.
-
-## Phase 4 -- eviction / capacity enforcement (P1)
-
-Not started. Depends on Phase 3's factored sweep logic. See
-`KES_HARDENING_PLAN.md` §5 -- eviction on miss walking the LRU list
-from `lru_tail`, `KES_ERROR_BUSY` when eviction can't free enough
-room (recommended in the doc, but flag if implemented differently),
-and `kes_cache_create()` rejecting `KES_CACHE_LFU`/`KES_CACHE_CUSTOM`
-with `KES_ERROR_INVALID` per §5.3.
-
-## Phase 5 -- test expansion (P1/P2)
-
-Not started. This is the largest remaining phase -- see
-`KES_HARDENING_PLAN.md` §6.A through §6.H (functional coverage per
-public function, edge cases, concurrency/stress, fault injection,
-persistence/crash-consistency, randomized/fuzz-adjacent testing,
-performance smoke tests, long-run soak test). The duplicate-insert
-bug above should get its dedicated test as part of §6.C.
-
-## Phase 6 -- documentation truth pass (P2)
-
-Not started. Correct `docs/CONTINUATION_PROMPT.md` and README status
-badges once Phases 3-5 land; add a "Known Limitations" section. Do
-this last, once everything it describes is actually true (per the
-plan's §0 standing rule).
+- §6.B edge cases not yet covered: NULL for every individual pointer
+  parameter (only some functions tested this way);
+  `block_count = 0`/`UINT32_MAX`, `start_block = UINT64_MAX`, and
+  `start_block * block_size` overflow combinations for the cache
+  layer specifically (the storage layer's 32-bit overflow case *is*
+  covered, `test_kes_extent_read_write_32bit_overflow` in
+  `tests/test_kes_storage_full.c`); non-power-of-2 `block_size`
+  validation; pin/unpin imbalance beyond a single pin/unpin pair;
+  `kes_cache_destroy()` with an outstanding unreleased reference;
+  operations on a cache between `kes_cache_stop()` and
+  `kes_cache_destroy()`; hash-collision disambiguation
+  (`kes_extent_equal()` actually used, not just the hash); storage
+  layer at 100%-full-then-free-one-block; concurrent open of the same
+  storage file from two `kes_storage_t*` instances (undocumented,
+  unguarded -- needs at minimum a test recording current behavior as
+  a known limitation per §6.B's own guidance).
+- §6.C further concurrency/stress: scaling the existing tests to more
+  threads than CPU cores and higher iteration counts; a dedicated
+  `kes_cache_destroy()`-during-concurrent-access test; running the
+  concurrency suite 100+ times in a loop with a logged fixed random
+  seed (a stress-test target, not yet added to the Makefile).
+- §6.D fault injection: configurable-failure-mode I/O wrappers
+  (fail on Nth call, or with a probability), `malloc`/`aligned_alloc`
+  failure simulation, partial read/write simulation. None of this
+  exists yet.
+- §6.E storage persistence/crash-consistency: no-explicit-sync
+  reopen behavior, truncated/corrupted descriptor detection, bit-
+  flipped bitmap block detection. Not covered.
+- §6.F randomized/fuzz-adjacent testing: a long random
+  get/put/pin/unpin/mark_dirty/flush/sync/invalidate sequence with
+  per-operation invariant checks, and randomized bitmap bit-range
+  testing against a naive reference implementation. Not done.
+- §6.G performance smoke tests: not done (informational only, not
+  blocking).
+- §6.H long-run soak test (a `make soak` target running the mixed
+  workload for 10+ minutes under ASan/TSan): not done.
 
 ---
 
@@ -138,17 +224,25 @@ plan's §0 standing rule).
   if/when something actually links it). **Nothing in `src/` includes
   or links it yet.**
 - `CODING_STYLE.md` Rule 11 (log before every early-return failure
-  path via `TRACE_ERR`/`TRACE_SYSERR`/`TRACE_ERRNO`) is still
-  unaddressed in this repo's existing code. `kanek_foundations/src/trace.h`
-  provides exactly those macros and is header-only for that subset
-  (no linking needed, just `#include "trace.h"` once the include path
-  is in place, which it now is). The natural place to start applying
-  this is Phase 3's four new functions -- write them Rule-11-compliant
-  from the start rather than retrofitting existing functions (per
-  AGENTS.md's "no drive-by rewrites" guidance, existing early-return
-  paths in `kes_bitmap.c`/`kes_storage.c`/`kes_cache.c` should only
-  gain `TRACE_*` calls when you're already touching that function's
-  body for another reason).
+  path via `TRACE_ERR`/`TRACE_SYSERR`/`TRACE_ERRNO`) is now partially
+  addressed: `kes_cache.c` (the no-read_extent-callback path, the
+  load-failure path, the no-write_extent-callback path in
+  `kes_cache_flush_extent()`, the cache-full-can't-evict path in
+  `kes_cache_get_extent()`, `kes_cache_start()`'s
+  already-running/`pthread_create`-failure paths, and the
+  sweep/eviction flush-failure paths) and `kes_storage.c` (the
+  double-free/invalid-extent path in `kes_extent_free()`) call
+  `TRACE_ERR` today -- Phase 3/4's new functions were written
+  Rule-11-compliant from the start, per the original plan here. Most
+  early-return paths in `kes_bitmap.c`/`kes_storage.c` and some in
+  `kes_cache.c` (e.g. every `KES_ERROR_INVALID`/`KES_ERROR_NOTFOUND`
+  NULL/not-found check) still fail silently. `kanek_foundations/src/
+  trace.h` provides the macros and is header-only for that subset
+  (no linking needed, just `#include "trace.h"`, already reachable
+  via the include path). Per AGENTS.md's "no drive-by rewrites"
+  guidance, keep applying this to new functions and to existing
+  functions only when you're already touching their body for another
+  reason -- don't do a blanket sweep.
 - Sanitizer/verification targets available: `make asan`, `make tsan`,
   `make valgrind`, `make sanitize-all`, `make check-all`. TSan
   binaries must be run under `setarch $(uname -m) -R` in this

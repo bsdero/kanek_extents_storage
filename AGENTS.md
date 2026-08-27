@@ -18,54 +18,65 @@ Three source files make up the whole library (`src/`, ~1600 lines
 total): `kes_bitmap.c`, `kes_storage.c`, `kes_cache.c`, each with a
 corresponding header in `include/kes/`.
 
-## Ground truth: trust `KES_HARDENING_PLAN.md`, not `docs/`
+## Ground truth: trust `PENDING_ITEMS.md`/`KES_HARDENING_PLAN.md`, not `docs/`
 
-**Read `KES_HARDENING_PLAN.md` before working on the cache layer.** It
-is a verified work order — every claim in it was checked by building
-the repo and reading the actual code — and it explicitly documents
-that most of `docs/` (`CONTINUATION_PROMPT.md` in particular) is
-aspirational and wrong. Concretely, as of this writing:
+**Read `PENDING_ITEMS.md` before working on the cache layer** — it is
+the current, maintained status/work tracker, and it links back to
+`KES_HARDENING_PLAN.md` (still the design spec/ground-truth for *how*
+to implement each remaining piece correctly). Both were originally
+written because most of `docs/` (`CONTINUATION_PROMPT.md` in
+particular, since corrected — see below) turned out to be aspirational
+and wrong. Concretely, as of this writing:
 
-- `kes_cache.h` declares `kes_cache_sync`, `kes_cache_invalidate`,
-  `kes_cache_reset_stats`, and `kes_cache_start` — **none of these are
-  implemented** in `kes_cache.c`. `kes_cache_stop()` guards against
-  `bg_threads` never having been started, so it doesn't crash, but no
-  background sync thread ever runs.
-- `kes_cache_policy_t` (`KES_CACHE_LRU`/`LFU`/`CUSTOM`) is stored at
-  `kes_cache_create()` and never read again — there is no LFU or Clock
-  eviction logic anywhere, despite both being described as complete in
-  `docs/CONTINUATION_PROMPT.md`.
-- **No eviction or capacity enforcement exists.** `max_entries` /
-  `max_memory` are validated once at creation and never checked again;
-  `kes_cache_get_extent()` unconditionally grows the cache on every
-  miss. The LRU list (`mru_head`/`lru_tail`) is maintained correctly
-  but nothing ever consults it to evict.
-- The heap-buffer-overflow bug that used to fail `test_kes_cache` (a
-  struct cast past the end of the cache's actual buffer allocation,
-  `KES_HARDENING_PLAN.md` §1–2) is fixed — all 6/6 cache tests and
-  9/9 minimal tests currently pass (`make check-all`: normal build +
-  ASan+UBSan + TSan + Valgrind, 15/15 tests, 0 leaks, 0 races). Don't
-  assume that stays true without rerunning it.
+- Phases 1–4 of `KES_HARDENING_PLAN.md` are done: the original
+  heap-buffer-overflow bug, a P0 concurrency bug (duplicate hash-table
+  entries on a racing cache miss), all four previously-missing
+  `kes_cache.h` functions (`kes_cache_sync`, `kes_cache_invalidate`,
+  `kes_cache_reset_stats`, `kes_cache_start`), and real capacity
+  enforcement/eviction are all implemented and tested. `kes_cache_start()`
+  runs a real background flush thread; `kes_cache_get_extent()` evicts
+  from the LRU tail as needed to respect `config.max_entries`/
+  `config.max_memory`, returning `KES_ERROR_BUSY` if it can't free
+  enough room.
+- `kes_cache_policy_t`: only `KES_CACHE_LRU` is implemented.
+  `kes_cache_create()` **rejects** `KES_CACHE_LFU`/`KES_CACHE_CUSTOM`
+  (returns `NULL`) rather than silently falling back to LRU — there is
+  still no LFU or Clock eviction logic anywhere, despite both being
+  described as complete in older versions of `docs/CONTINUATION_PROMPT.md`.
+- Verified as of this writing: `make check-all` (normal build +
+  ASan+UBSan + TSan + Valgrind) passes clean — 69/69 tests across all
+  five test binaries (`test_kes_minimal`, `test_kes_bitmap_full`,
+  `test_kes_storage_full`, `test_kes_cache`, `test_kes_cache_full`),
+  0 leaks, 0 races. **Don't assume that stays true without rerunning
+  it** — this is exactly the failure mode `KES_HARDENING_PLAN.md` §0
+  warns about, and it applies to this file too.
+- Getting the cache-layer concurrency right required going *beyond*
+  `KES_HARDENING_PLAN.md` §4's literal suggestions in a few places
+  (its "bump `ref_count` to pin the traversal node" pattern turned out
+  to be a real, ASan-confirmed data race against pre-existing code
+  that also modifies `ref_count` under a different lock; `pthread_cond_wait()`
+  internally unlocking while parked was a separate, TSan-caught hazard
+  the plan didn't anticipate). See the `try_evict_entry_locked()` doc
+  comment in `src/kes_cache.c` and the Phase 3 entry in
+  `PENDING_ITEMS.md` for the full explanation before touching this
+  code — the locking here is more subtle than it looks.
 
-Treat everything else under `docs/` (design docs, project structure,
-edge-device prompts) as design-intent / marketing copy written ahead
-of the implementation, not a description of current behavior — this
-includes `README.md`'s status badges and feature list (LFU/Clock
-eviction, buddy-system allocation, flash optimization are all
-aspirational, not implemented). When in doubt about whether a feature
-exists, grep `src/*.c` for the function name rather than trusting a
-doc.
+`docs/CONTINUATION_PROMPT.md` has been corrected to match current
+reality and is safe to read now. Treat everything else under `docs/`
+(design docs, project structure, edge-device prompts) as design-intent
+/ marketing copy written ahead of the implementation, not a
+description of current behavior — this still includes claims about
+buddy-system allocation and flash optimization (aspirational, not
+implemented). When in doubt about whether a feature exists, grep
+`src/*.c` for the function name rather than trusting a doc.
 
-**`PENDING_ITEMS.md` is the current work tracker** — read it alongside
-`KES_HARDENING_PLAN.md` (which is still the design spec/ground-truth
-for *how* to implement each piece correctly) before picking up cache
-work. It lists, in priority order: a known but unfixed P0 concurrency
-bug (`kes_cache_get_extent()` miss path can create duplicate
-hash-table entries for the same extent id under concurrent access —
-no lock spans the `hash_find`/`hash_insert` pair), the four
-unimplemented `kes_cache.h` functions (Phase 3), eviction/capacity
-enforcement (Phase 4), test expansion (Phase 5), and a docs truth pass
-(Phase 6) to do last.
+**`PENDING_ITEMS.md` is the current work tracker** — read it before
+picking up any cache or storage work. What remains, in priority order:
+test expansion (Phase 5, partially done — functional coverage per
+public function exists, but `KES_HARDENING_PLAN.md` §6's edge-case/
+fault-injection/crash-consistency/fuzz/soak-test matrix does not), a
+docs truth pass over the rest of `docs/` beyond `CONTINUATION_PROMPT.md`
+(Phase 6, partially done), and allocation strategies beyond first-fit.
 
 ## `CODING_STYLE.md` is binding for all new/edited code
 
@@ -107,21 +118,25 @@ specifically:
 - space after `(`, none before `)`
 - anonymous struct typedefs, no `_s` tag, for any new typedef'd struct
 
-**Rule 11 (log before every early-return failure path) is still
-unaddressed in existing KES code**: it names `TRACE_ERR`/
-`TRACE_SYSERR`/`TRACE_ERRNO`, and `grep -rn "TRACE_\|trace.h" src/
-include/` returns nothing — existing early-return paths in
-`kes_bitmap.c`/`kes_storage.c`/`kes_cache.c` fail silently (return an
-error code, print nothing). The macros themselves are no longer
-missing, though: `../kanek_foundations/src/trace.h` (see the sibling
-KFL checkout above) provides exactly these macros and is header-only
-for that subset, and the include path already resolves it. Nothing in
-`src/` includes or links it yet. Per this repo's "no drive-by
-rewrites" rule, don't retrofit `TRACE_*` calls into existing functions
-just to satisfy Rule 11 — apply it to new functions you write (Phase 3
-of `PENDING_ITEMS.md` is the natural starting point), and only touch
-an existing function's error paths when you're already rewriting that
-function's body for another reason.
+**Rule 11 (log before every early-return failure path) is now
+partially addressed**: `kes_cache.c` and `kes_storage.c` both call
+`TRACE_ERR` on several early-return failure paths added or touched
+during Phases 1–4 (the no-read/write-extent-callback paths, the
+load/flush-failure paths, the cache-full-can't-evict path,
+`kes_cache_start()`'s already-running/`pthread_create`-failure paths,
+the double-free/invalid-extent path in `kes_extent_free()`). Most
+early-return paths in `kes_bitmap.c`/`kes_storage.c`, and the simple
+NULL/not-found checks throughout `kes_cache.c`, still fail silently
+(return an error code, print nothing) — this was never meant to be a
+blanket retrofit, just applied to new/touched functions as they came
+up, per the "no drive-by rewrites" rule below.
+`../kanek_foundations/src/trace.h` (see the sibling KFL checkout
+above) provides the `TRACE_ERR`/`TRACE_SYSERR`/`TRACE_ERRNO` macros
+and is header-only for that subset; the include path already
+resolves it. Continue applying it to new functions you write, and to
+an existing function's error paths only when you're already
+rewriting that function's body for another reason — don't do a
+blanket sweep unless asked.
 
 ## Building and Testing
 
@@ -131,7 +146,7 @@ into — unlike KFL).
 ```bash
 make all          # build build/libkes.a and build/libkes.so.1.0.0
 make test-core    # build + run test_kes_minimal only — 9/9 pass, stable
-make test         # build + run all tests, including cache (6/6 passing)
+make test         # build + run all 5 test binaries — 69/69 passing
 make debug        # DEBUG=1: -g3 -O0 -DDEBUG build
 make examples     # build examples/example_kes_usage.c
 make run-example  # build and run the example program
@@ -168,9 +183,10 @@ which clones the sibling `kanek_foundations` (KFL) repo to
 `../kanek_foundations` if it isn't already checked out there —
 `-I../kanek_foundations/src` is on the include path so `trace.h` is
 reachable. `make foundations` builds `libkfl.a` from that checkout
-on demand (not a prerequisite of `all`). As of this writing nothing in
-`src/` actually includes or links KFL yet — see the Rule 11 note
-below.
+on demand (not a prerequisite of `all`). `kes_cache.c` and
+`kes_storage.c` both `#include "trace.h"` from that checkout now (see
+the Rule 11 note above) — but only for that header-only macro subset;
+nothing in `src/` links `libkfl.a`.
 
 ## Architecture
 

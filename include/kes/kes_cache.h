@@ -49,11 +49,17 @@ typedef enum {
     KES_EXTENT_ERROR    = 0x20   /* I/O error occurred */
 } kes_extent_state_t;
 
-/* Cache eviction policies */
+/* Cache eviction policies. Only KES_CACHE_LRU is currently
+ * implemented -- kes_cache_create() rejects KES_CACHE_LFU and
+ * KES_CACHE_CUSTOM with NULL rather than silently falling back to
+ * LRU behavior for a config that asked for something else. */
 typedef enum {
     KES_CACHE_LRU = 0,           /* Least Recently Used */
-    KES_CACHE_LFU,               /* Least Frequently Used */
-    KES_CACHE_CUSTOM             /* Custom policy */
+    KES_CACHE_LFU,               /* Least Frequently Used -- NOT
+                                   * implemented, rejected at
+                                   * kes_cache_create() */
+    KES_CACHE_CUSTOM             /* Custom policy -- NOT implemented,
+                                   * rejected at kes_cache_create() */
 } kes_cache_policy_t;
 
 /* Cache configuration */
@@ -93,6 +99,43 @@ struct kes_extent_entry {
     uint64_t access_time;        /* Last access timestamp */
     uint64_t access_count;       /* Total access count */
     size_t data_size;            /* Size of cached data */
+
+    /* Number of callers currently holding a raw pointer to this
+     * entry -- from hash_find()/hash_find_or_insert() (protected by
+     * the entry's hash bucket lock), or mid-traversal in
+     * cache_sweep()/make_room_for_new_entry() (protected by
+     * cache_lock, since that is what the LRU list itself requires;
+     * see the Sweep/Eviction Logic comment in kes_cache.c) -- but
+     * has not yet locked `lock` below. Modified only via __atomic
+     * builtins. try_evict_entry_locked() (kes_cache.c) will not
+     * free an entry while lookup_pins is nonzero, checked while
+     * holding *both* the bucket lock and cache_lock at once (the
+     * two locks that separately protect the two kinds of pinner
+     * above), so a pin taken under either one is guaranteed visible.
+     * Every pinner releases its pin immediately after acquiring
+     * `lock`. Without this, freeing an entry a concurrent lookup or
+     * traversal has already found (but not yet locked) would be a
+     * use-after-free the moment that caller proceeds to lock the
+     * now-destroyed mutex. */
+    uint32_t lookup_pins;
+
+    /* Number of threads currently inside the
+     * kes_cache_get_extent() wait-loop for this entry's
+     * KES_EXTENT_LOADING flag to clear (src/kes_cache.c). Modified
+     * only while `lock` is held, same as ref_count/pin_count/state.
+     * This exists because pthread_cond_wait() internally unlocks
+     * `lock` while parked, then re-locks it before returning -- so
+     * a waiter does NOT continuously hold `lock` for the loop's
+     * whole duration even though the code looks like it does, and
+     * lookup_pins offers no protection here (the waiter already
+     * locked `lock` once, well before this gap). Without
+     * cond_waiters, an entry whose ref_count has genuinely dropped
+     * to 0 could be freed (destroying `lock/cond`) while a
+     * still-parked waiter is registered on that soon-to-be-invalid
+     * condvar/mutex pair, which is undefined behavior the instant it
+     * wakes and tries to re-lock. try_evict_entry_locked() refuses
+     * to evict while cond_waiters != 0. */
+    uint32_t cond_waiters;
 
     /* Hash table linkage */
     struct kes_extent_entry *hash_next;
@@ -150,7 +193,9 @@ struct kes_cache {
  * ================================================================= */
 
 /**
- * Create a new cache instance
+ * Create a new cache instance. Returns NULL if config is invalid,
+ * including config->policy requesting KES_CACHE_LFU or
+ * KES_CACHE_CUSTOM (unimplemented -- see kes_cache_policy_t).
  * @param config Cache configuration
  * @return Cache handle or NULL on error
  */
@@ -164,7 +209,12 @@ kes_cache_t *kes_cache_create( const kes_cache_config_t *config);
 int kes_cache_destroy( kes_cache_t *cache);
 
 /**
- * Start background cache management threads
+ * Start background cache management threads. Each thread wakes
+ * every config.sync_interval_ms (against CLOCK_MONOTONIC, immune to
+ * wall-clock adjustments) and runs the same flush-then-evict sweep
+ * kes_cache_sync() runs manually. Returns KES_ERROR_EXISTS if
+ * threads are already running (call kes_cache_stop() first to
+ * restart), KES_ERROR_INVALID if config.background_threads <= 0.
  * @param cache Cache handle
  * @return KES_SUCCESS or error code
  */
@@ -182,7 +232,11 @@ int kes_cache_stop( kes_cache_t *cache);
  * ================================================================= */
 
 /**
- * Get extent data (load from disk if not cached)
+ * Get extent data (load from disk if not cached). On a cache miss,
+ * evicts from the LRU tail as needed to stay within
+ * config.max_entries/config.max_memory; returns KES_ERROR_BUSY if
+ * eviction cannot free enough room (every cached entry is currently
+ * referenced or pinned).
  * @param cache Cache handle
  * @param id Extent identifier
  * @param buffer Pointer to receive data buffer
@@ -238,14 +292,24 @@ int kes_cache_flush_extent( kes_cache_t *cache,
                              const kes_extent_id_t *id);
 
 /**
- * Flush all dirty extents to disk (sync operation)
+ * Flush all dirty extents to disk (sync operation), then free any
+ * entry that is unreferenced and unpinned after its flush attempt.
+ * Entries still referenced or pinned are flushed if dirty but never
+ * freed -- this is a durability checkpoint, not a full eviction
+ * pass. A clean no-op on an empty cache.
  * @param cache Cache handle
  * @return KES_SUCCESS or error code
  */
 int kes_cache_sync( kes_cache_t *cache);
 
 /**
- * Invalidate extent (remove from cache)
+ * Invalidate extent (remove from cache). WARNING: discards any
+ * dirty data unconditionally, without writing it back -- this is
+ * the difference between invalidate() (discard) and sync()/
+ * flush_extent() (persist). Call flush_extent() first if the data
+ * needs to survive. Returns KES_ERROR_NOTFOUND if the extent isn't
+ * cached, KES_ERROR_BUSY if it is currently referenced or pinned
+ * (ref_count > 0 || pin_count > 0).
  * @param cache Cache handle
  * @param id Extent identifier
  * @return KES_SUCCESS or error code
@@ -266,7 +330,13 @@ int kes_cache_invalidate( kes_cache_t *cache,
 int kes_cache_get_stats( kes_cache_t *cache, kes_cache_stats_t *stats);
 
 /**
- * Reset cache statistics
+ * Reset cache statistics. Resets only the cumulative counters
+ * (hits, misses, evictions, flushes, bytes_read, bytes_written) to
+ * zero. Does NOT reset the state counters (memory_used,
+ * entries_cached, entries_dirty, entries_pinned) -- those describe
+ * the cache's current contents, not history, and zeroing them would
+ * desynchronize stats from reality until the next operation
+ * happened to correct it.
  * @param cache Cache handle
  * @return KES_SUCCESS or error code
  */

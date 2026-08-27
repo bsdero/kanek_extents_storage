@@ -890,6 +890,701 @@ static bool test_concurrent_miss_no_duplicate_entry() {
     TEST_PASS("Concurrent miss on same extent creates only one entry");
 }
 
+/*
+ * Phase 3 tests: kes_cache_sync(), kes_cache_invalidate(),
+ * kes_cache_reset_stats(), kes_cache_start() -- PENDING_ITEMS.md
+ * Phase 3 / KES_HARDENING_PLAN.md S4.
+ */
+
+/**
+ * kes_cache_sync() must flush a dirty entry to the backing store and,
+ * once the entry is unreferenced/unpinned after the flush attempt,
+ * free it -- and must be a clean no-op on an already-empty cache.
+ */
+static bool test_cache_sync() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent,
+                              mock_write_extent, mock_sync_device);
+
+    kes_extent_id_t id = {
+        .start_block = 20,
+        .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+
+    void *buffer = NULL;
+    int result = kes_cache_get_extent(cache, &id, &buffer);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to get extent");
+
+    memset(buffer, 0xAB, TEST_BLOCK_SIZE);
+    result = kes_cache_mark_dirty(cache, &id);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to mark dirty");
+
+    result = kes_cache_put_extent(cache, &id);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to put extent");
+
+    result = kes_cache_sync(cache);
+    TEST_ASSERT(result == KES_SUCCESS, "sync() failed");
+
+    kes_cache_stats_t stats;
+    kes_cache_get_stats(cache, &stats);
+    TEST_ASSERT(stats.flushes == 1, "Expected 1 flush from sync()");
+    TEST_ASSERT(stats.entries_dirty == 0,
+               "Expected 0 dirty entries after sync()");
+    TEST_ASSERT(stats.entries_cached == 0,
+               "Unreferenced/unpinned entry should have been freed "
+               "by sync() after its flush");
+
+    uint8_t expected[TEST_BLOCK_SIZE];
+    memset(expected, 0xAB, TEST_BLOCK_SIZE);
+    TEST_ASSERT(memcmp(g_mock_storage[20].pattern, expected,
+                      TEST_BLOCK_SIZE) == 0,
+               "Dirty data was not written back by sync()");
+
+    /* sync() on an empty cache must be a clean no-op. */
+    result = kes_cache_sync(cache);
+    TEST_ASSERT(result == KES_SUCCESS,
+               "sync() on an empty cache should succeed as a no-op");
+
+    kes_cache_destroy(cache);
+    TEST_PASS("Cache sync");
+}
+
+/**
+ * kes_cache_sync() must flush a dirty entry that is still referenced,
+ * but must NOT free it -- a durability checkpoint, not an eviction
+ * pass, per KES_HARDENING_PLAN.md S4.1 point 3.
+ */
+static bool test_cache_sync_keeps_referenced_entries() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent,
+                              mock_write_extent, mock_sync_device);
+
+    kes_extent_id_t id = {
+        .start_block = 21,
+        .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+
+    void *buffer = NULL;
+    int result = kes_cache_get_extent(cache, &id, &buffer);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to get extent");
+
+    result = kes_cache_mark_dirty(cache, &id);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to mark dirty");
+
+    /* Deliberately no put_extent() here -- entry stays referenced
+     * (ref_count == 1) through the sync() call below. */
+    result = kes_cache_sync(cache);
+    TEST_ASSERT(result == KES_SUCCESS, "sync() failed");
+
+    kes_cache_stats_t stats;
+    kes_cache_get_stats(cache, &stats);
+    TEST_ASSERT(stats.flushes == 1,
+               "Referenced dirty entry should still be flushed");
+    TEST_ASSERT(stats.entries_dirty == 0,
+               "Expected 0 dirty entries after sync()");
+    TEST_ASSERT(stats.entries_cached == 1,
+               "Referenced entry must survive sync() -- not freed");
+
+    kes_cache_put_extent(cache, &id);
+    kes_cache_destroy(cache);
+    TEST_PASS("Cache sync keeps referenced entries");
+}
+
+/**
+ * kes_cache_invalidate() success/error-path coverage (S4.2):
+ * NOTFOUND for an uncached id, BUSY while referenced, SUCCESS (and
+ * entry actually removed) once unreferenced/unpinned.
+ */
+static bool test_cache_invalidate() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent,
+                              mock_write_extent, mock_sync_device);
+
+    kes_extent_id_t missing_id = {
+        .start_block = 998, .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+    int result = kes_cache_invalidate(cache, &missing_id);
+    TEST_ASSERT(result == KES_ERROR_NOTFOUND,
+               "Expected NOTFOUND for an uncached extent");
+
+    kes_extent_id_t busy_id = {
+        .start_block = 22, .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+    void *buffer = NULL;
+    result = kes_cache_get_extent(cache, &busy_id, &buffer);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to get extent");
+
+    /* Deliberately no put_extent() -- still referenced. */
+    result = kes_cache_invalidate(cache, &busy_id);
+    TEST_ASSERT(result == KES_ERROR_BUSY,
+               "Expected BUSY while the extent is still referenced");
+    kes_cache_put_extent(cache, &busy_id);
+
+    kes_extent_id_t id = {
+        .start_block = 23, .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+    result = kes_cache_get_extent(cache, &id, &buffer);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to get extent");
+    kes_cache_put_extent(cache, &id);
+
+    result = kes_cache_invalidate(cache, &id);
+    TEST_ASSERT(result == KES_SUCCESS,
+               "Expected SUCCESS invalidating an unreferenced entry");
+
+    kes_cache_stats_t stats;
+    kes_cache_get_stats(cache, &stats);
+    TEST_ASSERT(stats.entries_cached == 1,
+               "Only busy_id should remain cached -- id was "
+               "invalidated and freed, busy_id was only put(), "
+               "never invalidated");
+
+    kes_cache_destroy(cache);
+    TEST_PASS("Cache invalidate");
+}
+
+/**
+ * kes_cache_invalidate() must discard dirty data unconditionally,
+ * WITHOUT writing it back -- the data-loss semantics S4.2 requires
+ * to distinguish it from sync()/flush_extent().
+ */
+static bool test_cache_invalidate_discards_dirty_data() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent,
+                              mock_write_extent, mock_sync_device);
+
+    kes_extent_id_t id = {
+        .start_block = 24, .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+
+    void *buffer = NULL;
+    int result = kes_cache_get_extent(cache, &id, &buffer);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to get extent");
+
+    memset(buffer, 0xCD, TEST_BLOCK_SIZE);
+    result = kes_cache_mark_dirty(cache, &id);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to mark dirty");
+    result = kes_cache_put_extent(cache, &id);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to put extent");
+
+    kes_cache_stats_t before;
+    kes_cache_get_stats(cache, &before);
+
+    result = kes_cache_invalidate(cache, &id);
+    TEST_ASSERT(result == KES_SUCCESS, "invalidate() failed");
+
+    kes_cache_stats_t after;
+    kes_cache_get_stats(cache, &after);
+    TEST_ASSERT(after.flushes == before.flushes,
+               "invalidate() must not flush dirty data");
+    TEST_ASSERT(after.entries_dirty == 0,
+               "entries_dirty should be decremented for the "
+               "discarded entry");
+
+    uint8_t not_expected[TEST_BLOCK_SIZE];
+    memset(not_expected, 0xCD, TEST_BLOCK_SIZE);
+    TEST_ASSERT(memcmp(g_mock_storage[24].pattern, not_expected,
+                      TEST_BLOCK_SIZE) != 0,
+               "invalidate() must discard dirty data, not persist it");
+
+    kes_cache_destroy(cache);
+    TEST_PASS("Cache invalidate discards dirty data without flush");
+}
+
+/**
+ * kes_cache_reset_stats() must zero only the cumulative counters
+ * (hits/misses/evictions/flushes/bytes_read/bytes_written) and
+ * leave the state counters (memory_used/entries_cached/
+ * entries_dirty/entries_pinned) unchanged (S4.3).
+ */
+static bool test_cache_reset_stats() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent,
+                              mock_write_extent, mock_sync_device);
+
+    kes_extent_id_t id = {
+        .start_block = 26, .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+
+    void *buffer = NULL;
+    int result = kes_cache_get_extent(cache, &id, &buffer);  /* miss */
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to get extent");
+    kes_cache_put_extent(cache, &id);
+
+    result = kes_cache_get_extent(cache, &id, &buffer);       /* hit */
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to get extent (hit)");
+
+    kes_cache_mark_dirty(cache, &id);
+    kes_cache_pin_extent(cache, &id);
+
+    kes_cache_stats_t before;
+    kes_cache_get_stats(cache, &before);
+    TEST_ASSERT(before.hits >= 1 && before.misses >= 1 &&
+               before.bytes_read > 0,
+               "Sanity check: expected nonzero cumulative counters "
+               "before reset");
+    TEST_ASSERT(before.entries_cached == 1 && before.entries_dirty == 1
+               && before.entries_pinned == 1 && before.memory_used > 0,
+               "Sanity check: expected nonzero state counters before "
+               "reset");
+
+    result = kes_cache_reset_stats(cache);
+    TEST_ASSERT(result == KES_SUCCESS, "reset_stats() failed");
+
+    kes_cache_stats_t after;
+    kes_cache_get_stats(cache, &after);
+    TEST_ASSERT(after.hits == 0 && after.misses == 0 &&
+               after.evictions == 0 && after.flushes == 0 &&
+               after.bytes_read == 0 && after.bytes_written == 0,
+               "Cumulative counters must be zero after reset_stats()");
+    TEST_ASSERT(after.memory_used == before.memory_used &&
+               after.entries_cached == before.entries_cached &&
+               after.entries_dirty == before.entries_dirty &&
+               after.entries_pinned == before.entries_pinned,
+               "State counters must survive reset_stats() unchanged");
+
+    kes_cache_unpin_extent(cache, &id);
+    kes_cache_put_extent(cache, &id);
+    kes_cache_destroy(cache);
+    TEST_PASS("Cache reset_stats preserves state counters");
+}
+
+/**
+ * kes_cache_start() must actually run automatic background
+ * flushing -- the one behavior the whole background-thread design
+ * exists to deliver (S3.4 acceptance criteria) -- and must reject a
+ * second start() while already running, and reject
+ * background_threads <= 0.
+ */
+static bool test_cache_start_background_flush() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+    config.background_threads = 1;
+    config.sync_interval_ms = 50;  /* fast, for test speed */
+
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent,
+                              mock_write_extent, mock_sync_device);
+
+    kes_extent_id_t id = {
+        .start_block = 27, .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+
+    void *buffer = NULL;
+    int result = kes_cache_get_extent(cache, &id, &buffer);
+    TEST_ASSERT(result == KES_SUCCESS, "Failed to get extent");
+
+    memset(buffer, 0xEF, TEST_BLOCK_SIZE);
+    kes_cache_mark_dirty(cache, &id);
+    kes_cache_put_extent(cache, &id);  /* ref 0 -- eligible for the
+                                         * background sweep to flush
+                                         * and free */
+
+    result = kes_cache_start(cache);
+    TEST_ASSERT(result == KES_SUCCESS,
+               "Failed to start background thread");
+
+    result = kes_cache_start(cache);
+    TEST_ASSERT(result == KES_ERROR_EXISTS,
+               "Expected EXISTS starting an already-running cache");
+
+    /* No explicit sync()/flush_extent() call anywhere in this test
+     * from here on -- only the background thread can flush this
+     * entry. Sleep several sync intervals to avoid a timing-flaky
+     * single-interval wait. */
+    usleep(50000 * 6);  /* 300ms, 6x the 50ms interval */
+
+    kes_cache_stats_t stats;
+    kes_cache_get_stats(cache, &stats);
+    TEST_ASSERT(stats.flushes >= 1,
+               "Background thread should have flushed the dirty "
+               "entry automatically");
+
+    uint8_t expected[TEST_BLOCK_SIZE];
+    memset(expected, 0xEF, TEST_BLOCK_SIZE);
+    TEST_ASSERT(memcmp(g_mock_storage[27].pattern, expected,
+                      TEST_BLOCK_SIZE) == 0,
+               "Background flush should have written the dirty data "
+               "to the mock backing store");
+
+    result = kes_cache_stop(cache);
+    TEST_ASSERT(result == KES_SUCCESS,
+               "Failed to stop background thread");
+
+    /* A second stop() (kes_cache_destroy() below issues one too)
+     * must be safe/idempotent, not double-join. */
+    result = kes_cache_stop(cache);
+    TEST_ASSERT(result == KES_SUCCESS,
+               "Second stop() call should be safe/idempotent");
+
+    kes_cache_destroy(cache);
+    TEST_PASS("Background thread automatically flushes dirty entries");
+}
+
+/**
+ * kes_cache_start() must reject a nonsensical thread count instead
+ * of silently doing nothing.
+ */
+static bool test_cache_start_rejects_zero_threads() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+    config.background_threads = 0;
+
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    int result = kes_cache_start(cache);
+    TEST_ASSERT(result == KES_ERROR_INVALID,
+               "Expected INVALID for background_threads <= 0");
+
+    kes_cache_destroy(cache);
+    TEST_PASS("Start rejects background_threads <= 0");
+}
+
+/*
+ * Phase 4 tests: capacity enforcement / eviction --
+ * PENDING_ITEMS.md Phase 4 / KES_HARDENING_PLAN.md S5.
+ */
+
+/**
+ * Filling a small-max_entries cache with far more distinct,
+ * unreferenced extents than it can hold must never let
+ * stats.entries_cached exceed config.max_entries, and must actually
+ * evict (S5.1's acceptance criteria).
+ */
+static bool test_cache_eviction_respects_max_entries() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+    config.max_entries = KES_CACHE_MIN_ENTRIES;  /* 16 */
+
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent,
+                              mock_write_extent, mock_sync_device);
+
+    for (int i = 0; i < 40; i++) {
+        kes_extent_id_t id = {
+            .start_block = (uint64_t)i, .block_count = 1,
+            .block_size = TEST_BLOCK_SIZE
+        };
+        void *buffer = NULL;
+        int result = kes_cache_get_extent(cache, &id, &buffer);
+        TEST_ASSERT(result == KES_SUCCESS,
+                   "get_extent failed while filling cache past "
+                   "max_entries");
+        kes_cache_put_extent(cache, &id);
+
+        kes_cache_stats_t stats;
+        kes_cache_get_stats(cache, &stats);
+        TEST_ASSERT(stats.entries_cached <= config.max_entries,
+                   "entries_cached exceeded configured max_entries");
+    }
+
+    kes_cache_stats_t stats;
+    kes_cache_get_stats(cache, &stats);
+    TEST_ASSERT(stats.evictions > 0,
+               "Expected evictions once max_entries was exceeded");
+
+    kes_cache_destroy(cache);
+    TEST_PASS("Eviction respects max_entries");
+}
+
+/**
+ * Pinned entries must never be evicted, even when the cache is
+ * repeatedly pushed well past max_entries by other traffic (S5.1
+ * acceptance criteria, second test).
+ */
+static bool test_cache_pinned_entries_never_evicted() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+    config.max_entries = KES_CACHE_MIN_ENTRIES;  /* 16 */
+
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent,
+                              mock_write_extent, mock_sync_device);
+
+    kes_extent_id_t pinned_ids[4];
+    for (int i = 0; i < 4; i++) {
+        pinned_ids[i].start_block = (uint64_t)i;
+        pinned_ids[i].block_count = 1;
+        pinned_ids[i].block_size = TEST_BLOCK_SIZE;
+
+        void *buffer = NULL;
+        int result = kes_cache_get_extent(cache, &pinned_ids[i],
+                                         &buffer);
+        TEST_ASSERT(result == KES_SUCCESS,
+                   "get_extent failed for a to-be-pinned entry");
+        result = kes_cache_pin_extent(cache, &pinned_ids[i]);
+        TEST_ASSERT(result == KES_SUCCESS, "pin_extent failed");
+        result = kes_cache_put_extent(cache, &pinned_ids[i]);
+        TEST_ASSERT(result == KES_SUCCESS, "put_extent failed");
+    }
+
+    for (int i = 10; i < 50; i++) {
+        kes_extent_id_t id = {
+            .start_block = (uint64_t)i, .block_count = 1,
+            .block_size = TEST_BLOCK_SIZE
+        };
+        void *buffer = NULL;
+        int result = kes_cache_get_extent(cache, &id, &buffer);
+        TEST_ASSERT(result == KES_SUCCESS,
+                   "get_extent failed while pushing past max_entries");
+        kes_cache_put_extent(cache, &id);
+    }
+
+    kes_cache_stats_t before;
+    kes_cache_get_stats(cache, &before);
+
+    for (int i = 0; i < 4; i++) {
+        void *buffer = NULL;
+        int result = kes_cache_get_extent(cache, &pinned_ids[i],
+                                         &buffer);
+        TEST_ASSERT(result == KES_SUCCESS,
+                   "Pinned entry should still be gettable");
+        TEST_ASSERT(
+            validate_test_data( (const uint8_t *)buffer,
+                                 pinned_ids[i].start_block),
+            "Pinned entry data corrupted or reloaded incorrectly");
+        kes_cache_put_extent(cache, &pinned_ids[i]);
+        kes_cache_unpin_extent(cache, &pinned_ids[i]);
+    }
+
+    kes_cache_stats_t after;
+    kes_cache_get_stats(cache, &after);
+    TEST_ASSERT(after.hits == before.hits + 4,
+               "All 4 pinned entries should have been cache hits, "
+               "confirming none were evicted under capacity "
+               "pressure");
+
+    kes_cache_destroy(cache);
+    TEST_PASS("Pinned entries are never evicted under capacity "
+              "pressure");
+}
+
+/**
+ * When the cache is full and every entry is pinned (so eviction can
+ * free nothing), a further cache miss must return KES_ERROR_BUSY
+ * rather than silently exceeding max_entries (S5.2).
+ */
+static bool test_cache_get_extent_busy_when_full_and_pinned() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+    config.max_entries = KES_CACHE_MIN_ENTRIES;  /* 16 */
+
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent,
+                              mock_write_extent, mock_sync_device);
+
+    kes_extent_id_t ids[KES_CACHE_MIN_ENTRIES];
+    for (uint32_t i = 0; i < KES_CACHE_MIN_ENTRIES; i++) {
+        ids[i].start_block = (uint64_t)i;
+        ids[i].block_count = 1;
+        ids[i].block_size = TEST_BLOCK_SIZE;
+
+        void *buffer = NULL;
+        int result = kes_cache_get_extent(cache, &ids[i], &buffer);
+        TEST_ASSERT(result == KES_SUCCESS,
+                   "Failed to fill cache to max_entries");
+        result = kes_cache_pin_extent(cache, &ids[i]);
+        TEST_ASSERT(result == KES_SUCCESS, "pin_extent failed");
+        kes_cache_put_extent(cache, &ids[i]);
+    }
+
+    kes_extent_id_t overflow_id = {
+        .start_block = 90, .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+    void *buffer = NULL;
+    int result = kes_cache_get_extent(cache, &overflow_id, &buffer);
+    TEST_ASSERT(result == KES_ERROR_BUSY,
+               "Expected BUSY when the cache is full of pinned "
+               "entries and cannot evict enough room");
+    TEST_ASSERT(buffer == NULL, "Output buffer should stay NULL");
+
+    for (uint32_t i = 0; i < KES_CACHE_MIN_ENTRIES; i++) {
+        kes_cache_unpin_extent(cache, &ids[i]);
+    }
+
+    kes_cache_destroy(cache);
+    TEST_PASS("get_extent returns BUSY when full and cannot evict");
+}
+
+/**
+ * kes_cache_create() must reject KES_CACHE_LFU and KES_CACHE_CUSTOM
+ * (unimplemented policies, S5.3) rather than silently behaving as
+ * if KES_CACHE_LRU had been requested, and must still accept
+ * KES_CACHE_LRU.
+ */
+static bool test_cache_create_rejects_unimplemented_policy() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+
+    config.policy = KES_CACHE_LFU;
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache == NULL,
+               "kes_cache_create() should reject KES_CACHE_LFU");
+
+    config.policy = KES_CACHE_CUSTOM;
+    cache = kes_cache_create(&config);
+    TEST_ASSERT(cache == NULL,
+               "kes_cache_create() should reject KES_CACHE_CUSTOM");
+
+    config.policy = KES_CACHE_LRU;
+    cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL,
+               "kes_cache_create() should still accept KES_CACHE_LRU");
+    kes_cache_destroy(cache);
+
+    TEST_PASS("create() rejects unimplemented eviction policies");
+}
+
+/*
+ * S6.C: the highest-value concurrency test in
+ * KES_HARDENING_PLAN.md -- one thread calling sync() repeatedly
+ * while other threads continuously get/put a small, overlapping
+ * pool of extent ids, run under a small max_entries so real
+ * eviction pressure (not just flushing) is exercised too. This is
+ * exactly the interleaving that would expose a use-after-free if
+ * the lookup_pins-protected eviction path (src/kes_cache.c) has a
+ * bug -- run under ASan/TSan, not just the normal build.
+ */
+typedef struct {
+    kes_cache_t *cache;
+    kes_extent_id_t *ids;
+    int num_ids;
+    int iterations;
+    bool success;
+} mixed_thread_data_t;
+
+static void *mixed_get_put_thread(void *arg) {
+    mixed_thread_data_t *data = (mixed_thread_data_t*)arg;
+    data->success = true;
+
+    for (int i = 0; i < data->iterations; i++) {
+        kes_extent_id_t *id = &data->ids[i % data->num_ids];
+        void *buffer = NULL;
+        int result = kes_cache_get_extent(data->cache, id, &buffer);
+
+        if (result != KES_SUCCESS && result != KES_ERROR_BUSY) {
+            data->success = false;
+            break;
+        }
+        if (result == KES_SUCCESS) {
+            kes_cache_put_extent(data->cache, id);
+        }
+    }
+    return NULL;
+}
+
+static void *mixed_sync_thread(void *arg) {
+    mixed_thread_data_t *data = (mixed_thread_data_t*)arg;
+
+    for (int i = 0; i < data->iterations; i++) {
+        kes_cache_sync(data->cache);
+    }
+    return NULL;
+}
+
+static bool test_concurrent_sync_vs_get_put() {
+    kes_cache_config_t config;
+    kes_cache_get_default_config(&config, false);
+    config.max_entries = KES_CACHE_MIN_ENTRIES;  /* force real
+                                                    * eviction
+                                                    * pressure, not
+                                                    * just flushing */
+
+    kes_cache_t *cache = kes_cache_create(&config);
+    TEST_ASSERT(cache != NULL, "Cache creation failed");
+
+    kes_cache_set_io_callbacks(cache, mock_read_extent,
+                              mock_write_extent, mock_sync_device);
+
+    kes_extent_id_t ids[8];
+    for (int i = 0; i < 8; i++) {
+        ids[i].start_block = (uint64_t)(60 + i);
+        ids[i].block_count = 1;
+        ids[i].block_size = TEST_BLOCK_SIZE;
+    }
+
+    pthread_t get_put_threads[4];
+    mixed_thread_data_t get_put_data[4];
+    pthread_t sync_threads[2];
+    mixed_thread_data_t sync_data[2];
+
+    for (int i = 0; i < 4; i++) {
+        get_put_data[i].cache = cache;
+        get_put_data[i].ids = ids;
+        get_put_data[i].num_ids = 8;
+        get_put_data[i].iterations = 200;
+        get_put_data[i].success = false;
+
+        int rc = pthread_create(&get_put_threads[i], NULL,
+                                mixed_get_put_thread,
+                                &get_put_data[i]);
+        TEST_ASSERT(rc == 0, "Failed to create get/put thread");
+    }
+
+    for (int i = 0; i < 2; i++) {
+        sync_data[i].cache = cache;
+        sync_data[i].iterations = 100;
+
+        int rc = pthread_create(&sync_threads[i], NULL,
+                                mixed_sync_thread, &sync_data[i]);
+        TEST_ASSERT(rc == 0, "Failed to create sync thread");
+    }
+
+    for (int i = 0; i < 4; i++) {
+        pthread_join(get_put_threads[i], NULL);
+        TEST_ASSERT(get_put_data[i].success,
+                   "A get/put thread failed unexpectedly");
+    }
+    for (int i = 0; i < 2; i++) {
+        pthread_join(sync_threads[i], NULL);
+    }
+
+    kes_cache_destroy(cache);
+    TEST_PASS("Concurrent sync() vs get/put on overlapping ids");
+}
+
 /* =================================================================
  * Test Runner
  * ================================================================= */
@@ -927,6 +1622,27 @@ static test_case_t test_suite[] = {
     { "Concurrent Access", test_concurrent_access },
     { "Concurrent Miss No Duplicate Entry",
       test_concurrent_miss_no_duplicate_entry },
+    { "Cache Sync", test_cache_sync },
+    { "Cache Sync Keeps Referenced Entries",
+      test_cache_sync_keeps_referenced_entries },
+    { "Cache Invalidate", test_cache_invalidate },
+    { "Cache Invalidate Discards Dirty Data",
+      test_cache_invalidate_discards_dirty_data },
+    { "Cache Reset Stats", test_cache_reset_stats },
+    { "Cache Start Background Flush",
+      test_cache_start_background_flush },
+    { "Cache Start Rejects Zero Threads",
+      test_cache_start_rejects_zero_threads },
+    { "Cache Eviction Respects Max Entries",
+      test_cache_eviction_respects_max_entries },
+    { "Cache Pinned Entries Never Evicted",
+      test_cache_pinned_entries_never_evicted },
+    { "Cache Get Extent Busy When Full And Pinned",
+      test_cache_get_extent_busy_when_full_and_pinned },
+    { "Cache Create Rejects Unimplemented Policy",
+      test_cache_create_rejects_unimplemented_policy },
+    { "Concurrent Sync vs Get/Put",
+      test_concurrent_sync_vs_get_put },
     { NULL, NULL } /* Terminator */
 };
 
