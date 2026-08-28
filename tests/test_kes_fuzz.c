@@ -24,8 +24,7 @@
  * - test_bitmap_fuzz_vs_reference(): drives kes_bitmap_t and a
  *   naive, trivially-correct reference bitmap through the same
  *   randomized set_range/clear_range/find_free sequence and compares
- *   them bit-for-bit after every operation. (Added in a follow-up
- *   commit -- see git history/PENDING_ITEMS.md.)
+ *   them bit-for-bit after every operation.
  *
  * Both read KES_TEST_SEED (default time(NULL)) and KES_FUZZ_ITERATIONS
  * (default a few thousand) from the environment and print the seed
@@ -335,6 +334,258 @@ static bool test_cache_invariant_fuzz(void) {
 }
 
 /* =================================================================
+ * A.6.2 -- Bitmap fuzz vs. naive reference
+ * ================================================================= */
+
+/* Deliberately not a multiple of 8 -- forces the bitmap's final byte
+ * to be partially used, so "byte-boundary-exact" and "whole bitmap"
+ * range flavors below are meaningfully distinct from each other. */
+#define BITMAP_FUZZ_TOTAL_BITS 251
+
+typedef struct {
+    uint8_t *bits;         /* one byte per bit: 0 or 1 */
+    uint64_t total_bits;
+} naive_bitmap_t;
+
+static naive_bitmap_t *naive_bitmap_create( uint64_t total_bits) {
+    naive_bitmap_t *nb = calloc( 1, sizeof(naive_bitmap_t));
+
+    if ( nb == NULL) {
+        return(NULL);
+    }
+
+    nb->bits = calloc( total_bits, sizeof(uint8_t));
+    if ( nb->bits == NULL) {
+        free( nb);
+        return(NULL);
+    }
+
+    nb->total_bits = total_bits;
+    return(nb);
+}
+
+static void naive_bitmap_destroy( naive_bitmap_t *nb) {
+    if ( nb == NULL) {
+        return;
+    }
+
+    free( nb->bits);
+    free( nb);
+}
+
+static void naive_set_range( naive_bitmap_t *nb, uint64_t start,
+                              uint32_t count) {
+    for ( uint32_t i = 0; i < count; i++) {
+        nb->bits[start + i] = 1;
+    }
+}
+
+static void naive_clear_range( naive_bitmap_t *nb, uint64_t start,
+                                uint32_t count) {
+    for ( uint32_t i = 0; i < count; i++) {
+        nb->bits[start + i] = 0;
+    }
+}
+
+static uint64_t naive_free_bits( naive_bitmap_t *nb) {
+    uint64_t free_count = 0;
+
+    for ( uint64_t i = 0; i < nb->total_bits; i++) {
+        if ( nb->bits[i] == 0) {
+            free_count++;
+        }
+    }
+
+    return(free_count);
+}
+
+/*
+ * Mirrors kes_bitmap_find_free()'s exact search order (linear scan
+ * from the clamped hint to the end, then wrap and scan 0-to-hint) so
+ * its result -- success/failure and the returned start bit -- can be
+ * compared directly with the real implementation, not just checked
+ * for "some valid free run." The upfront free-bit-count guard also
+ * mirrors the real function's use of a tracked free_bits counter
+ * rather than a fresh scan.
+ */
+static bool naive_find_free( naive_bitmap_t *nb, uint32_t count,
+                              uint64_t hint, uint64_t *found_start) {
+    if ( count == 0 || naive_free_bits( nb) < count) {
+        return(false);
+    }
+
+    uint64_t search_start = hint;
+    if ( search_start >= nb->total_bits) {
+        search_start = 0;
+    }
+
+    for ( uint64_t start = search_start;
+         start <= nb->total_bits - count; start++) {
+        bool ok = true;
+        for ( uint32_t i = 0; i < count && ok; i++) {
+            if ( nb->bits[start + i] != 0) {
+                ok = false;
+            }
+        }
+        if ( ok) {
+            *found_start = start;
+            return(true);
+        }
+    }
+
+    if ( search_start > 0) {
+        for ( uint64_t start = 0;
+             start < search_start &&
+             start <= nb->total_bits - count; start++) {
+            bool ok = true;
+            for ( uint32_t i = 0; i < count && ok; i++) {
+                if ( nb->bits[start + i] != 0) {
+                    ok = false;
+                }
+            }
+            if ( ok) {
+                *found_start = start;
+                return(true);
+            }
+        }
+    }
+
+    return(false);
+}
+
+static bool test_bitmap_fuzz_vs_reference(void) {
+    unsigned int seed = fuzz_get_seed();
+    long iterations = fuzz_get_iterations();
+
+    printf( "INFO: bitmap fuzz seed=%u iterations=%ld total_bits=%d "
+            "(rerun with KES_TEST_SEED=%u to reproduce a failure)\n",
+            seed, iterations, BITMAP_FUZZ_TOTAL_BITS, seed);
+    srand( seed);
+
+    kes_bitmap_t *bm = NULL;
+    TEST_ASSERT( kes_bitmap_create( BITMAP_FUZZ_TOTAL_BITS, &bm) ==
+                 KES_SUCCESS, "fuzz bitmap create");
+
+    naive_bitmap_t *nb = naive_bitmap_create( BITMAP_FUZZ_TOTAL_BITS);
+    TEST_ASSERT( nb != NULL, "fuzz naive bitmap create");
+
+    for ( long iter = 0; iter < iterations; iter++) {
+        int op = rand() % 3;
+        int flavor = (int)(iter % 10);
+        uint64_t start;
+        uint32_t count;
+
+        if ( flavor == 0) {
+            /* whole bitmap */
+            start = 0;
+            count = BITMAP_FUZZ_TOTAL_BITS;
+        } else if ( flavor == 1) {
+            /* byte-boundary-exact, multi-byte */
+            start = (uint64_t)( rand() %
+                                 (BITMAP_FUZZ_TOTAL_BITS / 8)) * 8;
+            uint32_t max_count =
+                (uint32_t)(BITMAP_FUZZ_TOTAL_BITS - start);
+            uint32_t bytes_left = max_count / 8;
+            count = (bytes_left > 0) ?
+                    (uint32_t)(rand() % bytes_left + 1) * 8 : 8;
+            if ( start + count > BITMAP_FUZZ_TOTAL_BITS) {
+                count = (uint32_t)(BITMAP_FUZZ_TOTAL_BITS - start);
+            }
+        } else {
+            /* fully random, in-bounds */
+            start = (uint64_t)( rand() % BITMAP_FUZZ_TOTAL_BITS);
+            uint32_t max_count =
+                (uint32_t)(BITMAP_FUZZ_TOTAL_BITS - start);
+            count = (uint32_t)(rand() % (int)max_count) + 1;
+        }
+
+        if ( op == 0) {
+            int rc_real = kes_bitmap_set_range( bm, start, count);
+            naive_set_range( nb, start, count);
+            if ( rc_real != KES_SUCCESS) {
+                printf( "FAIL: set_range rc=%d start=%llu count=%u "
+                        "at iter=%ld seed=%u\n", rc_real,
+                        (unsigned long long)start, count, iter, seed);
+                return(false);
+            }
+        } else if ( op == 1) {
+            int rc_real = kes_bitmap_clear_range( bm, start, count);
+            naive_clear_range( nb, start, count);
+            if ( rc_real != KES_SUCCESS) {
+                printf( "FAIL: clear_range rc=%d start=%llu count=%u "
+                        "at iter=%ld seed=%u\n", rc_real,
+                        (unsigned long long)start, count, iter, seed);
+                return(false);
+            }
+        } else {
+            uint64_t hint =
+                (uint64_t)( rand() % BITMAP_FUZZ_TOTAL_BITS);
+            uint32_t want = (uint32_t)(rand() % 8) + 1;
+            uint64_t real_start = 0;
+            uint64_t naive_start = 0;
+            int rc_real = kes_bitmap_find_free( bm, want, hint,
+                                                 &real_start);
+            bool naive_ok = naive_find_free( nb, want, hint,
+                                              &naive_start);
+            bool real_ok = ( rc_real == KES_SUCCESS);
+
+            if ( real_ok != naive_ok) {
+                printf( "FAIL: find_free success mismatch "
+                        "(real=%d naive=%d) want=%u hint=%llu at "
+                        "iter=%ld seed=%u\n", real_ok, naive_ok,
+                        want, (unsigned long long)hint, iter, seed);
+                return(false);
+            }
+            if ( real_ok && real_start != naive_start) {
+                printf( "FAIL: find_free start mismatch "
+                        "(real=%llu naive=%llu) want=%u hint=%llu "
+                        "at iter=%ld seed=%u\n",
+                        (unsigned long long)real_start,
+                        (unsigned long long)naive_start, want,
+                        (unsigned long long)hint, iter, seed);
+                return(false);
+            }
+            /* find_free mutates neither implementation's bit
+             * contents -- no naive bit-array update here. */
+        }
+
+        for ( uint64_t i = 0; i < BITMAP_FUZZ_TOTAL_BITS; i++) {
+            bool real_bit = kes_bitmap_test( bm, i);
+            bool naive_bit = ( nb->bits[i] != 0);
+            if ( real_bit != naive_bit) {
+                printf( "FAIL: bit %llu mismatch (real=%d naive=%d) "
+                        "at iter=%ld seed=%u\n",
+                        (unsigned long long)i, real_bit, naive_bit,
+                        iter, seed);
+                return(false);
+            }
+        }
+
+        uint64_t real_free = 0;
+        TEST_ASSERT( kes_bitmap_get_stats( bm, NULL, &real_free,
+                         NULL) == KES_SUCCESS,
+                     "fuzz bitmap get_stats");
+        uint64_t naive_free = naive_free_bits( nb);
+        if ( real_free != naive_free) {
+            printf( "FAIL: free_bits mismatch (real=%llu naive=%llu) "
+                    "at iter=%ld seed=%u\n",
+                    (unsigned long long)real_free,
+                    (unsigned long long)naive_free, iter, seed);
+            return(false);
+        }
+    }
+
+    kes_bitmap_destroy( bm);
+    naive_bitmap_destroy( nb);
+
+    TEST_SUCCESS( "Bitmap fuzz vs. naive reference (set_range/"
+                   "clear_range/find_free with whole-bitmap, "
+                   "byte-boundary-exact, and fully random ranges; "
+                   "bit-for-bit and free_bits compare after every "
+                   "operation)");
+}
+
+/* =================================================================
  * Test Runner
  * ================================================================= */
 
@@ -345,6 +596,7 @@ typedef struct {
 
 static test_case_t test_cases[] = {
     {"Cache Invariant Fuzz",        test_cache_invariant_fuzz},
+    {"Bitmap Fuzz vs. Reference",   test_bitmap_fuzz_vs_reference},
     {NULL, NULL}
 };
 
