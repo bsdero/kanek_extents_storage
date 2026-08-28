@@ -249,6 +249,84 @@ static bool test_get_extent_rejects_non_power_of_2_block_size(void) {
     TEST_SUCCESS( "kes_cache_get_extent rejects invalid id->block_size");
 }
 
+/* ================================================================
+ * A.1.3 -- block_count = 0 / UINT32_MAX in a kes_extent_id_t passed
+ * to kes_cache_get_extent().
+ *
+ * block_count = 0: extent_data_size() (src/kes_cache.c) computes
+ * (size_t)0 * block_size == 0. Reading further: extent_alloc_data()
+ * calls aligned_alloc(64, KES_ALIGN(0, 64)) i.e. aligned_alloc(64, 0)
+ * -- on this platform's glibc that returns a valid non-NULL, zero-
+ * size, freeable pointer (confirmed empirically, not assumed), so
+ * the miss path proceeds normally: the mock read_extent callback is
+ * invoked with size == 0 and the call succeeds, producing a real but
+ * empty (0-byte) cached entry. Nothing here crashes, corrupts state,
+ * or leaks, so this is asserted as-is (KES_SUCCESS, non-NULL buffer)
+ * rather than an assumed rejection -- block_count == 0 is simply not
+ * validated anywhere in this module today. This is a real, minor gap
+ * (a 0-block extent is a nonsensical request) but is NOT the same
+ * class of bug as the UINT32_MAX case below (no oversized allocation
+ * risk, no crash risk), so per rule 0.3 it is reported rather than
+ * silently fixed here -- see this pass's final report.
+ *
+ * block_count = UINT32_MAX: extent_data_size() computes
+ * (size_t)UINT32_MAX * block_size (EDGE_BLOCK_SIZE == 4096) ==
+ * 17,592,186,040,320 bytes (~16 TiB) -- correctly in 64-bit space,
+ * not wrapped (id->block_count is cast to size_t before the multiply,
+ * and block_size's uint32_t operand promotes to size_t too, so this
+ * particular product cannot alias a small value; A.1.4 below probes
+ * this more directly). make_room_for_new_entry() (src/kes_cache.c)
+ * checks stats.memory_used + aligned_needed <= config.max_memory
+ * BEFORE any allocation is attempted -- since ~16 TiB exceeds any
+ * realistic config.max_memory (the default edge config here is 8MB),
+ * this fails immediately on an empty cache with nothing to evict, and
+ * kes_cache_get_extent() returns KES_ERROR_BUSY without ever calling
+ * aligned_alloc(). This is the "clean failure, not a crash or huge
+ * allocation attempt" the plan asks for -- observed to be BUSY, not
+ * the NOMEM the plan speculated as a possibility, because the
+ * capacity check rejects the request before allocation is ever
+ * attempted.
+ */
+static bool test_block_count_zero_and_max(void) {
+    kes_cache_config_t cfg;
+    kes_cache_t *cache;
+    void *buf = NULL;
+    kes_extent_id_t zero_count = { .start_block = 5, .block_count = 0,
+                                    .block_size = EDGE_BLOCK_SIZE,
+                                    .reserved = 0 };
+    kes_extent_id_t max_count = { .start_block = 6,
+                                   .block_count = UINT32_MAX,
+                                   .block_size = EDGE_BLOCK_SIZE,
+                                   .reserved = 0 };
+    int result;
+
+    default_config( &cfg);
+    cache = kes_cache_create( &cfg);
+    TEST_ASSERT( cache != NULL, "cache creation for block_count test");
+    kes_cache_set_io_callbacks( cache, mock_read, mock_write, mock_sync);
+
+    result = kes_cache_get_extent( cache, &zero_count, &buf);
+    TEST_ASSERT( result == KES_SUCCESS,
+                "block_count == 0 currently succeeds with a 0-byte "
+                "cached entry -- observed behavior, not an assumed "
+                "one (see comment above); no crash either way");
+    TEST_ASSERT( buf != NULL,
+                "buffer for a 0-byte entry is still a valid, non-NULL "
+                "pointer (aligned_alloc(64, 0) on this platform)");
+    kes_cache_put_extent( cache, &zero_count);
+
+    result = kes_cache_get_extent( cache, &max_count, &buf);
+    TEST_ASSERT( result == KES_ERROR_BUSY,
+                "block_count == UINT32_MAX is cleanly rejected as "
+                "BUSY (capacity check fails before any allocation "
+                "is attempted) rather than crashing or actually "
+                "trying to allocate ~16TiB");
+
+    kes_cache_destroy( cache);
+    TEST_SUCCESS( "block_count == 0 / UINT32_MAX handled without "
+                  "crash or unbounded allocation");
+}
+
 typedef struct {
     const char *name;
     bool ( *func)(void);
@@ -258,6 +336,7 @@ static test_case_t test_cases[] = {
     {"NULL parameter checks", test_null_parameter_checks},
     {"get_extent rejects invalid block_size",
      test_get_extent_rejects_non_power_of_2_block_size},
+    {"block_count 0 and UINT32_MAX", test_block_count_zero_and_max},
     {NULL, NULL}
 };
 
