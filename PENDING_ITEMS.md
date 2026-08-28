@@ -500,6 +500,30 @@ numbered sub-item with pasted `make test`/`make asan` evidence:
   `kes_storage_open()` fails cleanly (no crash, no `*storage` output)
   rather than proceeding with uninitialized/garbage geometry.
   `make test` after this commit: 87/87 (was 86/86).
+- **A.5.3** (`tests/test_kes_crash_consistency.c`,
+  `test_bitflipped_bitmap_block`): flips one specific bit (1->0,
+  i.e. "used" -> "free") in the *on-disk bitmap region* (not the
+  descriptor) for a block that is genuinely still allocated and holds
+  live written data, then reopens. No corruption is detected at
+  `kes_storage_open()` time (no bitmap checksum exists anywhere in
+  this codebase, confirmed by reading `kes_bitmap_load()`/
+  `kes_bitmap_save()`) -- characterized precisely:
+  `kes_storage_get_stats()`'s `free_blocks`/`used_blocks` come from
+  `storage->desc` (loaded from the untouched descriptor block) and so
+  still report the *correct, pre-corruption* counts, while the live
+  in-memory bitmap (`kes_bitmap_load()` recalculates `free_bits` by
+  actually counting the loaded, corrupted bitmap bytes) now silently
+  disagrees with those counts by exactly one bit -- a real, silent
+  desync between the two redundant sources of truth, visible only by
+  inspecting `storage->bitmap` directly (`kes_storage_t`/
+  `kes_bitmap_t` are both non-opaque). Concretely demonstrated as a
+  real double-allocation hazard, not just a bookkeeping curiosity: a
+  fresh 1-block allocation hinted at that exact `start_block` is
+  handed the *same, still-live* block back by the allocator (since
+  the bitmap now thinks it is free), and writing the new allocation's
+  data is shown to silently overwrite the original extent's still-
+  valid data. `make test` after this commit: 88/88 (was 87/87). This
+  completes A.5 in full.
 
 **Not done** -- see `KES_HARDENING_PLAN.md` §6 for full detail on
 each:
@@ -512,9 +536,9 @@ each:
 - ~~§6.D fault injection~~ DONE -- see "Phase 5 progress (this pass)
   -- plan_phase5.md Track A.4/A.5" above (`tests/test_kes_fault_
   injection.c`, A.4.1-A.4.3).
-- §6.E storage persistence/crash-consistency: no-explicit-sync
-  reopen behavior, truncated/corrupted descriptor detection, bit-
-  flipped bitmap block detection. Not covered.
+- ~~§6.E storage persistence/crash-consistency~~ DONE -- see "Phase 5
+  progress (this pass) -- plan_phase5.md Track A.4/A.5" above
+  (`tests/test_kes_crash_consistency.c`, A.5.1-A.5.3).
 - §6.F randomized/fuzz-adjacent testing: a long random
   get/put/pin/unpin/mark_dirty/flush/sync/invalidate sequence with
   per-operation invariant checks, and randomized bitmap bit-range
