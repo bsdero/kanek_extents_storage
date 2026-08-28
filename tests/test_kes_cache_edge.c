@@ -679,6 +679,118 @@ static bool test_empty_cache_no_ops(void) {
                   "by test_cache_invalidate, tests/test_kes_cache.c)");
 }
 
+/* ================================================================
+ * A.1.9 -- hash-collision disambiguation.
+ *
+ * kes_extent_hash() and kes_extent_equal() are already directly unit
+ * tested (test_kes_extent_hash/test_kes_extent_equal,
+ * tests/test_kes_cache_full.c:377,391) but not together in a real
+ * lookup scenario. include/kes/kes_cache.h defines struct kes_cache
+ * in full (not opaque), so this test can read cache->bucket_mask
+ * directly from a real, live cache instead of hardcoding the
+ * internal KES_CACHE_DEFAULT_BUCKETS constant from src/kes_cache.c.
+ * kes_extent_hash() is exported, so a genuine collision is found by
+ * brute force: with block_count/block_size held fixed and
+ * start_block swept from 0 up to (but not including)
+ * 2 * (bucket_mask + 1), by the pigeonhole principle at least one
+ * bucket (there are bucket_mask + 1 of them) must receive two of
+ * those more-than-double-the-bucket-count start_block values --
+ * guaranteed, not probabilistic, regardless of kes_extent_hash()'s
+ * actual distribution. Both colliding ids are then inserted via
+ * get_extent()/put_extent() with distinguishable backing data and
+ * confirmed independently retrievable with correct, distinct data --
+ * proving kes_extent_equal() actually disambiguates within a bucket
+ * (src/kes_cache.c:176,218 call it in hash_find()/
+ * hash_find_or_insert()) rather than just being unit-tested in
+ * isolation.
+ */
+static bool test_hash_collision_disambiguation(void) {
+    kes_cache_config_t cfg;
+    kes_cache_t *cache;
+    uint32_t mask;
+    uint64_t sweep_limit;
+    int *first_seen;
+    uint64_t collide_a = UINT64_MAX, collide_b = UINT64_MAX;
+    void *buf_a = NULL, *buf_b = NULL;
+
+    default_config( &cfg);
+    cache = kes_cache_create( &cfg);
+    TEST_ASSERT( cache != NULL,
+                "cache creation for hash-collision test");
+    mask = cache->bucket_mask;
+    sweep_limit = 2ULL * ( (uint64_t)mask + 1);
+    TEST_ASSERT( sweep_limit <= EDGE_NUM_BLOCKS,
+                "sweep range fits the mock backing store -- adjust "
+                "EDGE_NUM_BLOCKS if bucket_count ever grows");
+
+    first_seen = calloc( (size_t)mask + 1, sizeof(int));
+    TEST_ASSERT( first_seen != NULL, "calloc for bucket-seen table");
+    for ( uint64_t i = 0; i <= mask; i++) {
+        first_seen[i] = -1;
+    }
+
+    for ( uint64_t sb = 0; sb < sweep_limit; sb++) {
+        kes_extent_id_t candidate = make_id( sb);
+        uint32_t bucket = kes_extent_hash( &candidate) & mask;
+
+        if ( first_seen[bucket] == -1) {
+            first_seen[bucket] = (int)sb;
+        } else {
+            collide_a = (uint64_t)first_seen[bucket];
+            collide_b = sb;
+            break;
+        }
+    }
+    free( first_seen);
+
+    TEST_ASSERT( collide_a != UINT64_MAX && collide_b != UINT64_MAX,
+                "pigeonhole guarantees a collision within the swept "
+                "range -- one must have been found");
+    TEST_ASSERT( collide_a != collide_b,
+                "the two colliding ids are genuinely distinct");
+
+    kes_cache_set_io_callbacks( cache, mock_read, mock_write, mock_sync);
+    memset( g_backing[collide_a], 0xAA, EDGE_BLOCK_SIZE);
+    memset( g_backing[collide_b], 0xBB, EDGE_BLOCK_SIZE);
+
+    kes_extent_id_t id_a = make_id( collide_a);
+    kes_extent_id_t id_b = make_id( collide_b);
+
+    TEST_ASSERT(
+        kes_extent_hash( &id_a) % ( mask + 1) ==
+            kes_extent_hash( &id_b) % ( mask + 1),
+        "sanity: id_a and id_b really do land in the same bucket");
+
+    TEST_ASSERT( kes_cache_get_extent( cache, &id_a, &buf_a) ==
+                    KES_SUCCESS,
+                "get id_a (bucket collision partner 1)");
+    TEST_ASSERT( kes_cache_get_extent( cache, &id_b, &buf_b) ==
+                    KES_SUCCESS,
+                "get id_b (bucket collision partner 2, same bucket)");
+    TEST_ASSERT( buf_a != buf_b,
+                "id_a and id_b resolved to two distinct entries, "
+                "not the same one misidentified by hash alone");
+
+    TEST_ASSERT(
+        ( (unsigned char *)buf_a)[0] == 0xAA &&
+        ( (unsigned char *)buf_a)[EDGE_BLOCK_SIZE - 1] == 0xAA,
+        "id_a's data is exactly its own backing pattern (0xAA), not "
+        "id_b's");
+    TEST_ASSERT(
+        ( (unsigned char *)buf_b)[0] == 0xBB &&
+        ( (unsigned char *)buf_b)[EDGE_BLOCK_SIZE - 1] == 0xBB,
+        "id_b's data is exactly its own backing pattern (0xBB), not "
+        "id_a's -- kes_extent_equal() correctly disambiguated both "
+        "within their shared hash bucket");
+
+    kes_cache_put_extent( cache, &id_a);
+    kes_cache_put_extent( cache, &id_b);
+    kes_cache_destroy( cache);
+    TEST_SUCCESS( "hash-collision disambiguation: two distinct ids "
+                  "in the same bucket are independently retrievable "
+                  "with correct, distinct data");
+}
+
 typedef struct {
     const char *name;
     bool ( *func)(void);
@@ -694,6 +806,8 @@ static test_case_t test_cases[] = {
     {"empty-cache no-ops", test_empty_cache_no_ops},
     {"destroy with outstanding reference",
      test_destroy_with_outstanding_reference},
+    {"hash collision disambiguation",
+     test_hash_collision_disambiguation},
     {"ops between stop() and destroy()",
      test_ops_between_stop_and_destroy},
     {"pin/unpin refcount semantics",
