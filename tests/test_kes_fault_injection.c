@@ -411,6 +411,96 @@ static bool test_flush_failure_dirty_state(void) {
                   "sync() recovers cleanly (S4.1 point 1)");
 }
 
+/* ================================================================
+ * A.4.2 -- malloc/aligned_alloc failure simulation.
+ *
+ * Requests a genuinely oversized (200GiB) extent against a cache
+ * configured with a large enough max_memory to pass
+ * make_room_for_new_entry()'s pre-allocation capacity check (already
+ * exercised at a smaller, capacity-rejected scale by A.1.3's
+ * UINT32_MAX case -- that one never reaches aligned_alloc() at all;
+ * this one is specifically designed to reach it and have it actually
+ * fail). 200GiB was chosen empirically: on this system, even 100GiB
+ * reliably fails with a real ENOMEM from aligned_alloc(), while
+ * 200GiB stays comfortably under AddressSanitizer's own internal
+ * max-supported-size cap (empirically ~1TiB on this system/compiler),
+ * so it exercises a genuine allocator-refuses-the-request path rather
+ * than ASan's separate "request too big to even consider" static
+ * check.
+ *
+ * See this file's header comment for the ASAN_OPTIONS=
+ * allocator_may_return_null=1 requirement this test relies on under
+ * `make asan` -- set by the Makefile's `asan` target specifically for
+ * this binary, not globally.
+ */
+#define FI_HUGE_BLOCK_SIZE   KES_MAX_BLOCK_SIZE
+#define FI_HUGE_BLOCK_COUNT  3276800u   /* 3276800 * 65536 == 200GiB */
+
+static bool test_malloc_failure_nomem(void) {
+    kes_cache_config_t cfg;
+    kes_cache_t *cache;
+    void *buf = (void *)0x1;   /* sentinel: must become NULL */
+    kes_extent_id_t huge = { .start_block = 99,
+                              .block_count = FI_HUGE_BLOCK_COUNT,
+                              .block_size = FI_HUGE_BLOCK_SIZE,
+                              .reserved = 0 };
+    kes_extent_id_t small = make_id( 20);
+    kes_cache_stats_t stats;
+    int result;
+
+    memset( &cfg, 0, sizeof(cfg));
+    cfg.max_memory = 500ULL * 1024 * 1024 * 1024;   /* 500GiB: passes
+                                                       * the capacity
+                                                       * check, so the
+                                                       * miss path
+                                                       * really reaches
+                                                       * aligned_alloc()
+                                                       */
+    cfg.min_memory = KES_CACHE_MIN_MEMORY;
+    cfg.max_entries = KES_CACHE_MIN_ENTRIES;
+    cfg.policy = KES_CACHE_LRU;
+    cfg.background_threads = 1;
+    cfg.sync_interval_ms = 1000;
+
+    cache = kes_cache_create( &cfg);
+    TEST_ASSERT( cache != NULL, "cache creation for NOMEM test");
+    kes_cache_set_io_callbacks( cache, fi_read, fi_write, fi_sync);
+
+    result = kes_cache_get_extent( cache, &huge, &buf);
+    TEST_ASSERT( result == KES_ERROR_NOMEM,
+                "a 200GiB extent request, past the capacity check but "
+                "genuinely too large for the allocator, cleanly "
+                "returns KES_ERROR_NOMEM");
+    TEST_ASSERT( buf == NULL,
+                "*buffer is set to NULL, not left as a stale/garbage "
+                "pointer");
+
+    kes_cache_get_stats( cache, &stats);
+    TEST_ASSERT( stats.entries_cached == 0,
+                "no partial entry was left in entries_cached");
+    TEST_ASSERT( stats.memory_used == 0,
+                "no partial memory_used accounting leaked");
+    TEST_ASSERT( stats.misses == 0,
+                "misses was not incremented -- the failure happened "
+                "before the candidate was ever published");
+
+    /* Cache remains fully usable afterward -- no corruption from the
+     * failed attempt. */
+    void *small_buf = NULL;
+    result = kes_cache_get_extent( cache, &small, &small_buf);
+    TEST_ASSERT( result == KES_SUCCESS,
+                "a normal-sized extent still works after the NOMEM "
+                "failure -- cache state was not corrupted");
+    TEST_ASSERT( small_buf != NULL, "normal buffer is non-NULL");
+    kes_cache_put_extent( cache, &small);
+
+    kes_cache_destroy( cache);
+    TEST_SUCCESS( "malloc/aligned_alloc failure: KES_ERROR_NOMEM "
+                  "propagates cleanly with no partial-state leak "
+                  "(run under make asan with ASAN_OPTIONS="
+                  "allocator_may_return_null=1 -- see header comment)");
+}
+
 typedef struct {
     const char *name;
     bool ( *func)(void);
@@ -421,6 +511,8 @@ static test_case_t test_cases[] = {
      test_load_failure_hash_table_state},
     {"flush failure: dirty + ERROR state (S4.1)",
      test_flush_failure_dirty_state},
+    {"malloc/aligned_alloc failure: KES_ERROR_NOMEM",
+     test_malloc_failure_nomem},
     {NULL, NULL}
 };
 

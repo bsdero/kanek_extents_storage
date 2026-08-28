@@ -416,6 +416,30 @@ numbered sub-item with pasted `make test`/`make asan` evidence:
   inconsistency between the two flush paths, also reported rather than
   fixed. `make test` after this commit: 83/83 (was 81/81 -- 2 new
   tests in the new `tests/test_kes_fault_injection.c`).
+- **A.4.2** (`tests/test_kes_fault_injection.c`,
+  `test_malloc_failure_nomem`; `Makefile`'s `asan` target): requests a
+  genuinely oversized (200GiB) extent against a cache configured with
+  a large enough `max_memory` to pass the pre-allocation capacity
+  check, so the miss path actually reaches `aligned_alloc()`, which
+  fails for real (confirmed empirically: even 100GiB reliably fails
+  with `ENOMEM` on this system). Asserts `KES_ERROR_NOMEM` is returned
+  cleanly, `*buffer` stays `NULL`, and no partial state leaks
+  (`entries_cached`/`memory_used`/`misses` all stay at 0, and the
+  cache remains fully usable for a normal-sized extent afterward).
+  Confirmed clean under plain `make test`. Under `make asan`,
+  AddressSanitizer's default behavior for *any* out-of-memory
+  allocation failure (not just requests over its internal
+  max-supported-size cap) is to abort the process rather than return
+  `NULL` -- confirmed empirically; `ASAN_OPTIONS=
+  allocator_may_return_null=1` must be set in the environment *before
+  process start* (a `setenv()` inside `main()` is too late -- also
+  confirmed empirically). The `asan` Makefile target now sets this
+  environment variable specifically when invoking
+  `test_kes_fault_injection` (only that one binary -- every other
+  test binary keeps ASan's default strict abort-on-OOM behavior, so a
+  genuine unexpected OOM elsewhere is still loud). `make test` after
+  this commit: 84/84. `make asan`: clean across all 84 tests,
+  `KES_ERROR_NOMEM` returned as expected, no abort, no other finding.
 
 **Not done** -- see `KES_HARDENING_PLAN.md` §6 for full detail on
 each:

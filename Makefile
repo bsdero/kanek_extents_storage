@@ -173,10 +173,24 @@ asan:
 	$(MAKE) all tests CFLAGS="$(CFLAGS) $(ASAN_FLAGS)" \
 	    LDFLAGS="$(LDFLAGS) $(ASAN_FLAGS)"
 	@echo "Running tests under ASan+UBSan..."
+	# test_kes_fault_injection deliberately triggers a real, expected
+	# allocator OOM (tests/test_kes_fault_injection.c, A.4.2 --
+	# plan_phase5.md). ASan's default reaction to ANY out-of-memory
+	# allocation failure is to print a report and abort the process
+	# rather than return NULL, which would fail this whole target on
+	# an intentional test case. allocator_may_return_null=1 makes
+	# ASan behave like plain glibc (return NULL) instead -- set only
+	# for this one binary so every other test keeps ASan's default
+	# strict abort-on-OOM behavior (a genuine, unexpected OOM
+	# elsewhere in the suite should still be loud).
 	@for test in $(TEST_TARGETS); do \
 		testname=$$(basename $$test); \
 		echo "--- $$testname (asan) ---"; \
-		$$test || exit 1; \
+		if [ "$$testname" = "test_kes_fault_injection" ]; then \
+			ASAN_OPTIONS=allocator_may_return_null=1 $$test || exit 1; \
+		else \
+			$$test || exit 1; \
+		fi; \
 	done
 
 .PHONY: tsan
