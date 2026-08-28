@@ -1,5 +1,22 @@
 # KES Tests and Examples Documentation
 
+## Standing note (Phase 6 docs truth pass)
+
+This document previously described only 2 of the current 6 test
+binaries (`test_kes_minimal.c` and `test_kes_cache.c`), and its cache
+test status ("4/6 Passing", "2 known issues") was stale by a wide
+margin. The verified current baseline, from a fresh `make test` run
+immediately before this pass: **70/70 tests passing across all 6
+binaries** -- `test_kes_minimal` (9), `test_kes_bitmap_full` (10),
+`test_kes_storage_full` (15), `test_kes_cache` (23),
+`test_kes_cache_full` (12), `test_kes_multiprocess` (1). See
+`PENDING_ITEMS.md` (verified state) and `AGENTS.md`'s "Ground truth"
+section. This revision adds the four test binaries that were
+undocumented here entirely (`test_kes_bitmap_full.c`,
+`test_kes_storage_full.c`, `test_kes_cache_full.c`,
+`test_kes_multiprocess.c`) and rewrites the cache test section to
+match reality.
+
 ## Overview
 
 This document describes the comprehensive test suite and example 
@@ -250,22 +267,83 @@ ensures all supporting utilities work correctly.
 
 ---
 
-### Cache Tests (`test_kes_cache.c`) - 4/6 Passing
+### Bitmap Full Tests (`test_kes_bitmap_full.c`) - 10/10 Passing
 
-Advanced caching system tests for performance optimization:
+One direct test per `kes_bitmap.h` function -- create/destroy, set,
+clear, test, set_range, clear_range, find_free, get_stats, load, save
+-- satisfying `KES_HARDENING_PLAN.md` §6.A's per-function coverage
+requirement for the bitmap layer.
 
-#### ✅ Passing Tests:
-- **Cache Lifecycle**: Creation, initialization, destruction
-- **Cache Hit Detection**: Hit/miss ratio tracking and optimization
-- **Extent Pinning**: Preventing eviction of critical data
-- **Dirty Extent Management**: Tracking modified data for writeback
+---
 
-#### ❌ Known Issues (Advanced Features):
-- **Basic Operations**: Mock I/O data validation edge case
-- **Concurrent Access**: Thread safety optimization needed
+### Storage Full Tests (`test_kes_storage_full.c`) - 15/15 Passing
 
-**Note**: Cache layer is bonus functionality - core storage is 
-production-ready without it.
+One direct test per `kes_storage.h` function (create/open/close/sync,
+extent allocate/free/read/write, get_stats/get_descriptor, the
+utility functions) plus targeted edge cases, including
+`test_kes_extent_read_write_32bit_overflow` (the storage-layer
+`start_block * block_size` overflow check).
+
+---
+
+### Cache Tests (`test_kes_cache.c`) - 23/23 Passing
+
+Edge-case and concurrency coverage for the cache layer, beyond the
+one-test-per-function coverage in `test_kes_cache_full.c` below. This
+document previously claimed "4/6 Passing" with two "known issues" in
+basic operations and concurrent access -- that was stale; every test
+in this file currently passes. Notable tests:
+
+- **Cache Lifecycle**: creation, `kes_cache_start()`/`kes_cache_stop()`
+  (including `Cache Start Background Flush`, which proves automatic
+  flushing actually happens, and `Cache Start Rejects Zero Threads`).
+- **Concurrent Miss No Duplicate Entry**: proves the P0 race fix
+  (concurrent cache-miss on the same extent ID no longer creates
+  duplicate hash-table entries) -- see `PENDING_ITEMS.md`'s "Resolved"
+  section.
+- **Concurrent Access** / **Concurrent Sync vs Get/Put**: multi-thread
+  regression tests against a `max_entries`-constrained cache, run
+  clean under ASan+UBSan and TSan during development (5+ consecutive
+  runs each) -- these are the tests that actually found the
+  concurrency hazards documented in `src/kes_cache.c`'s
+  `try_evict_entry_locked()` doc comment.
+- **Cache Eviction Respects Max Entries** / **Cache Pinned Entries
+  Never Evicted** / **Cache Get Extent Busy When Full And Pinned**:
+  capacity enforcement and eviction correctness.
+- **Cache Create Rejects Unimplemented Policy**: confirms
+  `KES_CACHE_LFU`/`KES_CACHE_CUSTOM` are rejected with `NULL` while
+  `KES_CACHE_LRU` is accepted.
+- **Cache Sync** / **Cache Sync Keeps Referenced Entries** /
+  **Cache Invalidate** / **Cache Invalidate Discards Dirty Data** /
+  **Cache Reset Stats**: the four functions added in Phase 3 --
+  semantics per `PENDING_ITEMS.md`'s "Resolved" section.
+- No-read/write-extent-callback paths and ref_count-leak-on-load-
+  failure tests.
+
+---
+
+### Cache Full Tests (`test_kes_cache_full.c`) - 12/12 Passing
+
+One direct test per `kes_cache.h` function, including
+`test_kes_extent_hash`/`test_kes_extent_equal` (the hash/equality
+utility functions) -- the per-function counterpart to
+`test_kes_cache.c`'s edge-case/concurrency coverage above.
+
+---
+
+### Multi-Process Test (`test_kes_multiprocess.c`) - 1/1 Passing
+
+`Cross Process Sync IO` -- a real `fork()` (two OS processes, not
+threads), each independently calling `kes_storage_open()` on the same
+backing file, taking turns writing/reading a distinguishable payload
+through `kes_extent_write()`/`kes_extent_read()` with turns strictly
+ordered by two POSIX semaphores in an anonymous `MAP_SHARED` mapping.
+This is the only test binary that exercises the storage layer's raw
+on-disk I/O path across independent processes rather than threads
+within one process -- see `AGENTS.md`'s "Ground truth" section for
+exactly what this does and does not prove (it deliberately never lets
+the two processes race each other; unsynchronized concurrent access
+remains an open, documented, unguarded gap).
 
 ---
 
@@ -474,28 +552,31 @@ make test-core
 # ✅ All tests PASSED!
 ```
 
-#### All Tests (Including Cache)
+#### All Tests (6 binaries)
 ```bash
-# Run complete test suite
+# Run the complete test suite
 make test
 
-# Expected: 9 core tests pass, cache tests have 2 known issues
+# Expected (verified baseline as of this writing -- rerun and
+# reconcile if this number ever looks different, per PENDING_ITEMS.md):
+# 70/70 across test_kes_minimal (9), test_kes_bitmap_full (10),
+# test_kes_storage_full (15), test_kes_cache (23),
+# test_kes_cache_full (12), test_kes_multiprocess (1)
 ```
 
 #### Individual Test Execution
 ```bash
-# Build tests
+# Build all test binaries
 make tests
 
-# Run core tests manually
-cp build/tests/test_kes_minimal /tmp/test_core
-chmod +x /tmp/test_core
-/tmp/test_core
-
-# Run cache tests manually  
-cp build/tests/test_kes_cache /tmp/test_cache
-chmod +x /tmp/test_cache
-/tmp/test_cache
+# Run any one binary manually the same way "make test" does --
+# copy to /tmp first (existing, intentional Makefile behavior)
+for t in test_kes_minimal test_kes_bitmap_full test_kes_storage_full \
+         test_kes_cache test_kes_cache_full test_kes_multiprocess; do
+    cp build/tests/$t /tmp/$t
+    chmod +x /tmp/$t
+    /tmp/$t
+done
 ```
 
 ### Example Execution
@@ -536,10 +617,18 @@ chmod +x /tmp/example
 - ✅ **System restart recovery**: Covered
 
 ### Platform Coverage
-- ✅ **POSIX systems**: Linux, macOS
-- ✅ **Architecture**: x86_64, ARM64
-- ✅ **Memory constraints**: Tested with various sizes
-- ✅ **Storage sizes**: From MB to GB ranges
+
+**Only actually verified on Linux/WSL2** (`AGENTS.md`'s "Building and
+Testing" section) -- the code is portable C99/POSIX with no
+platform-specific paths, but macOS and ARM64 are not independently
+tested by this project's own suite; treat those as "should work,"
+not "covered by CI" (there is no CI -- see
+`PROJECT_OVERVIEW_KES.md`'s corrected "Continuous Integration"
+section).
+- ✅ **Memory constraints**: exercised across the test binaries'
+  various cache/storage sizes.
+- ✅ **Storage sizes**: from small (`test_kes_minimal`) to the
+  larger allocation-exhaustion scenarios in `test_kes_storage_full.c`.
 
 ## Troubleshooting
 
@@ -583,29 +672,49 @@ touch /tmp/test_file  # Test write permissions
 ## Validation and Quality Assurance
 
 ### Code Quality
-- **Compiler warnings**: Zero warnings with -Wall -Wextra
-- **Static analysis**: Clean static analysis results
-- **Memory safety**: No memory leaks detected
-- **Thread safety**: Core operations are thread-safe
+- **Compiler warnings**: `-Wall -Wextra -Werror` -- any new warning
+  fails the build, so zero warnings is enforced, not just observed.
+- **Static analysis**: **not run.** There is no `cppcheck`/
+  `clang-analyzer` step anywhere in this repository -- see
+  `PROJECT_OVERVIEW_KES.md`'s corrected "Quality Assurance" section.
+- **Memory safety**: 0 leaks/errors under `make valgrind` and
+  `make asan` as of the last verified check-in (`PENDING_ITEMS.md`).
+- **Thread safety**: verified via `make tsan` (0 races as of the last
+  check-in) plus the dedicated concurrency-regression tests in
+  `test_kes_cache.c` and the fork()-based test in
+  `test_kes_multiprocess.c`.
 
 ### Performance Characteristics
-- **Allocation speed**: O(1) for first-fit, O(n) for best-fit
-- **Memory overhead**: <0.1% for metadata
-- **Storage overhead**: <0.03% for bitmap and descriptor
-- **Fragmentation**: <10% under typical workloads
+
+Not benchmarked (see `PROJECT_OVERVIEW_KES.md`'s corrected
+"Performance Benchmarks" section -- no benchmark suite exists in this
+repository). One correction worth calling out here specifically:
+`kes_bitmap_find_free()` (`src/kes_bitmap.c`) is a **linear scan**, not
+O(1) -- "O(1) for first-fit" was never accurate. Best-fit is not
+implemented at all, so there is nothing to give a complexity for.
 
 ### Reliability Metrics
-- **Core test success rate**: 100% (9/9 tests)
-- **Data integrity**: 100% verified in all I/O tests
-- **Recovery success**: 100% in persistence tests
-- **Resource cleanup**: 100% verified (no leaks)
+- **Test success rate**: 70/70 (100%) across all 6 binaries as of the
+  last verified `make test` run -- see the "Standing note" at the top
+  of this document and `PENDING_ITEMS.md`.
+- **Data integrity**: verified via byte-level read/write round-trips
+  in `test_kes_storage_full.c`/`test_kes_cache_full.c`.
+- **Recovery success**: verified for the clean-shutdown-then-reopen
+  case in `test_kes_storage_full.c`; crash-consistency (mid-write
+  failure, truncated/corrupted descriptor) is **not yet covered** --
+  see `plan_phase5.md` Track A.5.
+- **Resource cleanup**: 0 leaks verified via `make valgrind`.
 
 ## Conclusion
 
-The KES test suite and examples provide comprehensive validation of a 
-production-ready storage system. The 9 core tests passing with 100% 
-success rate demonstrates reliability suitable for mission-critical 
-applications.
+The KES test suite and examples provide substantial validation of the
+storage and cache layers as they actually exist today -- 70/70 tests
+passing across 6 binaries as of the last verified `make test` run,
+clean under ASan+UBSan/TSan/Valgrind (`make check-all`) as of the last
+verified check-in (`PENDING_ITEMS.md`). This document previously
+described only the 9-test `test_kes_minimal` suite as "the" test
+suite; that framing undercounted the actual current coverage by a
+wide margin and has been corrected throughout this file.
 
 The example program showcases real-world usage patterns that directly 
 translate to file systems, databases, and other storage applications. 
