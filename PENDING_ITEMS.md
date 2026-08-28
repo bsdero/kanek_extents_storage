@@ -454,6 +454,35 @@ numbered sub-item with pasted `make test`/`make asan` evidence:
   actually transferred (never the deliberately-uninitialized tail) to
   keep this Valgrind/MSan-safe for any future run. `make test` after
   this commit: 85/85 (was 84/84). This completes A.4 in full.
+- **A.5.1** (new `tests/test_kes_crash_consistency.c`,
+  `test_no_sync_reopen_durability`): two distinct observed behaviors,
+  discovered while writing this test, not assumed going in. **Case
+  1**: a storage file that has *never* been synced/closed even once
+  since `kes_storage_create()` becomes completely UNOPENABLE after a
+  crash -- `kes_storage_create()` never calls `kes_bitmap_save()` at
+  create time (only `save_storage_descriptor()` for block 0), so the
+  file's real physical size never reaches the bitmap region near the
+  end of the device until a real sync/close happens; a crash before
+  that makes `kes_storage_open()`'s `kes_bitmap_load()` read short and
+  return `KES_ERROR_IO` (not `KES_ERROR_CORRUPT`). **Case 2**: once a
+  file has been synced/closed at least once (fully laid out on disk),
+  a *later* crash without a further sync reopens successfully but
+  into stale, pre-crash bookkeeping -- confirmed by reading
+  `kes_extent_write()`: raw extent DATA is always durable immediately
+  (a direct, unbuffered `write()` syscall with no cache layer of its
+  own), but `storage->desc.free_blocks`/`used_blocks` and
+  `storage->bitmap` are only persisted by `kes_storage_sync()`/
+  `kes_storage_close()`. Concretely demonstrated: a fresh allocation
+  after such a reopen is handed the exact same blocks back (the
+  bitmap thinks they're free) and silently overwrites the "forgotten"
+  extent's still-physically-present data -- confirmed by reading it
+  back through the original extent descriptor afterward.
+  `include/kes/kes_types.h`'s `KES_STORAGE_SYNC` flag doc comment is a
+  single line ("Synchronous I/O") with no explicit durability promise
+  either way -- flagged as a Track B docs gap (out of scope for this
+  pass), not fixed here. `make test` after this commit: 86/86 (was
+  85/85 -- 1 new test in the new
+  `tests/test_kes_crash_consistency.c`).
 
 **Not done** -- see `KES_HARDENING_PLAN.md` §6 for full detail on
 each:
