@@ -28,9 +28,16 @@ platforms including edge devices and servers.
   devices
 
 ### 2. Memory Efficiency
-- Adaptive cache sizing based on available system memory
-- Configurable cache policies (LRU, LFU, or custom)
-- Support for memory-mapped I/O where appropriate
+- Adaptive cache sizing based on available system memory -- **not
+  implemented**; there is no system-memory-pressure signal being
+  read. `config.max_memory`/`config.min_memory` are fixed, caller-set
+  limits, not dynamically adjusted.
+- Configurable cache policies -- `kes_cache_policy_t` declares LRU,
+  LFU, and Custom, but **only LRU is implemented**;
+  `kes_cache_create()` rejects the other two with `NULL`.
+- Support for memory-mapped I/O -- **not implemented**; there is no
+  `mmap()` call anywhere in `src/kes_cache.c`. I/O goes entirely
+  through the caller-supplied `read_extent`/`write_extent` callbacks.
 
 ### 3. Thread Safety
 - Fine-grained locking: a `pthread_rwlock_t` per hash bucket, a
@@ -54,8 +61,8 @@ platforms including edge devices and servers.
 |   Cache Manager  |
 |------------------|
 | - Hash table     |
-| - LRU/LFU lists  |
-| - Memory pool    |
+| - LRU list       |    (LFU declared, not implemented)
+| - Memory pool    |    (design intent -- see "Memory Layout" below)
 | - Stats tracking |
 | - Background     |
 |   thread mgmt    |
