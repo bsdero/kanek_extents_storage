@@ -526,6 +526,63 @@ static bool test_pin_unpin_refcount_semantics(void) {
                   "extra unpins are safe no-ops");
 }
 
+/* ================================================================
+ * A.1.6 -- kes_cache_destroy() with an outstanding, never-released
+ * kes_cache_get_extent() reference.
+ *
+ * Reading kes_cache_destroy() (src/kes_cache.c) first: it walks
+ * cache->mru_head to cache->list_next unconditionally, freeing every
+ * entry's data buffer, destroying its mutex/cond, and free()-ing the
+ * struct -- it does NOT check entry->ref_count (or pin_count) at
+ * all before doing so. So the actual, observed contract is: destroy()
+ * frees every entry regardless of outstanding references, it does
+ * not refuse or defer. This test proves that doing so does not crash
+ * or corrupt anything by itself (get an extent, deliberately never
+ * put_extent() it, then destroy()) -- it deliberately does NOT then
+ * dereference the now-dangling buffer pointer afterward, since doing
+ * that would be a real use-after-free this test is not trying to
+ * prove is safe (it isn't -- destroy() invalidates the buffer, it
+ * just doesn't check first). Per the task instructions this specific
+ * test must also be confirmed under `make asan`, not just plain
+ * `make test`, since a subtler defect here (e.g. destroy() itself
+ * double-freeing, or corrupting bucket/LRU bookkeeping while an
+ * entry is still logically referenced) is exactly the shape ASan
+ * catches and a plain run would not.
+ */
+static bool test_destroy_with_outstanding_reference(void) {
+    kes_cache_config_t cfg;
+    kes_cache_t *cache;
+    void *buf = NULL;
+    kes_extent_id_t id = make_id( 30);
+    int result;
+
+    default_config( &cfg);
+    cache = kes_cache_create( &cfg);
+    TEST_ASSERT( cache != NULL,
+                "cache creation for destroy-with-reference test");
+    kes_cache_set_io_callbacks( cache, mock_read, mock_write, mock_sync);
+
+    TEST_ASSERT( kes_cache_get_extent( cache, &id, &buf) == KES_SUCCESS,
+                "get an extent and deliberately never put_extent() it "
+                "-- ref_count stays at 1 through destroy() below");
+    TEST_ASSERT( buf != NULL, "buffer non-NULL before destroy");
+
+    result = kes_cache_destroy( cache);
+    TEST_ASSERT( result == KES_SUCCESS,
+                "destroy() with an outstanding reference still "
+                "succeeds -- observed behavior: it frees the entry "
+                "unconditionally rather than refusing or deferring, "
+                "per this function's actual implementation");
+
+    /* Deliberately does not touch `buf` here -- it is dangling now
+     * that destroy() has freed the entry that owned it. */
+
+    TEST_SUCCESS( "kes_cache_destroy() with an outstanding "
+                  "get_extent() reference: no crash (frees the "
+                  "entry regardless of ref_count -- run under "
+                  "make asan to confirm no corruption)");
+}
+
 typedef struct {
     const char *name;
     bool ( *func)(void);
@@ -538,6 +595,8 @@ static test_case_t test_cases[] = {
     {"block_count 0 and UINT32_MAX", test_block_count_zero_and_max},
     {"start_block near UINT64_MAX, no size wrap",
      test_start_block_near_max_no_size_wrap},
+    {"destroy with outstanding reference",
+     test_destroy_with_outstanding_reference},
     {"pin/unpin refcount semantics",
      test_pin_unpin_refcount_semantics},
     {NULL, NULL}
