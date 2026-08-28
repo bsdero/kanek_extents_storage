@@ -583,6 +583,57 @@ static bool test_destroy_with_outstanding_reference(void) {
                   "make asan to confirm no corruption)");
 }
 
+/* ================================================================
+ * A.1.7 -- operations between kes_cache_stop() and
+ * kes_cache_destroy().
+ *
+ * Reading kes_cache_stop() (src/kes_cache.c) first: it sets
+ * cache->shutdown = true, broadcasts bg_cond, joins/frees any running
+ * background threads, then returns -- it does not set any flag that
+ * kes_cache_get_extent()/kes_cache_put_extent() (or any other
+ * operation) check. Confirmed by grep: `cache->shutdown` is only
+ * read inside cache_bg_thread_func()'s own loop condition, nowhere
+ * else in this file. So the actual, observed contract is: stop()
+ * only tears down background threads, it does NOT flag the cache as
+ * unusable for normal foreground operations -- get_extent()/
+ * put_extent() called after stop() just work normally, exactly as
+ * the plan's own hint anticipated. This test asserts that directly
+ * rather than assuming a rejection that does not happen.
+ */
+static bool test_ops_between_stop_and_destroy(void) {
+    kes_cache_config_t cfg;
+    kes_cache_t *cache;
+    void *buf = NULL;
+    kes_extent_id_t id = make_id( 40);
+
+    default_config( &cfg);
+    cfg.background_threads = 1;
+    cfg.sync_interval_ms = 1000;
+
+    cache = kes_cache_create( &cfg);
+    TEST_ASSERT( cache != NULL,
+                "cache creation for stop-then-ops test");
+    kes_cache_set_io_callbacks( cache, mock_read, mock_write, mock_sync);
+
+    TEST_ASSERT( kes_cache_start( cache) == KES_SUCCESS,
+                "start background thread");
+    TEST_ASSERT( kes_cache_stop( cache) == KES_SUCCESS,
+                "stop background thread");
+
+    TEST_ASSERT( kes_cache_get_extent( cache, &id, &buf) == KES_SUCCESS,
+                "get_extent() after stop() still works normally -- "
+                "stop() does not flag the cache unusable, it only "
+                "tears down background threads (observed behavior)");
+    TEST_ASSERT( buf != NULL, "buffer non-NULL after stop()+get");
+    TEST_ASSERT( kes_cache_put_extent( cache, &id) == KES_SUCCESS,
+                "put_extent() after stop() also still works normally");
+
+    kes_cache_destroy( cache);
+    TEST_SUCCESS( "get_extent/put_extent between stop() and destroy() "
+                  "work normally -- stop() only tears down background "
+                  "threads, it is not a caller-facing shutdown flag");
+}
+
 typedef struct {
     const char *name;
     bool ( *func)(void);
@@ -597,6 +648,8 @@ static test_case_t test_cases[] = {
      test_start_block_near_max_no_size_wrap},
     {"destroy with outstanding reference",
      test_destroy_with_outstanding_reference},
+    {"ops between stop() and destroy()",
+     test_ops_between_stop_and_destroy},
     {"pin/unpin refcount semantics",
      test_pin_unpin_refcount_semantics},
     {NULL, NULL}
