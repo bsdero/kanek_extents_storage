@@ -422,6 +422,147 @@ tests added: 9 in `tests/test_kes_cache_edge.c`, 1 in the new
 `tests/test_kes_multiprocess.c`). `make asan`/`make tsan`: clean for
 every test in this pass that required them (A.1.6, A.2.2).
 
+### Phase 5 progress (this pass) -- plan_phase5.md Track A.4/A.5
+
+New file `tests/test_kes_fault_injection.c` (A.4), one commit per
+numbered sub-item with pasted `make test`/`make asan` evidence:
+
+- **A.4.1** (`tests/test_kes_fault_injection.c`,
+  `test_load_failure_hash_table_state` /
+  `test_flush_failure_dirty_state`): a small, self-contained
+  configurable-failure mock I/O harness (`fi_control_t`/
+  `fi_should_fail()` -- fail on the Nth call, or fail on every call
+  after the Nth). **Real, observed gap found and reported, NOT fixed
+  (rule 0.3 -- production-code changes are out of scope for this
+  file)**: after a load failure, `kes_cache_get_extent()` leaves the
+  entry permanently in `KES_EXTENT_ERROR` state in the hash table
+  (`stats.entries_cached` still counts it) -- a *second* call on the
+  same id, even with the failure condition fully cleared, returns
+  `KES_ERROR_IO` immediately without ever calling `read_extent()`
+  again (proven via a call-count assertion on the fault harness). The
+  only recovery path is an explicit `kes_cache_invalidate()` on that
+  id before retrying; the test proves that recovery path works and
+  that the hash table itself is not otherwise corrupted. Separately,
+  `test_flush_failure_dirty_state` confirms
+  `KES_HARDENING_PLAN.md` S4.1 point 1 exactly as documented for the
+  `kes_cache_sync()` path (`KES_EXTENT_DIRTY` and `KES_EXTENT_ERROR`
+  both set on a failed flush, entry not evicted, clean recovery on a
+  later successful sync) -- and separately notes that
+  `kes_cache_flush_extent()` (the direct single-entry flush call, a
+  different code path) does NOT set `KES_EXTENT_ERROR` on failure the
+  same way, only returns `KES_ERROR_IO` -- a real, minor behavioral
+  inconsistency between the two flush paths, also reported rather than
+  fixed. `make test` after this commit: 83/83 (was 81/81 -- 2 new
+  tests in the new `tests/test_kes_fault_injection.c`).
+- **A.4.2** (`tests/test_kes_fault_injection.c`,
+  `test_malloc_failure_nomem`; `Makefile`'s `asan` target): requests a
+  genuinely oversized (200GiB) extent against a cache configured with
+  a large enough `max_memory` to pass the pre-allocation capacity
+  check, so the miss path actually reaches `aligned_alloc()`, which
+  fails for real (confirmed empirically: even 100GiB reliably fails
+  with `ENOMEM` on this system). Asserts `KES_ERROR_NOMEM` is returned
+  cleanly, `*buffer` stays `NULL`, and no partial state leaks
+  (`entries_cached`/`memory_used`/`misses` all stay at 0, and the
+  cache remains fully usable for a normal-sized extent afterward).
+  Confirmed clean under plain `make test`. Under `make asan`,
+  AddressSanitizer's default behavior for *any* out-of-memory
+  allocation failure (not just requests over its internal
+  max-supported-size cap) is to abort the process rather than return
+  `NULL` -- confirmed empirically; `ASAN_OPTIONS=
+  allocator_may_return_null=1` must be set in the environment *before
+  process start* (a `setenv()` inside `main()` is too late -- also
+  confirmed empirically). The `asan` Makefile target now sets this
+  environment variable specifically when invoking
+  `test_kes_fault_injection` (only that one binary -- every other
+  test binary keeps ASan's default strict abort-on-OOM behavior, so a
+  genuine unexpected OOM elsewhere is still loud). `make test` after
+  this commit: 84/84. `make asan`: clean across all 84 tests,
+  `KES_ERROR_NOMEM` returned as expected, no abort, no other finding.
+- **A.4.3** (`tests/test_kes_fault_injection.c`,
+  `test_partial_transfer_not_detected`): a mock `read_extent` that
+  reports `KES_SUCCESS` while only actually copying 16 of 4096
+  requested bytes. **Documented conclusion (plan_phase5.md's
+  either-outcome-acceptable option, not a bug)**: this is NOT
+  detected, and structurally cannot be at this layer -- the
+  `read_extent`/`write_extent` callback contract
+  (`include/kes/kes_cache.h`) is a plain `int` status code against a
+  fixed `size` *input* parameter, with no bytes-actually-transferred
+  *output* channel at all for `kes_cache_get_extent()` to check
+  against. The test only ever reads back the 16 bytes the mock
+  actually transferred (never the deliberately-uninitialized tail) to
+  keep this Valgrind/MSan-safe for any future run. `make test` after
+  this commit: 85/85 (was 84/84). This completes A.4 in full.
+- **A.5.1** (new `tests/test_kes_crash_consistency.c`,
+  `test_no_sync_reopen_durability`): two distinct observed behaviors,
+  discovered while writing this test, not assumed going in. **Case
+  1**: a storage file that has *never* been synced/closed even once
+  since `kes_storage_create()` becomes completely UNOPENABLE after a
+  crash -- `kes_storage_create()` never calls `kes_bitmap_save()` at
+  create time (only `save_storage_descriptor()` for block 0), so the
+  file's real physical size never reaches the bitmap region near the
+  end of the device until a real sync/close happens; a crash before
+  that makes `kes_storage_open()`'s `kes_bitmap_load()` read short and
+  return `KES_ERROR_IO` (not `KES_ERROR_CORRUPT`). **Case 2**: once a
+  file has been synced/closed at least once (fully laid out on disk),
+  a *later* crash without a further sync reopens successfully but
+  into stale, pre-crash bookkeeping -- confirmed by reading
+  `kes_extent_write()`: raw extent DATA is always durable immediately
+  (a direct, unbuffered `write()` syscall with no cache layer of its
+  own), but `storage->desc.free_blocks`/`used_blocks` and
+  `storage->bitmap` are only persisted by `kes_storage_sync()`/
+  `kes_storage_close()`. Concretely demonstrated: a fresh allocation
+  after such a reopen is handed the exact same blocks back (the
+  bitmap thinks they're free) and silently overwrites the "forgotten"
+  extent's still-physically-present data -- confirmed by reading it
+  back through the original extent descriptor afterward.
+  `include/kes/kes_types.h`'s `KES_STORAGE_SYNC` flag doc comment is a
+  single line ("Synchronous I/O") with no explicit durability promise
+  either way -- flagged as a Track B docs gap (out of scope for this
+  pass), not fixed here. `make test` after this commit: 86/86 (was
+  85/85 -- 1 new test in the new
+  `tests/test_kes_crash_consistency.c`).
+- **A.5.2** (`tests/test_kes_crash_consistency.c`,
+  `test_truncated_and_corrupted_descriptor`): two distinct cases,
+  confirmed to return two *different* error codes by reading
+  `load_storage_descriptor()` first. Truncating the file to fewer
+  bytes than `sizeof(kes_storage_descriptor_t)` returns
+  `KES_ERROR_IO` (the `read()` byte count check fails before the
+  magic-number check is ever reached) -- **not** `KES_ERROR_CORRUPT`,
+  worth knowing if a caller tries to distinguish "corrupt" from
+  "truncated/missing" by return code alone. Overwriting just the
+  4-byte magic-number field in an otherwise-intact, correctly-sized
+  descriptor returns `KES_ERROR_CORRUPT` as expected (pairs against
+  case 1's different code and a distinct corruption pattern from
+  `test_kes_storage_open_corrupt()`,
+  `tests/test_kes_storage_full.c`, not duplicating it). Either way,
+  `kes_storage_open()` fails cleanly (no crash, no `*storage` output)
+  rather than proceeding with uninitialized/garbage geometry.
+  `make test` after this commit: 87/87 (was 86/86).
+- **A.5.3** (`tests/test_kes_crash_consistency.c`,
+  `test_bitflipped_bitmap_block`): flips one specific bit (1->0,
+  i.e. "used" -> "free") in the *on-disk bitmap region* (not the
+  descriptor) for a block that is genuinely still allocated and holds
+  live written data, then reopens. No corruption is detected at
+  `kes_storage_open()` time (no bitmap checksum exists anywhere in
+  this codebase, confirmed by reading `kes_bitmap_load()`/
+  `kes_bitmap_save()`) -- characterized precisely:
+  `kes_storage_get_stats()`'s `free_blocks`/`used_blocks` come from
+  `storage->desc` (loaded from the untouched descriptor block) and so
+  still report the *correct, pre-corruption* counts, while the live
+  in-memory bitmap (`kes_bitmap_load()` recalculates `free_bits` by
+  actually counting the loaded, corrupted bitmap bytes) now silently
+  disagrees with those counts by exactly one bit -- a real, silent
+  desync between the two redundant sources of truth, visible only by
+  inspecting `storage->bitmap` directly (`kes_storage_t`/
+  `kes_bitmap_t` are both non-opaque). Concretely demonstrated as a
+  real double-allocation hazard, not just a bookkeeping curiosity: a
+  fresh 1-block allocation hinted at that exact `start_block` is
+  handed the *same, still-live* block back by the allocator (since
+  the bitmap now thinks it is free), and writing the new allocation's
+  data is shown to silently overwrite the original extent's still-
+  valid data. `make test` after this commit: 88/88 (was 87/87). This
+  completes A.5 in full.
+
 **Not done** -- see `KES_HARDENING_PLAN.md` §6 for full detail on
 each:
 
@@ -430,15 +571,14 @@ each:
   `kes_cache_destroy()`-during-concurrent-access test; running the
   concurrency suite 100+ times in a loop with a logged fixed random
   seed (a stress-test target, not yet added to the Makefile).
-- §6.D fault injection: configurable-failure-mode I/O wrappers
-  (fail on Nth call, or with a probability), `malloc`/`aligned_alloc`
-  failure simulation, partial read/write simulation. None of this
-  exists yet.
-- §6.E storage persistence/crash-consistency: no-explicit-sync
-  reopen behavior, truncated/corrupted descriptor detection, bit-
-  flipped bitmap block detection. Not covered.
-- §6.F randomized/fuzz-adjacent testing: **DONE** -- see "Track A.6
-  -- randomized/fuzz-adjacent testing (DONE)" under Resolved above
+- ~~§6.D fault injection~~ DONE -- see "Phase 5 progress (this pass)
+  -- plan_phase5.md Track A.4/A.5" above (`tests/test_kes_fault_
+  injection.c`, A.4.1-A.4.3).
+- ~~§6.E storage persistence/crash-consistency~~ DONE -- see "Phase 5
+  progress (this pass) -- plan_phase5.md Track A.4/A.5" above
+  (`tests/test_kes_crash_consistency.c`, A.5.1-A.5.3).
+- ~~§6.F randomized/fuzz-adjacent testing~~ DONE -- see "Track A.6 --
+  randomized/fuzz-adjacent testing (DONE)" under Resolved above
   (`tests/test_kes_fuzz.c`, 2/2).
 - §6.G performance smoke tests: not done (informational only, not
   blocking).
