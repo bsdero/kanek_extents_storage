@@ -189,7 +189,8 @@ whichever of these haven't been checked.
 Functional coverage per public function now exists for all three
 headers: `test_kes_bitmap_full.c` (10/10), `test_kes_storage_full.c`
 (15/15), `test_kes_cache_full.c` (12/12) -- one direct test per
-function, satisfying most of §6.A. `test_kes_cache.c` (23/23) adds
+function, satisfying most of §6.A. `test_kes_cache.c` (24/24 as of
+Track A.3.1, see below) adds
 edge-case and concurrency coverage beyond that, including several
 items from §6.B/§6.C: no-callback-registered paths, ref_count-leak-
 on-load-failure, the P0 duplicate-insert race, and the Phase 3/4
@@ -197,6 +198,70 @@ concurrency regression test above. `test_kes_multiprocess.c` (1/1,
 see "Cross-process synchronized extent I/O test" above) adds the
 first real multi-process (`fork()`-based) coverage, distinct from
 every other test binary's thread-based concurrency.
+
+### Phase 5 progress -- Track A.3.1: `kes_cache_destroy()` vs concurrent access (DONE, real bug found and FLAGGED, NOT FIXED)
+
+`Cache Destroy Races Concurrent Access` added to `tests/test_kes_cache.c`
+(plan_phase5.md Track A.3.1). Reading `kes_cache_destroy()`
+(`src/kes_cache.c`) first, before writing any assertion, established
+its actual contract: it calls `kes_cache_stop()` (which only joins
+*background* flush threads started by `kes_cache_start()`), then
+walks the LRU list under `cache_lock`, freeing each entry's data
+buffer, destroying `entry->lock`/`entry->cond`, and `free()`ing the
+entry struct -- without ever acquiring `entry->lock` while doing so
+and without checking `ref_count`/`pin_count` first. Nothing waits
+for, rejects, or otherwise coordinates with a caller still inside
+`kes_cache_get_extent()`/`kes_cache_put_extent()` on the same cache.
+The actual, currently-inferred contract is therefore "the caller
+must quiesce every other thread using this cache before calling
+`kes_cache_destroy()`" -- not "`destroy()` is safe to call
+concurrently." `include/kes/kes_cache.h` does not state this
+explicitly today.
+
+**This is a genuine, confirmed bug, per rule 0.3 reported here and
+NOT fixed in this commit.** A standalone, minimal reproduction
+(one thread in a tight `get_extent()`/`put_extent()` loop,
+`kes_cache_destroy()` called from another thread ~2ms later) was
+built outside the test tree and run under both sanitizers:
+
+- **ASan**: heap-use-after-free -- `lru_remove()`
+  (`src/kes_cache.c:125`) reads a `kes_extent_entry_t` already freed
+  by `kes_cache_destroy()` (`src/kes_cache.c:779`). Reproduced on
+  every run of the standalone repro.
+- **TSan**: multiple data races on the freed entry's lock/fields
+  (`kes_cache_destroy()` vs. `kes_cache_get_extent()`/
+  `kes_cache_put_extent()`), plus explicit "heap-use-after-free" and
+  "use of an invalid mutex (e.g. uninitialized or destroyed)"
+  reports -- all pointing at the same destroy()-vs-get/put
+  interleaving.
+
+The automated `tests/test_kes_cache.c` version of this race runs the
+racer threads and `kes_cache_destroy()` inside a forked, disposable
+child process (mirroring `test_cross_process_racing_io()`'s pattern
+in `tests/test_kes_multiprocess.c`) precisely so this real,
+unfixed use-after-free cannot nondeterministically crash the whole
+test binary: the parent test process only asserts that it observes
+the child end (cleanly or via a sanitizer-reported crash) without
+hanging or itself crashing, and prints which outcome occurred. Under
+`make tsan` this reliably shows the child exiting with TSan's
+nonzero status (66) on every observed run; under `make asan` it has
+not been observed to reproduce inside this specific multi-threaded
+test-binary timing, even though the same bug reproduces every time
+in the separate, simpler standalone repro described above (a known
+ASan-detection timing artifact, not evidence the bug is
+ASan-specific). `make test`/`make asan`/`make tsan` all still pass
+71/71 -- the test's own assertions do not depend on the race
+actually triggering.
+
+**Not fixed** -- deciding between "make `kes_cache_destroy()`
+synchronize with in-flight callers" and "document
+caller-must-quiesce-first and let callers enforce it" is a real API
+contract decision, not a bug fix, and is out of scope for this
+commit per rule 0.3. Whoever picks this up next should read the
+`Cache Destroy Races Concurrent Access` test's doc comment in
+`tests/test_kes_cache.c` (immediately above
+`test_cache_destroy_races_concurrent_access()`) for the full
+citation trail before deciding.
 
 **Not done** -- see `KES_HARDENING_PLAN.md` §6 for full detail on
 each:
@@ -223,9 +288,10 @@ each:
   §6.B's own guidance is still needed).
 - §6.C further concurrency/stress: scaling the existing tests to more
   threads than CPU cores and higher iteration counts; a dedicated
-  `kes_cache_destroy()`-during-concurrent-access test; running the
-  concurrency suite 100+ times in a loop with a logged fixed random
-  seed (a stress-test target, not yet added to the Makefile).
+  `kes_cache_destroy()`-during-concurrent-access test -- **DONE, see
+  "Phase 5 progress -- Track A.3.1" above**; running the concurrency
+  suite 100+ times in a loop with a logged fixed random seed (a
+  stress-test target, not yet added to the Makefile).
 - §6.D fault injection: configurable-failure-mode I/O wrappers
   (fail on Nth call, or with a probability), `malloc`/`aligned_alloc`
   failure simulation, partial read/write simulation. None of this
