@@ -264,6 +264,96 @@ static bool test_no_sync_reopen_durability(void) {
                   "Track B docs gap, not fixed here)");
 }
 
+/* ================================================================
+ * A.5.2 -- truncated/corrupted descriptor detection.
+ *
+ * Two distinct cases, confirmed to return two DIFFERENT error codes
+ * by reading load_storage_descriptor() (src/kes_storage.c) first:
+ *
+ *   1. Truncating the file to fewer bytes than
+ *      sizeof(kes_storage_descriptor_t): the read() byte-count check
+ *      fails ("bytes_read != sizeof(...)") BEFORE the magic-number
+ *      check is ever reached, so this returns KES_ERROR_IO -- NOT
+ *      KES_ERROR_CORRUPT, which a caller distinguishing "corrupt"
+ *      from "truncated/missing" purely by return code should know.
+ *   2. Overwriting just the 4-byte magic-number field in an
+ *      otherwise-intact, correctly-sized descriptor: the byte-count
+ *      check passes (a full descriptor's worth of bytes was read),
+ *      but the magic check fails, returning KES_ERROR_CORRUPT as
+ *      documented -- already covered narrowly by
+ *      test_kes_storage_open_corrupt() in
+ *      tests/test_kes_storage_full.c (zeroed/garbage magic), NOT
+ *      duplicated here in the exact same form; this test instead
+ *      pairs it directly against case 1's different error code and a
+ *      distinct corruption byte pattern for contrast.
+ *
+ * Either way, kes_storage_open() must fail cleanly (no crash, no
+ * *storage output) rather than proceeding with uninitialized/garbage
+ * geometry -- confirmed for both cases below.
+ */
+static bool test_truncated_and_corrupted_descriptor(void) {
+    kes_storage_t *st = NULL;
+    int fd;
+
+    /* --- Case 1: truncate below sizeof(descriptor). --- */
+    cleanup();
+    TEST_ASSERT( make_storage( TEST_FILE, &st) == KES_SUCCESS,
+                "create storage (truncation case)");
+    TEST_ASSERT( kes_storage_close( st) == KES_SUCCESS,
+                "clean close to lay out a valid file first");
+    st = NULL;
+
+    fd = open( TEST_FILE, O_WRONLY);
+    TEST_ASSERT( fd >= 0, "reopen raw fd to truncate");
+    TEST_ASSERT( ftruncate( fd, 10) == 0,
+                "truncate to 10 bytes -- well under "
+                "sizeof(kes_storage_descriptor_t)");
+    close( fd);
+
+    TEST_ASSERT( kes_storage_open( TEST_FILE, 0, &st) ==
+                    KES_ERROR_IO,
+                "OBSERVED: a truncated (< one full descriptor) file "
+                "returns KES_ERROR_IO, not KES_ERROR_CORRUPT -- the "
+                "byte-count check in load_storage_descriptor() fails "
+                "before the magic-number check is ever reached");
+    TEST_ASSERT( st == NULL,
+                "*storage was not left pointing at a partially-"
+                "initialized handle");
+    cleanup();
+
+    /* --- Case 2: intact size, corrupted magic number. --- */
+    TEST_ASSERT( make_storage( TEST_FILE, &st) == KES_SUCCESS,
+                "create storage (magic-corruption case)");
+    TEST_ASSERT( kes_storage_close( st) == KES_SUCCESS,
+                "clean close to lay out a valid, full-size file");
+    st = NULL;
+
+    fd = open( TEST_FILE, O_WRONLY);
+    TEST_ASSERT( fd >= 0, "reopen raw fd to corrupt the magic number");
+    uint32_t garbage_magic = 0xDEADBEEF;
+    TEST_ASSERT( lseek( fd, 0, SEEK_SET) == 0, "seek to block 0");
+    TEST_ASSERT( write( fd, &garbage_magic, sizeof(garbage_magic)) ==
+                    (ssize_t)sizeof(garbage_magic),
+                "overwrite only the 4-byte magic field, leaving the "
+                "rest of the descriptor (and the whole file) intact");
+    close( fd);
+
+    TEST_ASSERT( kes_storage_open( TEST_FILE, 0, &st) ==
+                    KES_ERROR_CORRUPT,
+                "an intact-size descriptor with a bad magic number "
+                "returns KES_ERROR_CORRUPT, as documented");
+    TEST_ASSERT( st == NULL,
+                "*storage was not left pointing at a partially-"
+                "initialized handle on this failure either");
+
+    cleanup();
+    TEST_SUCCESS( "truncated/corrupted descriptor detection: "
+                  "truncation -> KES_ERROR_IO, bad magic -> "
+                  "KES_ERROR_CORRUPT -- two different codes for two "
+                  "different failure shapes, both rejected cleanly "
+                  "before any bitmap/geometry use");
+}
+
 typedef struct {
     const char *name;
     bool ( *func)(void);
@@ -271,6 +361,8 @@ typedef struct {
 
 static test_case_t test_cases[] = {
     {"no-sync reopen durability", test_no_sync_reopen_durability},
+    {"truncated/corrupted descriptor detection",
+     test_truncated_and_corrupted_descriptor},
     {NULL, NULL}
 };
 

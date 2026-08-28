@@ -483,6 +483,23 @@ numbered sub-item with pasted `make test`/`make asan` evidence:
   pass), not fixed here. `make test` after this commit: 86/86 (was
   85/85 -- 1 new test in the new
   `tests/test_kes_crash_consistency.c`).
+- **A.5.2** (`tests/test_kes_crash_consistency.c`,
+  `test_truncated_and_corrupted_descriptor`): two distinct cases,
+  confirmed to return two *different* error codes by reading
+  `load_storage_descriptor()` first. Truncating the file to fewer
+  bytes than `sizeof(kes_storage_descriptor_t)` returns
+  `KES_ERROR_IO` (the `read()` byte count check fails before the
+  magic-number check is ever reached) -- **not** `KES_ERROR_CORRUPT`,
+  worth knowing if a caller tries to distinguish "corrupt" from
+  "truncated/missing" by return code alone. Overwriting just the
+  4-byte magic-number field in an otherwise-intact, correctly-sized
+  descriptor returns `KES_ERROR_CORRUPT` as expected (pairs against
+  case 1's different code and a distinct corruption pattern from
+  `test_kes_storage_open_corrupt()`,
+  `tests/test_kes_storage_full.c`, not duplicating it). Either way,
+  `kes_storage_open()` fails cleanly (no crash, no `*storage` output)
+  rather than proceeding with uninitialized/garbage geometry.
+  `make test` after this commit: 87/87 (was 86/86).
 
 **Not done** -- see `KES_HARDENING_PLAN.md` §6 for full detail on
 each:
