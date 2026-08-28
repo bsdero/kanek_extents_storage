@@ -1,5 +1,21 @@
 # KANEK Extents Storage (KES) Project Overview
 
+## Standing note (Phase 6 docs truth pass)
+
+This document previously carried the largest number of stale claims
+of any file under `docs/` per the last review: a buddy-system
+allocator, log-structured/flash-aware allocation, compressed
+bitmaps, O(1) allocation search, ACID/checksummed/journaled
+persistence, and an "Advanced Features" section claiming LRU/LFU/Clock
+multi-policy eviction as a working bonus feature. Every claim below
+has been checked against `src/*.c`/`include/kes/*.h` directly (grep
+for the relevant identifiers finds nothing for anything marked "Not
+implemented" below) and corrected or explicitly labeled, per
+`AGENTS.md`'s "Ground truth" section, which this document should now
+match. Test-count and benchmark figures are updated to the current
+verified baseline (`TESTS_AND_EXAMPLES.md`) rather than the file's
+previous, uncited numbers.
+
 ## Project Description
 
 KANEK Extents Storage (KES) is a high-performance, cross-platform 
@@ -10,13 +26,34 @@ database engines, object storage, and other storage-intensive applications.
 
 ### Key Features
 
-- **Cross-Platform Compatibility**: POSIX-compliant (Linux, macOS, iOS)
-- **Architecture Agnostic**: Native support for x86_64 and ARM64
-- **Production Ready**: 9/9 core tests passing, comprehensive validation
-- **Thread-Safe Operations**: Full mutex protection for concurrent access
-- **Memory Efficient**: <0.1% metadata overhead, optimized for edge devices
-- **Flash-Aware Design**: Optimized for modern SSD and eMMC storage
-- **Minimal Dependencies**: Standard C library only
+- **Cross-Platform Compatibility**: written in portable C99/POSIX;
+  actually built and tested only on Linux/WSL2 (see `AGENTS.md`) --
+  macOS/iOS builds are untested by this project's own test suite, not
+  a verified claim
+- **Architecture Agnostic**: no architecture-specific code paths in
+  `src/*.c`, but x86_64/ARM64 are not independently verified by CI
+  here
+- **Well Tested**: 70/70 tests passing across 6 binaries as of the
+  last verified `make test` run (`test_kes_minimal` 9,
+  `test_kes_bitmap_full` 10, `test_kes_storage_full` 15,
+  `test_kes_cache` 23, `test_kes_cache_full` 12,
+  `test_kes_multiprocess` 1) -- see `TESTS_AND_EXAMPLES.md`. `make
+  check-all` (normal + ASan+UBSan + TSan + Valgrind) also passes
+  clean as of the last check-in (`PENDING_ITEMS.md`).
+- **Thread-Safe Operations**: `pthread_mutex_t` in `kes_storage_t`;
+  per-bucket `pthread_rwlock_t` + per-entry `pthread_mutex_t` +
+  cache-wide lock in `kes_cache_t` (see `kes_cache_design.md`'s
+  Thread Safety section for the real locking scheme, which is
+  fine-grained, not lock-free)
+- **Memory Efficient**: bitmap overhead is genuinely small (see
+  "Storage Overhead" below), but "<0.1%" was not independently
+  verified against a real run and should be treated as an estimate
+- **Flash-Aware Design**: **not implemented.** There is no flash
+  geometry detection, wear leveling, or flash-specific I/O path
+  anywhere in `src/*.c` -- see "Advanced Features" below
+- **Minimal Dependencies**: Standard C library + `pthread`; test/build
+  tooling additionally pulls in a header-only subset of
+  `../kanek_foundations` (see `AGENTS.md`)
 
 ## Core Functionalities
 
@@ -32,30 +69,53 @@ blocks. This approach provides:
 
 ### 2. Advanced Block Allocation
 
-Multiple allocation strategies optimized for different use cases:
+`kes_allocation_strategy_t` (`kes_types.h`) declares four strategies,
+but **`kes_extent_allocate()` always uses first-fit** regardless of
+which one `config.strategy` requests -- `allocate_extent_first_fit()`
+is the only allocation function implemented in `src/kes_storage.c`:
 
-- **First-Fit**: Fastest allocation for general-purpose use
-- **Best-Fit**: Minimize fragmentation for long-running systems
-- **Buddy System**: Power-of-2 allocation with efficient coalescing
-- **Log-Structured**: Sequential allocation optimized for flash storage
+- **First-Fit**: Fastest allocation for general-purpose use --
+  **implemented, and the only strategy actually used**.
+- **Best-Fit**: Minimize fragmentation for long-running systems --
+  declared in the enum, not implemented.
+- **Buddy System**: Power-of-2 allocation with efficient coalescing --
+  **not implemented anywhere in this codebase**; there is no
+  `kes_allocation_strategy_t` value for it either.
+- **Log-Structured**: Sequential allocation optimized for flash
+  storage -- not implemented.
 
 ### 3. Bitmap-Based Free Space Management
 
 Efficient tracking of allocated vs. free blocks:
 
-- **Compressed Bitmaps**: Memory-efficient representation
-- **Fast Search**: O(1) allocation for contiguous space
-- **Fragmentation Tracking**: Real-time fragmentation statistics
-- **Persistent State**: Bitmap survives system restarts
+- **Compressed Bitmaps**: **not implemented** -- `kes_bitmap_t` is a
+  single flat `uint8_t *` buffer, one bit per block; no RLE or other
+  compression.
+- **Search**: `kes_bitmap_find_free()` does a linear scan for the
+  first fitting run of free bits from a hint position -- **not O(1)**,
+  it is O(n) in the worst case over the bitmap size.
+- **Fragmentation Tracking**: `kes_storage_stats_t.fragmentation` is a
+  real, computed percentage (`src/kes_storage.c`) -- implemented.
+- **Persistent State**: the bitmap region is written to the backing
+  file and reloaded on `kes_storage_open()` -- implemented.
 
 ### 4. Storage Persistence and Recovery
 
-Reliable data storage with crash recovery:
-
-- **ACID Compliance**: Atomic operations with rollback support
-- **Metadata Integrity**: Checksums and validation for critical data
-- **Clean Recovery**: Graceful recovery from unexpected shutdowns
-- **Version Management**: Forward/backward compatibility support
+- **ACID Compliance**: **not implemented.** There is no
+  transaction/rollback mechanism -- `kes_storage_sync()` is a single
+  flush of the in-memory descriptor and bitmap, nothing more.
+- **Metadata Integrity**: **not implemented.** There is no checksum
+  field or validation beyond the magic-number check on open; a
+  truncated or corrupted descriptor is a known, untested gap (see
+  `plan_phase5.md` Track A.5).
+- **Clean Recovery**: `kes_storage_open()` reloads the descriptor and
+  bitmap written by the last `kes_storage_sync()`/`kes_storage_close()`
+  -- this covers clean-shutdown persistence, not crash recovery from a
+  mid-write failure (untested, see `plan_phase5.md` Track A.5).
+- **Version Management**: `kes_storage_descriptor_t` carries
+  `version_major`/`version_minor` fields, but there is no actual
+  forward/backward-compatibility logic that reads or acts on them --
+  they are stored and reloaded verbatim, nothing more.
 
 ## API Reference
 
@@ -153,9 +213,14 @@ All KES functions return integer error codes:
 #define KES_ERROR_INVALID       -1    // Invalid parameters
 #define KES_ERROR_NOMEM         -2    // Out of memory
 #define KES_ERROR_NOTFOUND      -3    // Resource not found
+#define KES_ERROR_EXISTS        -4    // Resource already exists
 #define KES_ERROR_IO            -5    // I/O error
 #define KES_ERROR_NOSPACE       -6    // No space available
 #define KES_ERROR_CORRUPT       -7    // Data corruption detected
+#define KES_ERROR_BUSY          -8    // Resource busy (referenced or
+                                       // pinned -- currently only
+                                       // returned by the cache layer)
+// (this list was previously missing KES_ERROR_EXISTS/_BUSY)
 
 // Get human-readable error description
 const char* kes_get_error_string(int error_code);
@@ -435,14 +500,15 @@ int object_store_get(object_store_t* store, const char* object_id,
 
 ### Performance Benchmarks
 
-| Operation | Performance | Notes |
-|-----------|-------------|-------|
-| Extent Allocation | 1M ops/sec | First-fit algorithm |
-| Extent Deallocation | 2M ops/sec | Bitmap clear operation |
-| Sequential Read | 800 MB/sec | Limited by storage device |
-| Sequential Write | 600 MB/sec | Limited by storage device |
-| Random Read (8KB) | 50K IOPS | SSD-optimized |
-| Random Write (8KB) | 30K IOPS | Flash-aware design |
+**Not measured.** There is no benchmark suite in this repository
+(`plan_phase5.md` Track A.7 / `KES_HARDENING_PLAN.md` §6.G describe
+adding an informational perf-smoke test as future, non-blocking work).
+The figures previously shown here (1M ops/sec allocation, 800 MB/sec
+sequential read, etc.) were never produced by an actual run against
+this code and have been removed rather than corrected -- there is
+nothing to correct them *to* yet. When a real perf-smoke test exists,
+its numbers belong here with a citation to the run that produced
+them.
 
 ## Platform Support
 
@@ -506,31 +572,61 @@ make package      # Create distribution package
 ## Testing and Validation
 
 ### Test Coverage
-- **Core Functionality**: 9/9 tests passing (100%)
-- **Memory Management**: Leak-free validation
-- **Thread Safety**: Concurrent access testing
-- **Data Integrity**: Byte-level verification
-- **Persistence**: Cross-session data recovery
+- **Overall**: 70/70 tests passing across 6 binaries as of the last
+  verified `make test` run -- see `TESTS_AND_EXAMPLES.md` for the
+  per-binary breakdown.
+- **Memory Management**: Leak-free per `make valgrind` (0 leaks as of
+  the last check-in, `PENDING_ITEMS.md`).
+- **Thread Safety**: concurrent-access regression tests exist
+  (`test_kes_cache.c`'s `Concurrent Access`,
+  `Concurrent Miss No Duplicate Entry`,
+  `Concurrent Sync vs Get/Put`; `test_kes_multiprocess.c`'s
+  fork()-based cross-process test) and pass under TSan (0 races as of
+  the last check-in).
+- **Data Integrity**: exercised by direct read/write round-trip
+  assertions in `test_kes_storage_full.c`/`test_kes_cache_full.c`.
+- **Persistence**: exercised by close/reopen tests in
+  `test_kes_storage_full.c`; crash-consistency (no-explicit-sync
+  reopen, truncated descriptor, bit-flipped bitmap) is explicitly
+  **not yet covered** -- see `plan_phase5.md` Track A.5.
 
 ### Quality Assurance
-- **Static Analysis**: Clean cppcheck and clang-analyzer results
-- **Memory Safety**: Valgrind clean execution
-- **Performance**: Benchmark validation under load
-- **Compatibility**: Multi-platform testing
+
+**Not run/not verified as part of this project.** There is no
+`cppcheck`/`clang-analyzer` step in the Makefile or anywhere in this
+repository, and no automated performance-regression benchmark. What
+*is* actually run and verified: `make asan` (ASan+UBSan), `make tsan`,
+`make valgrind`, and `make check-all` (all three plus a normal build)
+-- see `AGENTS.md`'s "Building and Testing" section.
 
 ### Continuous Integration
-- **GitHub Actions**: Automated testing on push
-- **Cross-Platform**: Linux, macOS, embedded targets
-- **Performance Regression**: Automated benchmark tracking
+
+**Not implemented.** There is no `.github/workflows/` directory, no
+CI configuration of any kind, and no automated cross-platform testing
+in this repository -- everything above is run manually.
 
 ## Advanced Features
 
-### Caching Layer (Bonus)
-Optional high-performance caching system:
-- **Multi-Policy Eviction**: LRU, LFU, Clock algorithms
-- **Background Sync**: Asynchronous dirty page writeback
-- **Memory Pressure**: Adaptive cache sizing
-- **Thread-Safe**: Lock-free cache operations
+### Caching Layer (Optional)
+An independent extent cache layer (`kes_cache.c`, does not call into
+`kes_storage.c` -- see `AGENTS.md`'s "Module layering" section) sits
+in front of a storage backend via caller-supplied I/O callbacks:
+- **Eviction**: **LRU only**. `kes_cache_policy_t` also declares
+  `KES_CACHE_LFU`/`KES_CACHE_CUSTOM`, but `kes_cache_create()` rejects
+  both (returns `NULL`) -- there is no LFU or Clock implementation
+  anywhere in this codebase. "Multi-Policy Eviction" was never an
+  accurate description.
+- **Background Sync**: real, implemented -- `kes_cache_start()` runs
+  background threads that periodically flush dirty extents and evict
+  per `config.max_entries`/`config.max_memory`.
+- **Capacity Enforcement**: `kes_cache_get_extent()` evicts from the
+  LRU tail on a miss to respect the configured limits, returning
+  `KES_ERROR_BUSY` if it can't free enough room -- there is no
+  separate "adaptive cache sizing" that responds to system memory
+  pressure; the limits are the config values you set.
+- **Thread-Safe**: fine-grained locking (`pthread_rwlock_t` per
+  bucket, `pthread_mutex_t` per entry, one cache-wide lock) -- **not**
+  lock-free. See `kes_cache_design.md`'s Thread Safety section.
 
 ### Flash Optimization (Planned)
 Future enhancements for flash storage:
