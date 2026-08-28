@@ -404,6 +404,128 @@ static bool test_start_block_near_max_no_size_wrap(void) {
                   "no 64-bit size truncation in extent_data_size()");
 }
 
+/* ================================================================
+ * A.1.5 -- pin/unpin imbalance and refcounted-pin semantics.
+ *
+ * Verified by reading src/kes_cache.c:1081-1139 (kes_cache_pin_extent/
+ * kes_cache_unpin_extent): pinning is refcounted, not boolean.
+ * kes_cache_pin_extent() increments entry->pin_count every call, only
+ * setting KES_EXTENT_PINNED and bumping stats.entries_pinned on the
+ * 0->1 transition; kes_cache_unpin_extent() decrements it, only
+ * clearing pinned state and decrementing stats.entries_pinned on the
+ * ->0 transition. An extra unpin beyond the pin count is a guarded
+ * no-op (`if (entry->pin_count > 0)`) -- it does not underflow.
+ * include/kes/kes_cache.h's doc comments for both functions were
+ * updated in this same commit to document this plainly.
+ *
+ * This test pins an entry 3 times, unpins once (still pinned/
+ * unevictable), unpins twice more (now evictable), and separately
+ * confirms an unpin on a never-pinned entry is a safe KES_SUCCESS
+ * no-op. "Unevictable" is proven the same way
+ * test_cache_pinned_entries_never_evicted (tests/test_kes_cache.c)
+ * does: fill a small-max_entries cache with unrelated traffic and
+ * confirm the pinned entry is still a cache hit (never reloaded from
+ * the mock backing store) afterward.
+ */
+static bool test_pin_unpin_refcount_semantics(void) {
+    kes_cache_config_t cfg;
+    kes_cache_t *cache;
+    void *buf = NULL;
+    kes_extent_id_t pinned_id = make_id( 20);
+    kes_cache_stats_t stats;
+    kes_extent_id_t never_pinned = make_id( 21);
+
+    memset( &cfg, 0, sizeof(cfg));
+    cfg.max_memory = KES_CACHE_MIN_MEMORY;
+    cfg.min_memory = KES_CACHE_MIN_MEMORY;
+    cfg.max_entries = KES_CACHE_MIN_ENTRIES;   /* 16, small on purpose */
+    cfg.policy = KES_CACHE_LRU;
+    cfg.background_threads = 1;
+    cfg.sync_interval_ms = 1000;
+
+    cache = kes_cache_create( &cfg);
+    TEST_ASSERT( cache != NULL, "cache creation for pin/unpin test");
+    kes_cache_set_io_callbacks( cache, mock_read, mock_write, mock_sync);
+
+    TEST_ASSERT(
+        kes_cache_get_extent( cache, &pinned_id, &buf) == KES_SUCCESS,
+        "get the entry that will be pinned 3 times");
+
+    TEST_ASSERT( kes_cache_pin_extent( cache, &pinned_id) == KES_SUCCESS,
+                "1st pin");
+    TEST_ASSERT( kes_cache_pin_extent( cache, &pinned_id) == KES_SUCCESS,
+                "2nd pin");
+    TEST_ASSERT( kes_cache_pin_extent( cache, &pinned_id) == KES_SUCCESS,
+                "3rd pin");
+    kes_cache_get_stats( cache, &stats);
+    TEST_ASSERT( stats.entries_pinned == 1,
+                "3 pins on 1 entry still counts as 1 pinned entry "
+                "(refcounted, not boolean)");
+    kes_cache_put_extent( cache, &pinned_id);
+
+    TEST_ASSERT( kes_cache_unpin_extent( cache,
+                                         &pinned_id) == KES_SUCCESS,
+                "1 of 3 unpins");
+
+    /* Push far more distinct, unpinned entries through the cache
+     * than max_entries allows, to create real eviction pressure. */
+    for ( int i = 100; i < 140; i++) {
+        kes_extent_id_t id = make_id( (uint64_t)i);
+        void *b = NULL;
+        TEST_ASSERT(
+            kes_cache_get_extent( cache, &id, &b) == KES_SUCCESS,
+            "get_extent failed while generating eviction pressure");
+        kes_cache_put_extent( cache, &id);
+    }
+
+    kes_cache_get_stats( cache, &stats);
+    TEST_ASSERT( stats.entries_pinned == 1,
+                "still pinned after only 1 of 3 unpins");
+
+    uint64_t hits_before = stats.hits;
+    TEST_ASSERT(
+        kes_cache_get_extent( cache, &pinned_id, &buf) == KES_SUCCESS,
+        "still-pinned entry is still gettable after eviction "
+        "pressure");
+    kes_cache_get_stats( cache, &stats);
+    TEST_ASSERT( stats.hits == hits_before + 1,
+                "still-pinned entry survived as a cache hit, not "
+                "evicted, after only 1 of 3 unpins");
+    kes_cache_put_extent( cache, &pinned_id);
+
+    TEST_ASSERT( kes_cache_unpin_extent( cache,
+                                         &pinned_id) == KES_SUCCESS,
+                "2 of 3 unpins");
+    TEST_ASSERT( kes_cache_unpin_extent( cache,
+                                         &pinned_id) == KES_SUCCESS,
+                "3 of 3 unpins -- fully unpinned now");
+    kes_cache_get_stats( cache, &stats);
+    TEST_ASSERT( stats.entries_pinned == 0,
+                "entries_pinned reaches 0 once pin count is fully "
+                "drained");
+
+    /* Extra unpin beyond the pin count: safe no-op, not an error. */
+    TEST_ASSERT(
+        kes_cache_unpin_extent( cache, &pinned_id) == KES_SUCCESS,
+        "extra unpin beyond the pin count is a safe no-op, "
+        "KES_SUCCESS, not an error");
+
+    /* Unpin on a never-pinned (but cached) entry: also a safe no-op. */
+    TEST_ASSERT(
+        kes_cache_get_extent( cache, &never_pinned, &buf) == KES_SUCCESS,
+        "get a never-pinned entry");
+    TEST_ASSERT(
+        kes_cache_unpin_extent( cache, &never_pinned) == KES_SUCCESS,
+        "unpin on a never-pinned entry is KES_SUCCESS with no state "
+        "change (current code does not special-case this as an "
+        "error)");
+    kes_cache_put_extent( cache, &never_pinned);
+
+    kes_cache_destroy( cache);
+    TEST_SUCCESS( "pin/unpin is refcounted: N pins require N unpins, "
+                  "extra unpins are safe no-ops");
+}
+
 typedef struct {
     const char *name;
     bool ( *func)(void);
@@ -416,6 +538,8 @@ static test_case_t test_cases[] = {
     {"block_count 0 and UINT32_MAX", test_block_count_zero_and_max},
     {"start_block near UINT64_MAX, no size wrap",
      test_start_block_near_max_no_size_wrap},
+    {"pin/unpin refcount semantics",
+     test_pin_unpin_refcount_semantics},
     {NULL, NULL}
 };
 

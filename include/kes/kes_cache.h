@@ -260,7 +260,14 @@ int kes_cache_put_extent( kes_cache_t *cache,
                            const kes_extent_id_t *id);
 
 /**
- * Pin extent in memory (prevent eviction)
+ * Pin extent in memory (prevent eviction). Pinning is
+ * reference-counted, not boolean: each call increments the entry's
+ * internal pin count, and only the 0->1 transition marks the entry
+ * pinned/unevictable and increments kes_cache_stats_t.entries_pinned
+ * -- a second, third, etc. pin on an already-pinned entry still
+ * returns KES_SUCCESS but does not double-count it in entries_pinned.
+ * N pins require N matching kes_cache_unpin_extent() calls before the
+ * entry becomes evictable again.
  * @param cache Cache handle
  * @param id Extent identifier
  * @return KES_SUCCESS or error code
@@ -269,7 +276,13 @@ int kes_cache_pin_extent( kes_cache_t *cache,
                            const kes_extent_id_t *id);
 
 /**
- * Unpin extent (allow eviction)
+ * Unpin extent (allow eviction). Decrements the reference-counted
+ * pin count kes_cache_pin_extent() maintains; only the ->0
+ * transition clears the pinned state and decrements
+ * kes_cache_stats_t.entries_pinned. Calling this more times than the
+ * entry was pinned is a safe no-op -- the pin count is guarded
+ * against underflow and an extra unpin still returns KES_SUCCESS
+ * with no state change, it is not treated as an error.
  * @param cache Cache handle
  * @param id Extent identifier
  * @return KES_SUCCESS or error code
