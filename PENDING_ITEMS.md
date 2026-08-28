@@ -198,29 +198,131 @@ see "Cross-process synchronized extent I/O test" above) adds the
 first real multi-process (`fork()`-based) coverage, distinct from
 every other test binary's thread-based concurrency.
 
+### Phase 5 progress (this pass) -- plan_phase5.md Track A.1/A.2 (DONE)
+
+All 9 sub-items of A.1 and both sub-items of A.2 are complete, each
+its own commit with pasted `make test`/`make asan`/`make tsan`
+evidence:
+
+- **A.1.1** (`tests/test_kes_cache_edge.c`, `test_null_parameter_
+  checks`): closes the NULL-parameter gaps left after checking
+  `test_kes_cache_full.c` function-by-function --
+  `pin_extent`/`unpin_extent`/`mark_dirty`/`flush_extent`'s `id`
+  parameter, `invalidate`'s `cache` and `id`, `sync`/`reset_stats`/
+  `start`'s `cache` (these three previously only existed inside
+  `test_kes_cache_full.c`'s `#if 0` Phase-3-pending block, so were
+  never actually compiled/run), and `set_io_callbacks`'s three
+  function-pointer parameters individually (observed: none are
+  validated, all accepted including NULL -- error is deferred to
+  use time).
+- **A.1.2** (`src/kes_cache.c`, `kes_cache_get_extent()`; doc comment
+  in `include/kes/kes_cache.h`): the plan's premise ("config.block_size
+  power-of-2 guard in `kes_cache_create()`") does not match this
+  codebase -- `kes_cache_config_t` has no `block_size` field at all;
+  it lives on the per-call `kes_extent_id_t` instead. Applied the
+  same `KES_IS_POWER_OF_2`/`KES_MIN_BLOCK_SIZE`/`KES_MAX_BLOCK_SIZE`
+  guard where `block_size` actually appears: `kes_cache_get_extent()`
+  now rejects an invalid `id->block_size` with `KES_ERROR_INVALID`
+  before any allocation is attempted.
+- **A.1.3** (`test_block_count_zero_and_max`): `block_count == 0`
+  currently produces a valid 0-byte cached entry (`aligned_alloc(64,
+  0)` returns non-NULL on this platform) -- asserted as observed
+  behavior, flagged below as a real but minor, not-yet-fixed gap.
+  `block_count == UINT32_MAX` is cleanly rejected as
+  `KES_ERROR_BUSY` (the `max_memory` capacity check in
+  `make_room_for_new_entry()` fails before any allocation is
+  attempted for the resulting ~16TiB request) -- not the `NOMEM` the
+  original plan speculated.
+- **A.1.4** (`test_start_block_near_max_no_size_wrap`): confirmed by
+  reading `src/kes_cache.c` that `id->start_block` is only ever used
+  for hashing/equality/logging in this module, never in size
+  arithmetic; `extent_data_size()`'s `(size_t)block_count *
+  block_size` is already 64-bit-safe. Test reuses
+  `test_kes_extent_read_write_32bit_overflow`'s 600000/8192 numbers
+  with a custom `max_memory` strictly between the wrapped (~591MiB)
+  and true (~4.58GiB) sizes to make a hypothetical wrap
+  distinguishable by return code; observed `KES_ERROR_BUSY`, matching
+  the unwrapped true size.
+- **A.1.5** (`test_pin_unpin_refcount_semantics`; doc comments for
+  `kes_cache_pin_extent`/`kes_cache_unpin_extent` in
+  `include/kes/kes_cache.h`): documents and tests that pinning is
+  reference-counted (N pins require N unpins), that an entry pinned
+  3x and unpinned only once survives real eviction pressure as a
+  cache hit, and that both an extra unpin beyond the pin count and an
+  unpin on a never-pinned entry are safe `KES_SUCCESS` no-ops.
+- **A.1.6** (`test_destroy_with_outstanding_reference`): read
+  `kes_cache_destroy()` first -- it frees every entry unconditionally,
+  never checking `ref_count`/`pin_count`. Test gets an extent, never
+  puts it, destroys the cache, asserts `KES_SUCCESS`/no crash, and
+  does not dereference the now-dangling buffer afterward. Per the
+  plan's rule, run under `make asan` specifically (not just plain
+  `make test`) -- clean, 0 ASan findings.
+- **A.1.7** (`test_ops_between_stop_and_destroy`): read
+  `kes_cache_stop()` and grepped `cache->shutdown`'s other uses --
+  confirmed it only tears down background threads and is read nowhere
+  else, so `get_extent()`/`put_extent()` after `stop()` just work
+  normally. Test asserts that directly.
+- **A.1.8** (`test_empty_cache_no_ops`): `kes_cache_sync()` and
+  `kes_cache_reset_stats()` on a freshly-created, never-populated
+  cache are clean `KES_SUCCESS` no-ops with all-zero stats after.
+  `invalidate()`-on-missing-id is already covered by
+  `test_cache_invalidate` (`tests/test_kes_cache.c`), not duplicated.
+- **A.1.9** (`test_hash_collision_disambiguation`): brute-forces a
+  genuine `kes_extent_hash()` bucket collision (guaranteed by the
+  pigeonhole principle, sweeping `2 * (bucket_mask + 1)` `start_block`
+  values against a live cache's real `bucket_mask` --
+  `struct kes_cache` is fully defined in `include/kes/kes_cache.h`,
+  not opaque), inserts both colliding ids with distinguishable
+  backing data, and confirms both are independently retrievable with
+  correct, distinct data -- proving `kes_extent_equal()` actually
+  disambiguates within a shared bucket, not just in isolation.
+- **A.2.1** (new `tests/test_kes_storage_edge.c`,
+  `test_exhaustion_then_free_and_reallocate`): drives a 2MB storage
+  to actual bit-for-bit exhaustion (distinct from the existing
+  single-over-large-request coverage in `test_kes_extent_allocate`),
+  confirms the next allocation cleanly returns `KES_ERROR_NOSPACE`,
+  cross-checks `kes_bitmap_get_stats()` against
+  `storage->desc.used_blocks` (`kes_storage_t` is non-opaque) to
+  confirm no bitmap/descriptor desync at exhaustion, then frees one
+  extent and confirms reallocation succeeds and first-fits into the
+  freed block.
+- **A.2.2** (`tests/test_kes_multiprocess.c`,
+  `test_cross_process_racing_io`): the deliberate-race counterpart to
+  `test_kes_cross_process_sync_io` -- same fork()/shared-file setup
+  with the semaphore turn-taking removed, both processes racing
+  `kes_extent_allocate()`/`kes_extent_write()` with zero coordination
+  (bounded, 20 ops/side). Does not assert correctness (this is the
+  documented, unguarded gap below) -- only that the race completes
+  without hanging or crashing either process. A third, non-racing
+  read-only re-open after both processes exit makes the real
+  corruption visible in the test log: each side's own self-reported
+  free/used counts look internally consistent (each only ever saw its
+  own private in-memory bitmap), but the real on-disk `used_blocks`
+  is observed to be less than the combined allocations both sides
+  believed succeeded -- one side's `kes_storage_sync()` silently
+  clobbered the other's. Verified stable across repeated runs and
+  clean under both `make asan` and `make tsan` (spawns a process, so
+  run under both per the plan's concurrency rule) -- no crash, no
+  ASan/TSan finding, in either.
+
+Real gap found but deliberately NOT fixed in this pass, per rule 0.3
+(no drive-by fixes -- reported instead): **`block_count == 0` is not
+validated anywhere in `kes_cache_get_extent()`** and currently
+produces a "successful" but nonsensical 0-byte cached entry rather
+than being rejected with `KES_ERROR_INVALID`. Low severity (no crash,
+no oversized-allocation risk, unlike the `UINT32_MAX` case which *is*
+already handled cleanly) but worth a small follow-up guard alongside
+the `block_size` check A.1.2 added.
+
+`make test` after this pass: 81/81 (was 70/70 baseline -- 11 new
+tests added: 9 in `tests/test_kes_cache_edge.c`, 1 in the new
+`tests/test_kes_storage_edge.c`, 1 added to
+`tests/test_kes_multiprocess.c`). `make asan`/`make tsan`: clean for
+every test in this pass that required them (A.1.6, A.2.2).
+
 **Not done** -- see `KES_HARDENING_PLAN.md` §6 for full detail on
 each:
 
-- §6.B edge cases not yet covered: NULL for every individual pointer
-  parameter (only some functions tested this way);
-  `block_count = 0`/`UINT32_MAX`, `start_block = UINT64_MAX`, and
-  `start_block * block_size` overflow combinations for the cache
-  layer specifically (the storage layer's 32-bit overflow case *is*
-  covered, `test_kes_extent_read_write_32bit_overflow` in
-  `tests/test_kes_storage_full.c`); non-power-of-2 `block_size`
-  validation; pin/unpin imbalance beyond a single pin/unpin pair;
-  `kes_cache_destroy()` with an outstanding unreleased reference;
-  operations on a cache between `kes_cache_stop()` and
-  `kes_cache_destroy()`; hash-collision disambiguation
-  (`kes_extent_equal()` actually used, not just the hash); storage
-  layer at 100%-full-then-free-one-block; *unsynchronized* concurrent
-  open/access of the same storage file from two `kes_storage_t*`
-  instances (still undocumented, unguarded -- the *synchronized* case
-  is now covered by `tests/test_kes_multiprocess.c`, see "Cross-process
-  synchronized extent I/O test" above, but that test deliberately never
-  lets the two processes race; a version that does race them and
-  records the resulting corruption/behavior as a known limitation per
-  §6.B's own guidance is still needed).
 - §6.C further concurrency/stress: scaling the existing tests to more
   threads than CPU cores and higher iteration counts; a dedicated
   `kes_cache_destroy()`-during-concurrent-access test; running the
