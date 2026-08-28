@@ -162,7 +162,7 @@ allocation from two processes against the same file is still expected
 to corrupt bitmap/descriptor state -- this remains untested and
 unguarded).
 
-### Phase 6 -- documentation truth pass (PARTIALLY DONE)
+### Phase 6 -- documentation truth pass (DONE)
 
 `README.md` and `docs/CONTINUATION_PROMPT.md` were corrected to
 match the state above (badges, feature lists, a "Known Limitations"
@@ -171,16 +171,80 @@ substantially rewritten -- it previously claimed flash zones, GC,
 and wear leveling as complete, which was never true at any point in
 this project's history.
 
-Not done: a pass over the other `docs/` files
-(`KES_API_Reference.md`, `KES_Design_Document.md`,
-`KES_Project_Structure.md`, `kes_cache_design.md`,
-`README_Implementation.md`, `EDGE_DEVICE_OPTIMIZATION_PROMPT.md`,
-`PROJECT_OVERVIEW_KES.md`, `TESTS_AND_EXAMPLES.md`) -- these likely
-still contain aspirational claims (flash zones, GC, wear leveling,
-multi-policy eviction) inherited from the same source as the old
-`CONTINUATION_PROMPT.md`. AGENTS.md's existing guidance to treat
-`docs/` as design-intent rather than ground truth still applies to
-whichever of these haven't been checked.
+The remaining 8 `docs/` files (`plan_phase5.md` Track B, B.1-B.8) have
+now been checked against `src/*.c`/`include/kes/*.h` directly and
+corrected, one file per commit on the `worktree-agent-a18355b7b9c32e9b4`
+branch (see that branch's log for exact diffs):
+
+- **B.1 `KES_API_Reference.md`**: full rewrite. Removed documentation
+  for a Flash-Specific API, Zone Management API, Garbage Collection
+  API, Wear Leveling API, hardware-profile loading, and a
+  Serialization API -- none exist in `include/kes/*.h`. Corrected
+  every struct field list against the real headers (drift check, not
+  just a feature-claim check, per the plan's B.1 instruction) and
+  added an entirely new "Cache API" section (`kes_cache.h` was
+  previously undocumented here despite being the most-tested layer).
+- **B.2 `KES_Design_Document.md`**: added a standing-note banner and
+  marked every aspirational section (buddy-system/slab/log-structured/
+  hybrid allocation, flash zones, GC, wear leveling, the profile-based
+  build system) as explicit "design intent, not implemented" rather
+  than deleting it. Corrected the allocation-engine and cache-eviction
+  sections to describe the actual first-fit-only allocator and
+  LRU-only cache.
+- **B.3 `KES_Project_Structure.md`**: full rewrite, replacing the
+  fictional multi-directory layout (`src/core/`, `src/flash/`,
+  `src/zones/`, `src/platforms/*/`, `tools/kes-*`, a profile-driven
+  build system) with the real 3-file structure
+  (`kes_bitmap.c`/`kes_storage.c`/`kes_cache.c`) and flat root
+  `Makefile`, matching `AGENTS.md`'s "Module layering" section.
+- **B.4 `kes_cache_design.md`**: fixed the config struct's field name
+  (`policy`, not `eviction_policy`), added the missing
+  `KES_EXTENT_ERROR` state, documented `kes_cache_invalidate`/
+  `reset_stats`/`get_stats`/`set_io_callbacks` (previously omitted
+  entirely) citing this file's own "Resolved" section above, corrected
+  the hash-collision description (separate chaining, not robin hood
+  hashing + linear probing) and the thread-safety description
+  (fine-grained locking, not lock-free), and fixed both config
+  examples (the server one used the rejected `KES_CACHE_LFU`).
+- **B.5 `README_Implementation.md`**: fixed the "LRU/LFU/Custom"
+  eviction claim and the "Custom Eviction Policy" section (now marked
+  NOT IMPLEMENTED), removed references to a nonexistent `make ...
+  edge` build target and `make benchmark`/`./build/test_runner`, and
+  fixed the server config example's use of the rejected
+  `KES_CACHE_LFU` policy.
+- **B.6 `EDGE_DEVICE_OPTIMIZATION_PROMPT.md`**: banner-labeled rather
+  than rewritten (it reads as legitimate forward-looking design intent
+  for a future session, per its own filename/framing, matching the
+  plan's guidance to prefer a banner for genuinely aspirational
+  content) -- also corrected its stale "9/9 tests passing" status line
+  to point at the current 70/70-across-6-binaries baseline.
+- **B.7 `PROJECT_OVERVIEW_KES.md`**: the file with the most stale
+  references per the last review. Corrected buddy-system/log-
+  structured allocation, compressed-bitmap and "O(1) find_free"
+  claims, ACID/checksum/rollback claims (none exist), the error-code
+  list (was missing `KES_ERROR_EXISTS`/`_BUSY`), removed the
+  fabricated performance-benchmark table (no benchmark suite exists to
+  have produced those numbers), fixed the "Advanced Features" section
+  ("Multi-Policy Eviction: LRU, LFU, Clock" and "lock-free" were both
+  wrong), and fixed the Quality Assurance/CI sections (no cppcheck,
+  clang-analyzer, or CI configuration exists in this repo).
+- **B.8 `TESTS_AND_EXAMPLES.md`**: updated to the 70/70-across-6-
+  binaries baseline (confirmed by a fresh `make test` run immediately
+  before this Phase 6 session started), replacing the stale
+  "4/6 Passing, 2 known issues" cache-test status
+  (`test_kes_cache.c` is actually 23/23) and documenting the four test
+  binaries this file previously omitted entirely
+  (`test_kes_bitmap_full.c`, `test_kes_storage_full.c`,
+  `test_kes_cache_full.c`, `test_kes_multiprocess.c`). Also corrected
+  the "O(1) for first-fit" allocation-speed claim and the unverified
+  macOS/ARM64 "covered" platform claims.
+
+Per `plan_phase5.md` §6 (bookkeeping), `AGENTS.md`'s "Ground truth"
+section should be updated to drop the "Phase 6 (docs, partially done)"
+language once this work has merged to the main checkout -- not done
+here, since this pass ran in an isolated worktree in parallel with
+other Track A (test expansion) work touching the same file; left for
+manual reconciliation at merge time.
 
 ---
 

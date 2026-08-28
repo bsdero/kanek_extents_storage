@@ -1,5 +1,25 @@
 # KES Edge Device Optimization - Next Development Session Prompt
 
+> **Phase 6 docs truth pass standing note**: everything below this
+> line describes **planned, not-yet-implemented work** -- a prompt for
+> a future development session, not a description of current KES
+> behavior. None of the APIs, files, build targets, or test names
+> mentioned below (`kes_edge.h`, `kes_power.h`, `kes_wear.h`,
+> `kes_gc.h`, wear leveling, hot/cold zones, background GC, Android/iOS
+> platform hooks, the `edge`/`smartphone`/`tablet` build profiles,
+> etc.) exist anywhere in `src/*.c` or `include/kes/*.h` as of this
+> writing. The "Current Project Status" section immediately below is
+> itself stale in one respect: it cites "9/9 tests passing" as the
+> whole test suite, but the verified current baseline is 70/70 across
+> six binaries (`test_kes_minimal`, `test_kes_bitmap_full`,
+> `test_kes_storage_full`, `test_kes_cache`, `test_kes_cache_full`,
+> `test_kes_multiprocess`) -- see `TESTS_AND_EXAMPLES.md`. For actual
+> current implementation status, see `AGENTS.md`'s "Ground truth"
+> section and `PENDING_ITEMS.md`. This document's content itself is
+> otherwise left as-is (a legitimate forward-looking design sketch,
+> per its own filename and framing) rather than rewritten, per
+> `plan_phase5.md`'s Track B.6 guidance.
+
 ## 🎯 **Objective for Next Session**
 
 Enhance KANEK Extents Storage (KES) with comprehensive edge device optimizations targeting smartphones, tablets, IoT devices, and embedded systems. Focus on memory efficiency, power management, and flash storage longevity while maintaining the existing production-ready core functionality.

@@ -1,5 +1,17 @@
 # KES Cache Implementation Guide
 
+## Standing note (Phase 6 docs truth pass)
+
+This document had a stale "LRU/LFU/Custom" eviction claim (only LRU
+is implemented -- `kes_cache_create()` rejects the other two with
+`NULL`), a "Multi-Policy Eviction" claim in an earlier revision (since
+removed here), and several build commands (`make clean edge`, `CC=...
+make clean edge`) referencing a `edge` Makefile target that does not
+exist -- there is no edge/server build variant, only `make all` with
+fixed flags. Both corrected below against the real root `Makefile`
+and `include/kes/kes_cache.h`. See `AGENTS.md`'s "Ground truth"
+section and `PENDING_ITEMS.md` for the current, authoritative status.
+
 ## Overview
 
 This document provides a comprehensive implementation of the caching system 
@@ -15,10 +27,20 @@ low-level block/extents storage management library.
 - **Thread-safe**: Fine-grained locking and lock-free operations
 
 ### ✅ Cache Architecture
-- **Hash table**: Fast O(1) extent lookup
-- **LRU eviction**: Configurable eviction policies (LRU/LFU/Custom)
-- **Memory pools**: Efficient memory management with alignment
-- **Background threads**: Asynchronous sync and cache management
+- **Hash table**: extent lookup via chained hashing (1024 buckets by
+  default), each bucket protected by its own `pthread_rwlock_t`
+- **LRU eviction**: the only implemented policy --
+  `kes_cache_policy_t` also declares `KES_CACHE_LFU`/`KES_CACHE_CUSTOM`,
+  but `kes_cache_create()` rejects both (returns `NULL`) rather than
+  falling back to LRU silently
+- **Alignment**: each extent's data buffer is `aligned_alloc()`'d to
+  `KES_CACHE_ALIGNMENT`; there is no pre-allocated memory pool despite
+  `kes_cache_config_t`'s `memory_pool`/`pool_size`/`free_list` fields
+  existing in the struct -- see `kes_cache_design.md`'s "Memory
+  Layout" section
+- **Background threads**: real, `pthread_create()`-based threads
+  (`kes_cache_start()`), asynchronously running the same
+  flush-then-evict sweep `kes_cache_sync()` runs manually
 
 ### ✅ Extent Operations
 - **Get/Put**: Reference counting for safe access
@@ -30,24 +52,27 @@ low-level block/extents storage management library.
 
 ### 1. Build the Library
 
+There is no separate `edge`/server build variant -- `make all` always
+uses the same fixed flags (`-std=c99 -Wall -Wextra -Werror -fPIC`,
+`-O2 -DNDEBUG`). Edge-appropriate cache *configuration* (not a
+different build) comes from `kes_cache_get_default_config(&config,
+true)` at runtime -- see "Platform-Specific Optimizations" below.
+
 ```bash
-# For server systems
+# Build the library + test binaries
 make clean all
 
-# For edge devices
-make clean edge
-
-# Debug build
+# Debug build (DEBUG=1: -g3 -O0 -DDEBUG)
 make clean debug
 
-# Cross-compilation for ARM
-CC=arm-linux-gnueabihf-gcc make clean all
+# Cross-compilation for ARM (CC alone, no CROSS_COMPILE variable)
+make clean CC=arm-linux-gnueabihf-gcc all
 ```
 
 ### 2. Basic Usage Example
 
 ```c
-#include "kes_cache.h"
+#include <kes/kes_cache.h>
 
 int main() {
     // Configure cache for your platform
@@ -159,17 +184,14 @@ for (int i = 0; i < 10; i++) {
 }
 ```
 
-### 3. Custom Eviction Policy
+### 3. Custom Eviction Policy -- NOT IMPLEMENTED
 
 ```c
-// Implement custom eviction logic
-typedef struct {
-    uint64_t priority_score;
-    // ... other fields
-} custom_entry_data_t;
-
-// Set up custom policy in configuration
-config.policy = KES_CACHE_CUSTOM;
+// config.policy = KES_CACHE_CUSTOM;
+// kes_cache_create(&config) returns NULL for this -- KES_CACHE_CUSTOM
+// (like KES_CACHE_LFU) is declared in kes_cache_policy_t but has no
+// implementation anywhere in src/kes_cache.c. There is no
+// custom_entry_data_t or pluggable-policy hook in the real API.
 ```
 
 ## Platform-Specific Optimizations
@@ -196,10 +218,14 @@ kes_cache_config_t server_config = {
     .max_memory = 512 * 1024 * 1024,     // 512MB max
     .min_memory = 64 * 1024 * 1024,      // 64MB min  
     .max_entries = 4096,                  // Many entries
-    .policy = KES_CACHE_LFU,              // Frequency-based
+    .policy = KES_CACHE_LRU,              // KES_CACHE_LFU is rejected
+                                           // by kes_cache_create() --
+                                           // not implemented
     .background_threads = 4,              // Multi-threaded
     .sync_interval_ms = 1000,             // 1s intervals
-    .enable_prefetch = true,              // Read-ahead
+    .enable_prefetch = true,              // Accepted, but currently
+                                           // inert -- no prefetch
+                                           // logic exists yet
     .enable_compression = false           // Speed over size
 };
 ```
@@ -285,22 +311,33 @@ int allocate_extent(kes_device_t* device, kes_extent_id_t* extent) {
 
 ### Unit Tests
 ```bash
-make test                 # Run all tests
-./build/test_runner       # Manual test execution
+make test                 # Build + run all 6 test binaries (70/70
+                           # as of the last verified check-in -- see
+                           # TESTS_AND_EXAMPLES.md and PENDING_ITEMS.md)
 ```
 
+There is no single `build/test_runner` binary -- each `tests/test_*.c`
+builds to its own binary under `build/tests/`; run one directly, e.g.
+`build/tests/test_kes_cache`.
+
 ### Performance Benchmarks
-```bash
-make benchmark            # Build and run benchmarks
-```
+
+**Not implemented.** There is no `make benchmark` target and no
+benchmark source files anywhere in this repository. `KES_HARDENING_PLAN.md`
+§6.G and `plan_phase5.md`'s Track A.7 describe adding an informational
+perf-smoke test as future work.
 
 ### Memory Analysis
 ```bash
 # Build with debug symbols
 make debug
 
-# Run with valgrind
-valgrind --tool=memcheck --leak-check=full ./build/test_runner
+# The project's own sanitizer/valgrind targets already run every
+# test binary for you -- prefer these over invoking valgrind by hand:
+make valgrind             # clean rebuild + Valgrind over all tests
+make asan                 # clean rebuild + ASan+UBSan over all tests
+make tsan                 # clean rebuild + TSan over all tests
+make check-all             # all of the above, gated on all passing
 ```
 
 ## Error Handling Best Practices
@@ -410,27 +447,25 @@ perf report
 
 ## Building on Different Platforms
 
-### Linux x86_64
+**Not verified/not a distinct build mode.** The Makefile has no `edge`
+target, no iOS/Android cross-compilation recipe, and no CI coverage
+for any platform beyond the Linux/WSL2 environment described in
+`AGENTS.md`. `CC=` overrides the compiler like any GNU Makefile, but
+nothing beyond that (ARM64/iOS/Android toolchain wiring, NDK sysroot
+flags, etc.) is provided or tested by this project:
+
 ```bash
+# Linux x86_64 (the only environment this project is actually
+# built/tested in)
 make clean all
+
+# Cross-compiler override -- untested by this project's own test
+# suite; you are responsible for verifying the result
+make clean CC=aarch64-linux-gnu-gcc all
 ```
 
-### Linux ARM64
-```bash
-CC=aarch64-linux-gnu-gcc make clean all
-```
-
-### iOS (Cross-compilation)
-```bash
-CC=xcrun -sdk iphoneos clang make clean edge
-```
-
-### Android (NDK)
-```bash
-CC=$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang \
-make clean edge
-```
-
-This implementation provides a solid foundation for your KES cache system. 
-The design is modular, platform-agnostic, and optimized for both edge devices 
-and server systems as requested.
+This implementation provides a solid foundation for a KES-based cache
+system. The design is portable C (no platform-specific code paths in
+`src/kes_cache.c` beyond the standard POSIX/pthread APIs), but claims
+about tested edge-device or iOS/Android builds should be treated as
+aspirational until verified against a real cross-build.
