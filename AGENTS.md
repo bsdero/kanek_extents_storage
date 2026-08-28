@@ -94,6 +94,17 @@ fault-injection/crash-consistency/fuzz/soak-test matrix does not), a
 docs truth pass over the rest of `docs/` beyond `CONTINUATION_PROMPT.md`
 (Phase 6, partially done), and allocation strategies beyond first-fit.
 
+**`plan_phase5.md` is the detailed execution plan for the Phase 5/6
+remainder** — a task-by-task breakdown (exact files to add/edit, exact
+test cases, exact acceptance criteria per task) of everything the
+paragraph above summarizes. Read it before starting Phase 5/6 work
+instead of re-deriving a task list from `KES_HARDENING_PLAN.md` §6/§7
+yourself; update it and `PENDING_ITEMS.md` together as tasks complete,
+per its own §6 (bookkeeping) — do not let this file, `PENDING_ITEMS.md`,
+and `plan_phase5.md` drift out of sync with each other or with actual
+code, the same failure mode that made the old `docs/CONTINUATION_PROMPT.md`
+untrustworthy in the first place.
+
 ## `CODING_STYLE.md` is binding for all new/edited code
 
 `CODING_STYLE.md` (originally written for KFL) is now the style
