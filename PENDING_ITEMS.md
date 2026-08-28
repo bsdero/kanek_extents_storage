@@ -384,6 +384,39 @@ tests added: 9 in `tests/test_kes_cache_edge.c`, 1 in the new
 `tests/test_kes_multiprocess.c`). `make asan`/`make tsan`: clean for
 every test in this pass that required them (A.1.6, A.2.2).
 
+### Phase 5 progress (this pass) -- plan_phase5.md Track A.4/A.5
+
+New file `tests/test_kes_fault_injection.c` (A.4), one commit per
+numbered sub-item with pasted `make test`/`make asan` evidence:
+
+- **A.4.1** (`tests/test_kes_fault_injection.c`,
+  `test_load_failure_hash_table_state` /
+  `test_flush_failure_dirty_state`): a small, self-contained
+  configurable-failure mock I/O harness (`fi_control_t`/
+  `fi_should_fail()` -- fail on the Nth call, or fail on every call
+  after the Nth). **Real, observed gap found and reported, NOT fixed
+  (rule 0.3 -- production-code changes are out of scope for this
+  file)**: after a load failure, `kes_cache_get_extent()` leaves the
+  entry permanently in `KES_EXTENT_ERROR` state in the hash table
+  (`stats.entries_cached` still counts it) -- a *second* call on the
+  same id, even with the failure condition fully cleared, returns
+  `KES_ERROR_IO` immediately without ever calling `read_extent()`
+  again (proven via a call-count assertion on the fault harness). The
+  only recovery path is an explicit `kes_cache_invalidate()` on that
+  id before retrying; the test proves that recovery path works and
+  that the hash table itself is not otherwise corrupted. Separately,
+  `test_flush_failure_dirty_state` confirms
+  `KES_HARDENING_PLAN.md` S4.1 point 1 exactly as documented for the
+  `kes_cache_sync()` path (`KES_EXTENT_DIRTY` and `KES_EXTENT_ERROR`
+  both set on a failed flush, entry not evicted, clean recovery on a
+  later successful sync) -- and separately notes that
+  `kes_cache_flush_extent()` (the direct single-entry flush call, a
+  different code path) does NOT set `KES_EXTENT_ERROR` on failure the
+  same way, only returns `KES_ERROR_IO` -- a real, minor behavioral
+  inconsistency between the two flush paths, also reported rather than
+  fixed. `make test` after this commit: 83/83 (was 81/81 -- 2 new
+  tests in the new `tests/test_kes_fault_injection.c`).
+
 **Not done** -- see `KES_HARDENING_PLAN.md` §6 for full detail on
 each:
 
