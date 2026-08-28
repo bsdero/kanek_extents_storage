@@ -327,6 +327,83 @@ static bool test_block_count_zero_and_max(void) {
                   "crash or unbounded allocation");
 }
 
+/* ================================================================
+ * A.1.4 -- start_block * block_size 64-bit overflow, cache-layer
+ * analogue of test_kes_extent_read_write_32bit_overflow (storage
+ * layer, tests/test_kes_storage_full.c).
+ *
+ * Reading src/kes_cache.c end to end first: id->start_block is used
+ * only for hashing (kes_extent_hash), equality (kes_extent_equal),
+ * and log messages in this module -- never in any size/offset
+ * arithmetic (grep confirms zero other uses). The only place a
+ * kes_extent_id_t feeds a size computation is extent_data_size():
+ * (size_t)id->block_count * id->block_size. Since id->block_count is
+ * explicitly cast to size_t (64-bit on this platform) before the
+ * multiply, and id->block_size (uint32_t) is promoted to size_t by
+ * the usual arithmetic conversions rather than staying a 32-bit
+ * operand, this product cannot silently truncate to 32 bits the way
+ * the storage layer's pre-fix bug did.
+ *
+ * This test still exercises the "start_block near UINT64_MAX, large
+ * block_count" shape the plan asks for (in case some future change
+ * reintroduces start_block into a size computation), and directly
+ * proves extent_data_size() computes the true 64-bit product rather
+ * than a 32-bit-wrapped one -- reusing the exact block_count/
+ * block_size pair test_kes_extent_read_write_32bit_overflow uses
+ * (600000 * 8192), where:
+ *   true size (64-bit)   = 4,915,200,000 bytes (~4.58 GiB)
+ *   wrapped size (32-bit)=   620,232,704 bytes (~591 MiB)
+ * A custom cache is configured with max_memory = 700,000,000 bytes,
+ * strictly between those two values, so the two possible outcomes
+ * are distinguishable by kes_cache_get_extent()'s return code alone:
+ *   - true (unwrapped) size: 4.9GB > 700MB max_memory -->
+ *     make_room_for_new_entry() fails its capacity check on an empty
+ *     cache with nothing to evict --> KES_ERROR_BUSY, no allocation
+ *     ever attempted. This is the actual, observed result.
+ *   - a hypothetical wrapped (591MB) size would fit under 700MB -->
+ *     the miss path would actually attempt aligned_alloc(591MB)
+ *     (which would very likely succeed) and then call this test's
+ *     mock read_extent with size=591MB, which mock_read() rejects
+ *     (KES_ERROR_IO, since it only accepts sizes up to
+ *     EDGE_BLOCK_SIZE) -- a clearly different, distinguishable
+ *     result from BUSY.
+ */
+static bool test_start_block_near_max_no_size_wrap(void) {
+    kes_cache_config_t cfg;
+    kes_cache_t *cache;
+    void *buf = NULL;
+    kes_extent_id_t huge = { .start_block = UINT64_MAX - 10,
+                              .block_count = 600000,
+                              .block_size = 8192, .reserved = 0 };
+    int result;
+
+    memset( &cfg, 0, sizeof(cfg));
+    cfg.max_memory = 700000000;         /* strictly between the
+                                          * wrapped and true sizes */
+    cfg.min_memory = KES_CACHE_MIN_MEMORY;
+    cfg.max_entries = KES_CACHE_MIN_ENTRIES;
+    cfg.policy = KES_CACHE_LRU;
+    cfg.background_threads = 1;
+    cfg.sync_interval_ms = 1000;
+
+    cache = kes_cache_create( &cfg);
+    TEST_ASSERT( cache != NULL,
+                "cache creation for start_block overflow test");
+    kes_cache_set_io_callbacks( cache, mock_read, mock_write, mock_sync);
+
+    result = kes_cache_get_extent( cache, &huge, &buf);
+    TEST_ASSERT( result == KES_ERROR_BUSY,
+                "extent_data_size() computed the true ~4.58GiB size "
+                "(BUSY, exceeds the 700MB max_memory ceiling), not a "
+                "32-bit-wrapped ~591MiB size (which would have fit "
+                "and produced KES_ERROR_IO from the undersized mock "
+                "read instead)");
+
+    kes_cache_destroy( cache);
+    TEST_SUCCESS( "start_block near UINT64_MAX + large block_count: "
+                  "no 64-bit size truncation in extent_data_size()");
+}
+
 typedef struct {
     const char *name;
     bool ( *func)(void);
@@ -337,6 +414,8 @@ static test_case_t test_cases[] = {
     {"get_extent rejects invalid block_size",
      test_get_extent_rejects_non_power_of_2_block_size},
     {"block_count 0 and UINT32_MAX", test_block_count_zero_and_max},
+    {"start_block near UINT64_MAX, no size wrap",
+     test_start_block_near_max_no_size_wrap},
     {NULL, NULL}
 };
 
