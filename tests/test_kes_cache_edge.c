@@ -184,6 +184,71 @@ static bool test_null_parameter_checks(void) {
         "set_io_callbacks(read_func,write_func,sync_func)");
 }
 
+/* ================================================================
+ * A.1.2 -- kes_cache_create() with non-power-of-2 config.block_size.
+ *
+ * The plan's premise for this task does not match the actual header:
+ * kes_cache_config_t (include/kes/kes_cache.h) has NO block_size
+ * field at all -- block_size lives on kes_extent_id_t instead, a
+ * per-call parameter to kes_cache_get_extent()/put_extent()/etc.,
+ * not a kes_cache_create()-time config value. There is nothing named
+ * "config.block_size" for kes_cache_create() to validate; the plan
+ * appears to have confused this with kes_storage_config_t's
+ * block_size field, which validate_config() (src/kes_storage.c:531)
+ * already checks.
+ *
+ * Reading src/kes_cache.c end to end confirms the closest real gap:
+ * kes_cache_get_extent() (and every other kes_extent_id_t-taking
+ * function) never validated id->block_size before this pass -- a
+ * non-power-of-2 or absurd block_size would flow straight into
+ * extent_data_size()'s size computation. That is the concrete,
+ * in-scope version of "add the same KES_IS_POWER_OF_2(...) guard
+ * mirroring kes_storage.c:537-539" the plan's recommended fix
+ * describes, applied where block_size actually appears in this
+ * module. Fixed in kes_cache_get_extent() (src/kes_cache.c): rejects
+ * id->block_size that is not a power of 2 in [KES_MIN_BLOCK_SIZE,
+ * KES_MAX_BLOCK_SIZE] with KES_ERROR_INVALID, before any allocation
+ * is attempted. See kes_cache_get_extent()'s updated doc comment in
+ * include/kes/kes_cache.h.
+ */
+static bool test_get_extent_rejects_non_power_of_2_block_size(void) {
+    kes_cache_config_t cfg;
+    kes_cache_t *cache;
+    void *buf = NULL;
+    kes_extent_id_t bad_not_pow2 = { .start_block = 1, .block_count = 1,
+                                      .block_size = 4097, .reserved = 0 };
+    kes_extent_id_t bad_too_small = { .start_block = 1, .block_count = 1,
+                                       .block_size = 1024, .reserved = 0 };
+    kes_extent_id_t bad_too_large = { .start_block = 1, .block_count = 1,
+                                       .block_size = 131072, .reserved = 0 };
+    kes_extent_id_t good = make_id( 1);
+
+    default_config( &cfg);
+    cache = kes_cache_create( &cfg);
+    TEST_ASSERT( cache != NULL, "cache creation for block_size test");
+    kes_cache_set_io_callbacks( cache, mock_read, mock_write, mock_sync);
+
+    TEST_ASSERT(
+        kes_cache_get_extent( cache, &bad_not_pow2, &buf) ==
+            KES_ERROR_INVALID,
+        "non-power-of-2 block_size (4097) rejected");
+    TEST_ASSERT(
+        kes_cache_get_extent( cache, &bad_too_small, &buf) ==
+            KES_ERROR_INVALID,
+        "below-KES_MIN_BLOCK_SIZE block_size (1024) rejected");
+    TEST_ASSERT(
+        kes_cache_get_extent( cache, &bad_too_large, &buf) ==
+            KES_ERROR_INVALID,
+        "above-KES_MAX_BLOCK_SIZE block_size (131072) rejected");
+    TEST_ASSERT(
+        kes_cache_get_extent( cache, &good, &buf) == KES_SUCCESS,
+        "a valid power-of-2, in-range block_size still works");
+
+    kes_cache_put_extent( cache, &good);
+    kes_cache_destroy( cache);
+    TEST_SUCCESS( "kes_cache_get_extent rejects invalid id->block_size");
+}
+
 typedef struct {
     const char *name;
     bool ( *func)(void);
@@ -191,6 +256,8 @@ typedef struct {
 
 static test_case_t test_cases[] = {
     {"NULL parameter checks", test_null_parameter_checks},
+    {"get_extent rejects invalid block_size",
+     test_get_extent_rejects_non_power_of_2_block_size},
     {NULL, NULL}
 };
 

@@ -232,11 +232,15 @@ int kes_cache_stop( kes_cache_t *cache);
  * ================================================================= */
 
 /**
- * Get extent data (load from disk if not cached). On a cache miss,
- * evicts from the LRU tail as needed to stay within
- * config.max_entries/config.max_memory; returns KES_ERROR_BUSY if
- * eviction cannot free enough room (every cached entry is currently
- * referenced or pinned).
+ * Get extent data (load from disk if not cached). Rejects
+ * KES_ERROR_INVALID if id->block_size is not a power of 2 in
+ * [KES_MIN_BLOCK_SIZE, KES_MAX_BLOCK_SIZE] (kes_types.h) -- there is
+ * no block_size field on kes_cache_config_t to validate at
+ * kes_cache_create() time, so this per-call id is where it is
+ * checked instead. On a cache miss, evicts from the LRU tail as
+ * needed to stay within config.max_entries/config.max_memory;
+ * returns KES_ERROR_BUSY if eviction cannot free enough room (every
+ * cached entry is currently referenced or pinned).
  * @param cache Cache handle
  * @param id Extent identifier
  * @param buffer Pointer to receive data buffer
