@@ -162,6 +162,44 @@ allocation from two processes against the same file is still expected
 to corrupt bitmap/descriptor state -- this remains untested and
 unguarded).
 
+### Track A.6 -- randomized/fuzz-adjacent testing (DONE)
+
+New `tests/test_kes_fuzz.c` (2/2), closing plan_phase5.md's Track
+A.6 / `KES_HARDENING_PLAN.md` §6.F:
+
+- `test_cache_invariant_fuzz()` (A.6.1): a long randomized loop
+  (`KES_FUZZ_ITERATIONS` env var, default 3000) issuing random
+  `get_extent`/`put_extent`/`pin_extent`/`unpin_extent`/`mark_dirty`/
+  `flush_extent`/`sync`/`invalidate` calls against a fixed 20-id
+  extent pool over a 16-entry (`KES_CACHE_MIN_ENTRIES`) cache, so
+  eviction pressure and per-id contention are frequent. After
+  *every* operation it walks the cache's hash table directly
+  (`kes_cache_t`/`kes_extent_entry_t` are fully defined in
+  `kes_cache.h`, not truly opaque, so this needed no new public API
+  surface) to confirm `ref_count`/`pin_count` stay under a sanity
+  ceiling and that `stats.entries_cached`/`stats.memory_used` match
+  the live hash-table population exactly. `KES_TEST_SEED` (default
+  `time(NULL)`) is printed at the start of the run for
+  reproducibility. No invariant violation found across the default
+  run plus several fixed-seed reruns at higher iteration counts (1,
+  42, 999999, 7, 424242 at 5000-8000 iterations each).
+- `test_bitmap_fuzz_vs_reference()` (A.6.2): drives `kes_bitmap_t`
+  and a naive `uint8_t`-array reference bitmap through the same
+  randomized `kes_bitmap_set_range`/`kes_bitmap_clear_range`/
+  `kes_bitmap_find_free` sequence (251-bit bitmap, deliberately not
+  a multiple of 8; every 10th iteration forces a whole-bitmap or
+  byte-boundary-exact/multi-byte range rather than a fully random
+  one) and compares them bit-for-bit, plus `free_bits` against a
+  fresh naive scan, after every operation. The naive reference's
+  `find_free` mirrors the real function's exact hint-forward-then-
+  wrap search order, so success/failure and the returned start bit
+  are compared directly. No mismatch found.
+
+Verified: `make test` 72/72 across all 7 binaries (was 70/70
+baseline; +2 from this file). `make asan` (full clean rebuild, all 7
+binaries including `test_kes_fuzz`) exits 0 with no
+AddressSanitizer/UBSan/LeakSanitizer output anywhere in the log.
+
 ### Phase 6 -- documentation truth pass (PARTIALLY DONE)
 
 `README.md` and `docs/CONTINUATION_PROMPT.md` were corrected to
@@ -233,10 +271,9 @@ each:
 - §6.E storage persistence/crash-consistency: no-explicit-sync
   reopen behavior, truncated/corrupted descriptor detection, bit-
   flipped bitmap block detection. Not covered.
-- §6.F randomized/fuzz-adjacent testing: a long random
-  get/put/pin/unpin/mark_dirty/flush/sync/invalidate sequence with
-  per-operation invariant checks, and randomized bitmap bit-range
-  testing against a naive reference implementation. Not done.
+- §6.F randomized/fuzz-adjacent testing: **DONE** -- see "Track A.6
+  -- randomized/fuzz-adjacent testing (DONE)" under Resolved above
+  (`tests/test_kes_fuzz.c`, 2/2).
 - §6.G performance smoke tests: not done (informational only, not
   blocking).
 - §6.H long-run soak test (a `make soak` target running the mixed
