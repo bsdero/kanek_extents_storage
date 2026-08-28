@@ -501,6 +501,94 @@ static bool test_malloc_failure_nomem(void) {
                   "allocator_may_return_null=1 -- see header comment)");
 }
 
+/* ================================================================
+ * A.4.3 -- partial read/write simulation.
+ *
+ * A mock read_extent that reports KES_SUCCESS while only actually
+ * transferring fewer bytes than `size` requests.
+ *
+ * DOCUMENTED CONCLUSION (plan_phase5.md's either-outcome-acceptable
+ * option: "either show this is detected and treated as an error, or
+ * document that byte-count verification genuinely isn't this layer's
+ * job"): reading kes_cache_get_extent()'s read path
+ * (src/kes_cache.c) confirms the latter. The read_extent/write_extent
+ * callback contract (include/kes/kes_cache.h) is:
+ *
+ *   int (*read_func)(void *device, const kes_extent_id_t *id,
+ *                     void *buffer, size_t size);
+ *
+ * a plain int status code against a fixed `size` INPUT parameter --
+ * there is no bytes-actually-transferred OUTPUT parameter anywhere in
+ * this signature for a callback to report a short transfer through,
+ * even if it wanted to. kes_cache_get_extent() only ever checks
+ * `result == KES_SUCCESS`; there is nothing else it *could* check.
+ * This is a real, structural absence, not an oversight in the
+ * kes_cache.c call site -- the fix, if this contract needs
+ * strengthening, would be a public API signature change (adding a
+ * bytes-transferred out-parameter or requiring short transfers to be
+ * reported as an error by convention), which is out of scope for a
+ * test-writing-only pass. This test proves the current, structural
+ * non-detection concretely rather than leaving it silently untested.
+ */
+static size_t g_partial_read_bytes = 0;
+
+static int fi_read_partial( void *dev, const kes_extent_id_t *id,
+                             void *buf, size_t size) {
+    (void)dev;
+
+    if ( id->start_block >= FI_NUM_BLOCKS || size > FI_BLOCK_SIZE) {
+        return(KES_ERROR_IO);
+    }
+    /* Deliberately transfer only g_partial_read_bytes < size bytes,
+     * while still reporting KES_SUCCESS -- the rest of `buf` is left
+     * as whatever aligned_alloc() handed back (uninitialized). This
+     * test never reads that untouched tail, so it stays safe under a
+     * future Valgrind/MSan run even though the memory itself is
+     * genuinely uninitialized there. */
+    memcpy( buf, g_backing[id->start_block], g_partial_read_bytes);
+    return(KES_SUCCESS);
+}
+
+static bool test_partial_transfer_not_detected(void) {
+    kes_cache_config_t cfg;
+    kes_cache_t *cache;
+    void *buf = NULL;
+    kes_extent_id_t id = make_id( 12);
+    int result;
+
+    kes_cache_get_default_config( &cfg, true);
+    cache = kes_cache_create( &cfg);
+    TEST_ASSERT( cache != NULL, "cache creation for partial-transfer "
+                "test");
+    kes_cache_set_io_callbacks( cache, fi_read_partial, fi_write,
+                                fi_sync);
+
+    memset( g_backing[id.start_block], 0x77, FI_BLOCK_SIZE);
+    g_partial_read_bytes = 16;   /* far less than FI_BLOCK_SIZE
+                                   * (4096) */
+
+    result = kes_cache_get_extent( cache, &id, &buf);
+    TEST_ASSERT( result == KES_SUCCESS,
+                "a callback that reports SUCCESS while only actually "
+                "transferring g_partial_read_bytes < size bytes is "
+                "NOT detected as an error -- see this test's comment "
+                "above for why: the callback contract has no "
+                "bytes-transferred output channel to check at all");
+    TEST_ASSERT( buf != NULL, "buffer is still returned normally");
+    TEST_ASSERT( memcmp( buf, g_backing[id.start_block], 16) == 0,
+                "the 16 bytes the mock actually did transfer are "
+                "correct -- this test deliberately never reads the "
+                "untouched (uninitialized) tail, bytes 16..4095");
+
+    kes_cache_put_extent( cache, &id);
+    kes_cache_destroy( cache);
+    TEST_SUCCESS( "partial read/write simulation: confirmed and "
+                  "documented as structurally NOT detectable at this "
+                  "layer -- the read_extent/write_extent callback "
+                  "contract has no bytes-transferred out-parameter to "
+                  "check against `size`");
+}
+
 typedef struct {
     const char *name;
     bool ( *func)(void);
@@ -513,6 +601,8 @@ static test_case_t test_cases[] = {
      test_flush_failure_dirty_state},
     {"malloc/aligned_alloc failure: KES_ERROR_NOMEM",
      test_malloc_failure_nomem},
+    {"partial read/write transfer: not detected (documented)",
+     test_partial_transfer_not_detected},
     {NULL, NULL}
 };
 

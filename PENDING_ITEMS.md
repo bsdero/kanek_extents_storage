@@ -440,6 +440,20 @@ numbered sub-item with pasted `make test`/`make asan` evidence:
   genuine unexpected OOM elsewhere is still loud). `make test` after
   this commit: 84/84. `make asan`: clean across all 84 tests,
   `KES_ERROR_NOMEM` returned as expected, no abort, no other finding.
+- **A.4.3** (`tests/test_kes_fault_injection.c`,
+  `test_partial_transfer_not_detected`): a mock `read_extent` that
+  reports `KES_SUCCESS` while only actually copying 16 of 4096
+  requested bytes. **Documented conclusion (plan_phase5.md's
+  either-outcome-acceptable option, not a bug)**: this is NOT
+  detected, and structurally cannot be at this layer -- the
+  `read_extent`/`write_extent` callback contract
+  (`include/kes/kes_cache.h`) is a plain `int` status code against a
+  fixed `size` *input* parameter, with no bytes-actually-transferred
+  *output* channel at all for `kes_cache_get_extent()` to check
+  against. The test only ever reads back the 16 bytes the mock
+  actually transferred (never the deliberately-uninitialized tail) to
+  keep this Valgrind/MSan-safe for any future run. `make test` after
+  this commit: 85/85 (was 84/84). This completes A.4 in full.
 
 **Not done** -- see `KES_HARDENING_PLAN.md` §6 for full detail on
 each:
@@ -449,10 +463,9 @@ each:
   `kes_cache_destroy()`-during-concurrent-access test; running the
   concurrency suite 100+ times in a loop with a logged fixed random
   seed (a stress-test target, not yet added to the Makefile).
-- §6.D fault injection: configurable-failure-mode I/O wrappers
-  (fail on Nth call, or with a probability), `malloc`/`aligned_alloc`
-  failure simulation, partial read/write simulation. None of this
-  exists yet.
+- ~~§6.D fault injection~~ DONE -- see "Phase 5 progress (this pass)
+  -- plan_phase5.md Track A.4/A.5" above (`tests/test_kes_fault_
+  injection.c`, A.4.1-A.4.3).
 - §6.E storage persistence/crash-consistency: no-explicit-sync
   reopen behavior, truncated/corrupted descriptor detection, bit-
   flipped bitmap block detection. Not covered.
