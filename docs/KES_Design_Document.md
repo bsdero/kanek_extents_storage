@@ -108,14 +108,23 @@ Flexible Layout Examples:
 - **Optimization**: Can be disabled to save space on constrained devices
 
 #### 3. Block Bitmap
-- **Location**: Last blocks (default) or external management  
-- **Purpose**: Track free/used blocks with efficient allocation
-- **Strategies**: Full memory, sliding window, on-demand loading
+- **Location**: block 0's descriptor points at a fixed bitmap region
+  in the backing file (`bitmap_start_block`/`bitmap_blocks` in
+  `kes_storage_descriptor_t`) -- there is no external-management
+  option.
+- **Purpose**: Track free/used blocks.
+- **Strategies**: **only "full memory" actually exists.** `kes_bitmap_t`
+  is a single flat in-memory `uint8_t *` buffer, loaded whole on open
+  and saved whole on sync -- sliding-window and on-demand loading are
+  design intent only, not implemented.
 
 #### 4. User Data Area
 - **Location**: Between metadata and bitmap
-- **Organization**: Multiple allocation zones with different strategies
-- **Flash Zones**: Hot/warm/cold data separation for wear leveling
+- **Organization**: **not implemented.** There is no zone concept of
+  any kind -- `kes_extent_allocate()` does a single first-fit scan
+  over the whole bitmap, with no per-zone strategy selection.
+- **Flash Zones**: Hot/warm/cold data separation for wear leveling --
+  not implemented; see "Flash-Aware Design" below.
 
 ### Multi-Strategy Allocation Engine
 
