@@ -634,6 +634,51 @@ static bool test_ops_between_stop_and_destroy(void) {
                   "threads, it is not a caller-facing shutdown flag");
 }
 
+/* ================================================================
+ * A.1.8 -- empty-cache no-ops.
+ *
+ * kes_cache_invalidate() on an id that was never inserted is already
+ * covered by test_cache_invalidate (tests/test_kes_cache.c:1010,
+ * "missing_id" check at the top of that test), asserting
+ * KES_ERROR_NOTFOUND -- not duplicated here. This test covers the
+ * other two: kes_cache_sync() and kes_cache_reset_stats() called on
+ * a freshly-created, never-populated cache, both of which must be
+ * clean KES_SUCCESS no-ops (test_cache_sync in
+ * tests/test_kes_cache.c does check this for sync() but only after
+ * first populating and syncing a real entry earlier in that test, at
+ * which point the cache is no longer "never-populated" -- this test
+ * checks a cache that has had zero get_extent() calls of any kind).
+ */
+static bool test_empty_cache_no_ops(void) {
+    kes_cache_config_t cfg;
+    kes_cache_t *cache;
+    kes_cache_stats_t stats;
+
+    default_config( &cfg);
+    cache = kes_cache_create( &cfg);
+    TEST_ASSERT( cache != NULL, "cache creation for empty-cache test");
+    kes_cache_set_io_callbacks( cache, mock_read, mock_write, mock_sync);
+
+    TEST_ASSERT( kes_cache_sync( cache) == KES_SUCCESS,
+                "sync() on a freshly-created, never-populated cache "
+                "is a clean no-op success");
+
+    TEST_ASSERT( kes_cache_reset_stats( cache) == KES_SUCCESS,
+                "reset_stats() on a freshly-created, never-populated "
+                "cache is a clean no-op success");
+    kes_cache_get_stats( cache, &stats);
+    TEST_ASSERT( stats.hits == 0 && stats.misses == 0 &&
+                stats.entries_cached == 0,
+                "stats remain all-zero after reset_stats() on an "
+                "already-empty cache");
+
+    kes_cache_destroy( cache);
+    TEST_SUCCESS( "sync()/reset_stats() are clean no-ops on a "
+                  "freshly-created, never-populated cache "
+                  "(invalidate()-on-missing-id is already covered "
+                  "by test_cache_invalidate, tests/test_kes_cache.c)");
+}
+
 typedef struct {
     const char *name;
     bool ( *func)(void);
@@ -646,6 +691,7 @@ static test_case_t test_cases[] = {
     {"block_count 0 and UINT32_MAX", test_block_count_zero_and_max},
     {"start_block near UINT64_MAX, no size wrap",
      test_start_block_near_max_no_size_wrap},
+    {"empty-cache no-ops", test_empty_cache_no_ops},
     {"destroy with outstanding reference",
      test_destroy_with_outstanding_reference},
     {"ops between stop() and destroy()",
