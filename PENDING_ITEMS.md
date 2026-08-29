@@ -364,6 +364,46 @@ commit per rule 0.3. Whoever picks this up next should read the
 `tests/test_kes_cache.c` (immediately above
 `test_cache_destroy_races_concurrent_access()`) for the full
 citation trail before deciding.
+
+### Phase 5 progress -- Track A.3.2: `make stress` harness (DONE)
+
+New `stress` target in the `Makefile` (plan_phase5.md Track A.3.2):
+repeatedly runs `test_kes_cache` (threads) and `test_kes_multiprocess`
+(`fork()`) `STRESS_RUNS` times each (default 100, e.g. `make stress
+STRESS_RUNS=500`), stopping and reporting the failing run number and
+captured output on the first non-zero exit rather than continuing
+past a failure. Plain rebuild by default; `SANITIZER=asan` or
+`SANITIZER=tsan` layers the same flags the `asan`/`tsan` targets use
+on top of a clean rebuild first, since a stress loop's whole point is
+surfacing a rare interleaving and both sanitizers are far more likely
+than a plain build to turn one into a visible failure.
+`KES_TEST_SEED` was not wired up: grepped both `tests/test_kes_cache.c`
+and `tests/test_kes_multiprocess.c` first and confirmed neither calls
+`rand()`/`srand()` or a randomized `usleep()` -- their only
+nondeterminism is real OS thread/process scheduling, so there is no
+seed to make reproducible today; noted in the Makefile comment for
+whoever adds seeded randomization to either file later.
+
+Actually run, not just written -- pasted evidence:
+- Plain: `make stress STRESS_RUNS=100` -- `test_kes_cache: 100/100
+  runs passed`, `test_kes_multiprocess: 100/100 runs passed`,
+  `stress: ALL RUNS PASSED`.
+- `make stress SANITIZER=tsan STRESS_RUNS=30` -- clean rebuild under
+  TSan, `test_kes_cache: 30/30 runs passed`, `test_kes_multiprocess:
+  30/30 runs passed`, `stress: ALL RUNS PASSED` -- no TSan report
+  (this run does not exercise the known A.3.1 `kes_cache_destroy()`
+  race, since `test_cache_destroy_races_concurrent_access()` forks
+  its racing repro into a disposable child process specifically so it
+  cannot fail the parent test binary's exit code).
+- `make stress SANITIZER=asan STRESS_RUNS=30` -- clean rebuild under
+  ASan+UBSan, `test_kes_cache: 30/30 runs passed`,
+  `test_kes_multiprocess: 30/30 runs passed`, `stress: ALL RUNS
+  PASSED` -- no ASan/UBSan finding.
+- `make test` after this commit: 91/91 (unchanged from the A.3.1
+  merge -- this task only adds a Makefile target, no new test cases).
+
+This completes A.3 in full.
+
 ### Phase 5 progress (this pass) -- plan_phase5.md Track A.1/A.2 (DONE)
 
 All 9 sub-items of A.1 and both sub-items of A.2 are complete, each
@@ -630,12 +670,13 @@ numbered sub-item with pasted `make test`/`make asan` evidence:
 **Not done** -- see `KES_HARDENING_PLAN.md` §6 for full detail on
 each:
 
-- §6.C further concurrency/stress: scaling the existing tests to more
-  threads than CPU cores and higher iteration counts; a dedicated
-  `kes_cache_destroy()`-during-concurrent-access test -- **DONE, see
-  "Phase 5 progress -- Track A.3.1" above**; running the concurrency
-  suite 100+ times in a loop with a logged fixed random seed (a
-  stress-test target, not yet added to the Makefile).
+- ~~§6.C further concurrency/stress~~ DONE -- a dedicated
+  `kes_cache_destroy()`-during-concurrent-access test, see "Phase 5
+  progress -- Track A.3.1" above; the `make stress` target running
+  `test_kes_cache`/`test_kes_multiprocess` `STRESS_RUNS` times (plain,
+  ASan, and TSan variants all actually run), see "Phase 5 progress --
+  Track A.3.2" above. Scaling to more threads than CPU cores was not
+  separately explored beyond the existing tests' thread counts.
 - ~~§6.D fault injection~~ DONE -- see "Phase 5 progress (this pass)
   -- plan_phase5.md Track A.4/A.5" above (`tests/test_kes_fault_
   injection.c`, A.4.1-A.4.3).

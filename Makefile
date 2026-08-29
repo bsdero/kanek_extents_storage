@@ -244,6 +244,97 @@ check-all:
 	$(MAKE) all
 	@echo "check-all: ALL CHECKS PASSED"
 
+# Stress-run harness (KES_HARDENING_PLAN.md S6.C / plan_phase5.md
+# Track A.3.2): repeatedly runs the two binaries with real
+# thread/process races -- test_kes_cache (threads) and
+# test_kes_multiprocess (fork()) -- STRESS_RUNS times each (default
+# 100; override with `make stress STRESS_RUNS=500`), stopping and
+# reporting the failing run number on the first non-zero exit rather
+# than continuing past a failure.
+#
+# Plain rebuild by default. Pass SANITIZER=asan or SANITIZER=tsan to
+# layer one of the sanitizer variants on top instead, reusing the
+# same ASAN_FLAGS/TSAN_FLAGS the asan/tsan targets themselves use
+# (chosen over always running plain, since a stress loop's whole
+# point is surfacing a rare interleaving, and ASan/TSan are far more
+# likely than a plain build to turn one into a visible failure) --
+# SANITIZER is left as an opt-in rather than the default because a
+# sanitized clean rebuild is much slower per run, and plain-build
+# stress runs are still useful for catching non-memory-safety logic
+# bugs (deadlocks, wrong results) cheaply.
+#
+# Fixed-seed-for-reproducibility note (per plan_phase5.md A.3.2):
+# neither tests/test_kes_cache.c nor tests/test_kes_multiprocess.c
+# currently calls rand()/srand() or usleep() with a randomized
+# argument -- checked by grep before adding this target. Their
+# delays are fixed constants (e.g. usleep(100) in mock I/O) and all
+# interleaving nondeterminism comes from OS thread/process
+# scheduling, not a seeded RNG this target could make reproducible.
+# If either file later grows a seeded random delay, wire a
+# KES_TEST_SEED environment variable through it (default
+# time(NULL) if unset) and print the seed at test startup, so a
+# stress failure can be reproduced via `KES_TEST_SEED=<value>`, per
+# this same task's guidance -- there is nothing to wire up today.
+STRESS_RUNS ?= 100
+STRESS_TARGETS = $(BUILD_DIR)/tests/test_kes_cache \
+                  $(BUILD_DIR)/tests/test_kes_multiprocess
+
+.PHONY: stress
+stress:
+	@if [ "$(SANITIZER)" = "asan" ]; then \
+		echo "=== stress: clean rebuild under ASan+UBSan ==="; \
+		$(MAKE) clean; \
+		$(MAKE) all tests CFLAGS="$(CFLAGS) $(ASAN_FLAGS)" \
+		    LDFLAGS="$(LDFLAGS) $(ASAN_FLAGS)"; \
+	elif [ "$(SANITIZER)" = "tsan" ]; then \
+		echo "=== stress: clean rebuild under TSan ==="; \
+		$(MAKE) clean; \
+		$(MAKE) all tests CFLAGS="$(CFLAGS) $(TSAN_FLAGS)" \
+		    LDFLAGS="$(LDFLAGS) $(TSAN_FLAGS)"; \
+	elif [ -n "$(SANITIZER)" ]; then \
+		echo "stress: unknown SANITIZER=$(SANITIZER)" \
+		     "(expected asan or tsan)"; \
+		exit 1; \
+	else \
+		echo "=== stress: plain clean rebuild ==="; \
+		$(MAKE) clean; \
+		$(MAKE) tests; \
+	fi
+	@echo "Stress-running test_kes_cache and test_kes_multiprocess," \
+	     "$(STRESS_RUNS) run(s) each" \
+	     "(SANITIZER=$(if $(SANITIZER),$(SANITIZER),none))..."
+	@logfile=$$(mktemp /tmp/kes_stress_XXXXXX.log); \
+	trap 'rm -f $$logfile' EXIT; \
+	for test in $(STRESS_TARGETS); do \
+		testname=$$(basename $$test); \
+		echo "--- stress: $$testname ---"; \
+		run=1; \
+		while [ $$run -le $(STRESS_RUNS) ]; do \
+			if [ "$(SANITIZER)" = "tsan" ]; then \
+				setarch $$(uname -m) -R $$test \
+				    > $$logfile 2>&1; \
+			else \
+				$$test > $$logfile 2>&1; \
+			fi; \
+			rc=$$?; \
+			if [ $$rc -ne 0 ]; then \
+				echo "STRESS FAILURE: $$testname failed" \
+				     "on run $$run/$(STRESS_RUNS)" \
+				     "(exit $$rc)"; \
+				echo "--- captured output ---"; \
+				cat $$logfile; \
+				echo "--- reproduce with: $$test" \
+				     "(tsan: setarch \`uname -m\` -R" \
+				     "$$test) ---"; \
+				exit 1; \
+			fi; \
+			run=$$((run + 1)); \
+		done; \
+		echo "$$testname: $(STRESS_RUNS)/$(STRESS_RUNS)" \
+		     "runs passed"; \
+	done; \
+	echo "stress: ALL RUNS PASSED"
+
 # Install library
 .PHONY: install
 install: all
@@ -345,6 +436,9 @@ help:
 	@echo "  sanitize-all  - asan + tsan, then a plain rebuild"
 	@echo "  valgrind      - Clean rebuild + run tests under Valgrind"
 	@echo "  check-all     - normal + asan + tsan + valgrind, gated"
+	@echo "  stress        - repeat test_kes_cache/test_kes_multiprocess" \
+	     "STRESS_RUNS times (default 100); SANITIZER=asan|tsan to" \
+	     "layer a sanitizer on top"
 	@echo ""
 	@echo "kanek_foundations (KFL) sibling repo:"
 	@echo "  foundations-fetch - clone KFL next to this repo if" \
