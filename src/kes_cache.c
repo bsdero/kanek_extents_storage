@@ -811,6 +811,24 @@ int kes_cache_get_extent( kes_cache_t *cache,
         return(KES_ERROR_INVALID);
     }
 
+    /*
+     * kes_cache_config_t has no block_size field of its own to
+     * validate at kes_cache_create() time -- block_size lives on the
+     * per-call kes_extent_id_t instead (kes_cache.h). This mirrors
+     * kes_storage.c's validate_config() block_size guard, applied at
+     * the point block_size actually arrives: here, before it is used
+     * to compute an allocation size via extent_data_size().
+     */
+    if ( !KES_IS_POWER_OF_2(id->block_size) ||
+        id->block_size < KES_MIN_BLOCK_SIZE ||
+        id->block_size > KES_MAX_BLOCK_SIZE) {
+        TRACE_ERR( "kes_cache_get_extent: invalid id->block_size %u "
+                   "(must be a power of 2 in [%u, %u])",
+                   id->block_size, (unsigned)KES_MIN_BLOCK_SIZE,
+                   (unsigned)KES_MAX_BLOCK_SIZE);
+        return(KES_ERROR_INVALID);
+    }
+
     *buffer = NULL;
 
     /* Fast-path lookup: avoids building a candidate entry for the

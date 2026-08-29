@@ -3,6 +3,31 @@
 
 ---
 
+## Standing note (Phase 6 docs truth pass)
+
+This document is largely **design-intent written well ahead of the
+implementation**, not a description of current behavior -- treat it
+the way `AGENTS.md` says to treat the rest of `docs/`. As of this
+writing, the actually-implemented library is three source files
+(~1600 lines total): a block bitmap (`kes_bitmap.c`), a first-fit-only
+extent allocator with persistence (`kes_storage.c`), and an
+independent LRU extent cache (`kes_cache.c`). Concretely, **none of
+the following exist in `src/*.c` or `include/kes/*.h`**: the buddy
+system / slab / log-structured / hybrid allocators, flash zones
+(hot/warm/cold), wear leveling (static or dynamic), garbage collection
+of any kind, the build-time hardware-profile system
+(`PROFILE=smartphone`/`kes_profile_load()`/memory-budget levels), LFU
+or Clock cache eviction, compression, encryption, or multi-device
+support. Sections below describing these are kept as forward-looking
+design sketches (per `plan_phase5.md`'s Track B.2 guidance) rather
+than deleted, but every such section is now explicitly marked
+**Not implemented**. Where a section describes something that *is*
+implemented, it has been corrected to match `src/*.c` exactly. See
+`AGENTS.md`'s "Ground truth" section and `PENDING_ITEMS.md` for the
+authoritative, maintained status.
+
+---
+
 ## Table of Contents
 
 1. [Executive Summary](#executive-summary)
@@ -83,28 +108,42 @@ Flexible Layout Examples:
 - **Optimization**: Can be disabled to save space on constrained devices
 
 #### 3. Block Bitmap
-- **Location**: Last blocks (default) or external management  
-- **Purpose**: Track free/used blocks with efficient allocation
-- **Strategies**: Full memory, sliding window, on-demand loading
+- **Location**: block 0's descriptor points at a fixed bitmap region
+  in the backing file (`bitmap_start_block`/`bitmap_blocks` in
+  `kes_storage_descriptor_t`) -- there is no external-management
+  option.
+- **Purpose**: Track free/used blocks.
+- **Strategies**: **only "full memory" actually exists.** `kes_bitmap_t`
+  is a single flat in-memory `uint8_t *` buffer, loaded whole on open
+  and saved whole on sync -- sliding-window and on-demand loading are
+  design intent only, not implemented.
 
 #### 4. User Data Area
 - **Location**: Between metadata and bitmap
-- **Organization**: Multiple allocation zones with different strategies
-- **Flash Zones**: Hot/warm/cold data separation for wear leveling
+- **Organization**: **not implemented.** There is no zone concept of
+  any kind -- `kes_extent_allocate()` does a single first-fit scan
+  over the whole bitmap, with no per-zone strategy selection.
+- **Flash Zones**: Hot/warm/cold data separation for wear leveling --
+  not implemented; see "Flash-Aware Design" below.
 
 ### Multi-Strategy Allocation Engine
 
-KES implements multiple allocation strategies selectable at build-time 
-or configurable per storage instance:
+**Actual status**: `kes_allocation_strategy_t` (`kes_types.h`) declares
+four strategies -- `KES_ALLOC_FIRST_FIT`, `KES_ALLOC_BEST_FIT`,
+`KES_ALLOC_WORST_FIT`, `KES_ALLOC_NEXT_FIT` -- but
+`kes_extent_allocate()` always calls `allocate_extent_first_fit()`
+(`src/kes_storage.c`) regardless of `config.strategy`. There is no
+buddy-system, slab, log-structured, or hybrid allocator implementation
+anywhere in this codebase; the list below is design-intent only:
 
 ```c
-Allocation Strategies:
-├── First Fit (Speed Optimized)
-├── Best Fit (Fragmentation Optimized) 
-├── Buddy System (Memory Efficient)
-├── Slab Allocator (Fixed-Size Optimized)
-├── Log-Structured (Flash Optimized)
-└── Hybrid (Adaptive Selection)
+Allocation Strategies (design intent -- only First Fit implemented):
+├── First Fit (Speed Optimized)              -- IMPLEMENTED
+├── Best Fit (Fragmentation Optimized)        -- Not implemented
+├── Buddy System (Memory Efficient)           -- Not implemented
+├── Slab Allocator (Fixed-Size Optimized)     -- Not implemented
+├── Log-Structured (Flash Optimized)          -- Not implemented
+└── Hybrid (Adaptive Selection)               -- Not implemented
 ```
 
 ---
@@ -165,7 +204,13 @@ typedef enum {
 
 ### 3. Extent Allocation Engine
 
-#### Multi-Zone Architecture
+**Not implemented** -- there is no zone concept (hot/warm/cold/GC, or
+size-based) anywhere in `src/kes_storage.c`. `kes_extent_allocate()`
+does a single first-fit scan over the whole bitmap via
+`kes_bitmap_find_free()`. The sections below describe a possible
+future zone-based design, not current behavior.
+
+#### Multi-Zone Architecture (design intent, not implemented)
 ```c
 Flash-Aware Zones:
 ├── Hot Zone (Frequently updated metadata)
@@ -180,18 +225,28 @@ Size-Based Zones:
 ```
 
 #### Allocation Algorithm Selection
-- **First Fit**: Fast allocation with limited search
-- **Best Fit**: Minimize fragmentation with exhaustive search
-- **Buddy System**: Power-of-2 allocation with coalescing
-- **Log-Structured**: Sequential allocation in zones
+- **First Fit**: Fast allocation with limited search -- **the only
+  algorithm actually implemented** (`allocate_extent_first_fit()`).
+- **Best Fit**: Minimize fragmentation with exhaustive search -- not
+  implemented; declared in `kes_allocation_strategy_t` only.
+- **Buddy System**: Power-of-2 allocation with coalescing -- not
+  implemented.
+- **Log-Structured**: Sequential allocation in zones -- not
+  implemented.
 
 ### 4. Caching Layer Integration
 
 #### Cache-Storage Interface
-- **Read Path**: Cache miss triggers extent loading from storage
-- **Write Path**: Cache dirty extents written back to storage
-- **Consistency**: Write-through or write-back policies
-- **Eviction**: LRU/LFU eviction coordinated with storage
+- **Read Path**: Cache miss triggers extent loading from storage via
+  caller-supplied `read_extent` callback (`kes_cache_set_io_callbacks()`).
+- **Write Path**: Dirty extents are written back on
+  `kes_cache_flush_extent()`/`kes_cache_sync()`/the background flush
+  thread (`kes_cache_start()`), via the caller-supplied `write_extent`
+  callback -- KES itself does not call into `kes_storage.c`.
+- **Consistency**: write-back only. There is no write-through mode.
+- **Eviction**: LRU only -- `kes_cache_create()` rejects
+  `KES_CACHE_LFU`/`KES_CACHE_CUSTOM` with `NULL` rather than
+  implementing them.
 
 ---
 
@@ -209,7 +264,7 @@ Size-Based Zones:
 - **Idle Detection**: Defer background operations during battery use
 - **Thermal Awareness**: Throttle operations during high temperature
 
-#### Flash Longevity
+#### Flash Longevity (design intent, not implemented)
 - **Wear Leveling**: Distribute writes across flash blocks evenly
 - **Write Reduction**: Minimize write amplification through batching
 - **Bad Block Management**: Handle and remap bad flash blocks
@@ -241,6 +296,14 @@ Size-Based Zones:
 ---
 
 ## Flash-Aware Design
+
+**Not implemented.** Everything in this section (hot/cold data
+classification, log-structured allocation, garbage collection, dynamic
+and static wear leveling) is a design sketch -- none of it exists in
+`src/*.c`. Grep confirms: no `wear`, `gc_`, or zone-related identifiers
+appear anywhere in the actual source. Kept here as forward-looking
+design intent, per `plan_phase5.md`'s Track B.2 guidance, not as a
+claim of current behavior.
 
 ### F2FS-Inspired Architecture
 
@@ -300,7 +363,16 @@ GC Trigger Conditions:
 
 ## Build System & Profiles
 
-### Profile-Based Configuration
+**Not implemented.** The actual build system is a single flat
+`Makefile` at the repository root with fixed targets (`make all`,
+`make test`, `make debug`, `make asan`/`tsan`/`valgrind`/`check-all`,
+etc. -- see `AGENTS.md`'s "Building and Testing" section for the
+complete, accurate list) and no `PROFILE=`/`MEMORY_BUDGET=`/`FEATURES=`
+variables, no per-hardware profile `.mk` files, and no feature-flag
+system. Everything below is a design sketch for a build system that
+does not exist.
+
+### Profile-Based Configuration (design intent, not implemented)
 
 #### Hardware Profiles
 ```makefile
@@ -373,9 +445,16 @@ Platform Detection:
 
 ## Performance Characteristics
 
+**Not measured.** The figures below are illustrative design targets
+for strategies that (aside from First Fit) are not implemented -- they
+are not benchmark results. `KES_HARDENING_PLAN.md` §6.G (performance
+smoke tests) and the "Perf smoke" item in `plan_phase5.md` Track A.7
+are the place to add real, reproducible numbers for the strategies
+that actually exist.
+
 ### Allocation Performance
 
-#### Strategy Performance Matrix
+#### Strategy Performance Matrix (design targets, not benchmarked)
 ```
 Strategy        | Allocation | Fragmentation | Memory    | Flash
               | Speed      | Resistance    | Overhead  | Friendly
@@ -410,7 +489,7 @@ Typical Memory Usage (64GB storage):
 - **Adaptive Algorithms**: Switch to memory-efficient algorithms
 - **Emergency Eviction**: Force cache eviction when needed
 
-### Flash Performance Optimization
+### Flash Performance Optimization (design intent, not implemented)
 
 #### Write Amplification Reduction
 - **Log-Structured Writes**: Minimize random writes
@@ -429,34 +508,34 @@ Typical Memory Usage (64GB storage):
 ### Upper Layer Integration
 
 #### Storage Lifecycle Integration
-```c
-// Typical integration pattern
-kes_storage_config_t config;
-kes_profile_load(KES_PROFILE_BUILD_DEFAULT, &config);
-config.device_path = "/dev/storage";
 
-kes_storage_t* storage;
+There is no `kes_profile_load()` or hardware-profile system --
+`kes_storage_config_t` is populated directly by the caller:
+
+```c
+kes_storage_config_t config = {
+    .device_path = "/dev/storage",
+    .device_size = 1024ULL * 1024 * 1024,
+    .block_size = KES_DEFAULT_BLOCK_SIZE,
+    .flags = KES_STORAGE_CREATE,
+    .strategy = KES_ALLOC_FIRST_FIT  /* the only strategy actually used */
+};
+
+kes_storage_t *storage;
 int result = kes_storage_create(&config, &storage);
 
-// Use storage for extent operations
 kes_extent_descriptor_t extent;
 kes_extent_allocate(storage, &request, &extent);
 ```
 
 #### Descriptor Management Integration
-```c
-// External descriptor management
-kes_descriptor_management_t desc_mgmt = {
-    .use_external = true,
-    .external_managed = {
-        .buffer = my_descriptor_buffer,
-        .buffer_size = sizeof(my_descriptor_buffer),
-        .save_callback = save_to_database,
-        .load_callback = load_from_database,
-        .user_data = database_handle
-    }
-};
-```
+
+**Not implemented.** There is no external/pluggable descriptor
+management -- `kes_descriptor_management_t` does not exist.
+`kes_storage_descriptor_t` is always stored in block 0 of the backing
+file and read/written internally by `kes_storage_open()`/
+`kes_storage_sync()`/`kes_storage_close()`; there is no save/load
+callback hook.
 
 ### File System Integration
 
