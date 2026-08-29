@@ -43,14 +43,20 @@ and wrong. Concretely, as of this writing:
   (returns `NULL`) rather than silently falling back to LRU — there is
   still no LFU or Clock eviction logic anywhere, despite both being
   described as complete in older versions of `docs/CONTINUATION_PROMPT.md`.
-- Verified as of this writing: `make check-all` (normal build +
-  ASan+UBSan + TSan + Valgrind) passes clean — 70/70 tests across all
-  six test binaries (`test_kes_minimal`, `test_kes_bitmap_full`,
-  `test_kes_storage_full`, `test_kes_cache`, `test_kes_cache_full`,
-  `test_kes_multiprocess`), 0 leaks, 0 races. **Don't assume that
-  stays true without rerunning it** — this is exactly the failure
-  mode `KES_HARDENING_PLAN.md` §0 warns about, and it applies to this
-  file too.
+- Verified as of this writing: `make test` (plain, unsanitized build)
+  passes clean — 92/92 tests across all twelve test binaries
+  (`test_kes_minimal`, `test_kes_bitmap_full`, `test_kes_storage_full`,
+  `test_kes_storage_edge`, `test_kes_cache`, `test_kes_cache_edge`,
+  `test_kes_cache_full`, `test_kes_multiprocess`,
+  `test_kes_fault_injection`, `test_kes_crash_consistency`,
+  `test_kes_fuzz`, `test_kes_soak`). **`make check-all` is NOT
+  currently reliably clean** — see the `kes_cache_flush_extent()`
+  race bullet below; this is a real, known, unfixed bug, not test
+  flakiness, and is the expected consequence of the soak test (Track
+  A.7.2, `PENDING_ITEMS.md`) doing its job. **Don't assume any of this
+  stays true without rerunning it** — this is exactly the failure mode
+  `KES_HARDENING_PLAN.md` §0 warns about, and it applies to this file
+  too.
 - `test_kes_multiprocess` covers a case none of the other binaries
   do: two independent OS processes (a real `fork()`, not threads),
   each with its own `kes_storage_open()` handle on the same backing
@@ -76,6 +82,25 @@ and wrong. Concretely, as of this writing:
   comment in `src/kes_cache.c` and the Phase 3 entry in
   `PENDING_ITEMS.md` for the full explanation before touching this
   code — the locking here is more subtle than it looks.
+- **`kes_cache_flush_extent()` (`src/kes_cache.c`) has a real,
+  TSan-confirmed data race, found by the Track A.7.2 soak test and
+  reported, not fixed, per `plan_phase5.md` rule 0.3**:
+  `kes_cache_get_extent()`'s cache-miss path deliberately calls
+  `read_extent()` (writing into `entry->data`) without holding
+  `entry->lock`, to avoid blocking other threads during I/O, even
+  though the entry is already published in the hash table (state
+  `KES_EXTENT_LOADING`) at that point. `kes_cache_flush_extent()`
+  checks only `entry->state & KES_EXTENT_DIRTY` before reading
+  `entry->data` under `entry->lock` — unlike
+  `sweep_flush_and_maybe_evict()` (used by `kes_cache_sync()`'s sweep
+  path and eviction), which also requires `!(entry->state &
+  KES_EXTENT_LOADING)`. A `kes_cache_mark_dirty()` call on a
+  still-loading entry (legal — `state` can be `LOADING | DIRTY` at
+  once) lets `kes_cache_flush_extent()` race the in-flight load. This
+  is why `make tsan`/`make check-all` are not currently reliably clean
+  — see `PENDING_ITEMS.md`'s "Track A.7.2" and "`make check-all`
+  bookkeeping run" entries for the full citation trail and candidate
+  fix shapes.
 
 `docs/CONTINUATION_PROMPT.md` has been corrected to match current
 reality and is safe to read now. Treat everything else under `docs/`
@@ -87,22 +112,30 @@ implemented). When in doubt about whether a feature exists, grep
 `src/*.c` for the function name rather than trusting a doc.
 
 **`PENDING_ITEMS.md` is the current work tracker** — read it before
-picking up any cache or storage work. What remains, in priority order:
-test expansion (Phase 5, partially done — functional coverage per
-public function exists, but `KES_HARDENING_PLAN.md` §6's edge-case/
-fault-injection/crash-consistency/fuzz/soak-test matrix does not), a
-docs truth pass over the rest of `docs/` beyond `CONTINUATION_PROMPT.md`
-(Phase 6, partially done), and allocation strategies beyond first-fit.
+picking up any cache or storage work. Phase 5 (test expansion,
+`plan_phase5.md` Track A) and Phase 6 (docs truth pass, Track B) are
+both **complete**: `KES_HARDENING_PLAN.md` §6's edge-case/fault-
+injection/crash-consistency/fuzz/soak-test matrix is fully covered
+(92/92 tests across 12 binaries, `make test`), and the 8 remaining
+`docs/` files got their truth pass. What remains: allocation
+strategies beyond first-fit, fixing the two real concurrency bugs this
+pass found and deliberately left unfixed per rule 0.3 (the
+`kes_cache_destroy()`-vs-concurrent-access use-after-free above, and
+the `kes_cache_flush_extent()` data race above), and the smaller
+non-concurrency gaps `PENDING_ITEMS.md` catalogs (`block_count == 0`
+not validated, load-failure entries never auto-retrying, etc.).
 
-**`plan_phase5.md` is the detailed execution plan for the Phase 5/6
-remainder** — a task-by-task breakdown (exact files to add/edit, exact
+**`plan_phase5.md` is the detailed execution record for that Phase
+5/6 work** — a task-by-task breakdown (exact files added/edited, exact
 test cases, exact acceptance criteria per task) of everything the
-paragraph above summarizes. Read it before starting Phase 5/6 work
-instead of re-deriving a task list from `KES_HARDENING_PLAN.md` §6/§7
-yourself; update it and `PENDING_ITEMS.md` together as tasks complete,
-per its own §6 (bookkeeping) — do not let this file, `PENDING_ITEMS.md`,
-and `plan_phase5.md` drift out of sync with each other or with actual
-code, the same failure mode that made the old `docs/CONTINUATION_PROMPT.md`
+paragraph above summarizes, now fully executed (all of Track A and
+Track B, per its own §6 bookkeeping rule). Read it for the *how* and
+*why* behind any of the above before touching cache/storage/docs code
+it covers, instead of re-deriving that history from
+`KES_HARDENING_PLAN.md` §6/§7 yourself. If a new multi-task plan
+supersedes it, keep this file, `PENDING_ITEMS.md`, and that plan in
+sync with each other and with actual code as tasks complete — the same
+failure mode that made the old `docs/CONTINUATION_PROMPT.md`
 untrustworthy in the first place.
 
 ## `CODING_STYLE.md` is binding for all new/edited code

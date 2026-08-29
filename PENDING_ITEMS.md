@@ -3,20 +3,47 @@
 Tracks progress against `KES_HARDENING_PLAN.md`'s phases. As of this
 writing, Phases 1-4 are complete (bug fix, sanitizer tooling, the
 four missing cache functions, capacity enforcement/eviction) and the
-P0 concurrency bug is fixed; Phase 5 (test expansion) and Phase 6
-(docs truth pass) are partially done -- see their sections below for
-exactly what's covered and what's still missing. Read
-`KES_HARDENING_PLAN.md` in full before picking up any remaining
-item -- it is still the ground-truth work order for *how* to
-implement each piece correctly, even though most of it now describes
-work already done.
+P0 concurrency bug is fixed; **Phase 5 (test expansion, `plan_phase5.md`
+Track A) and Phase 6 (docs truth pass, `plan_phase5.md` Track B) are
+both now complete** -- see their sections below (and `AGENTS.md`'s
+Ground Truth section) for exactly what each covers and, importantly,
+for the real bugs this pass found and deliberately left unfixed per
+`plan_phase5.md` rule 0.3. Read `KES_HARDENING_PLAN.md` in full before
+picking up any remaining item (allocation strategies beyond first-fit
+is the main one) -- it is still the ground-truth work order for *how*
+to implement each piece correctly, even though most of it now
+describes work already done.
 
-Verified state as of this writing: `make check-all` (normal build +
-ASan+UBSan + TSan + Valgrind) passes clean -- 70/70 tests across
-`test_kes_minimal`, `test_kes_bitmap_full`, `test_kes_storage_full`,
-`test_kes_cache`, `test_kes_cache_full`, `test_kes_multiprocess`; 0
-leaks (Valgrind), 0 races (TSan), 0 memory-safety errors (ASan+UBSan).
-Do not assume that stays true without rerunning it -- see
+Verified state as of this writing: `make test` (plain, unsanitized
+build) passes clean -- 92/92 tests across all 12 test binaries
+(`test_kes_minimal`, `test_kes_bitmap_full`, `test_kes_storage_full`,
+`test_kes_storage_edge`, `test_kes_cache`, `test_kes_cache_edge`,
+`test_kes_cache_full`, `test_kes_multiprocess`, `test_kes_fault_injection`,
+`test_kes_crash_consistency`, `test_kes_fuzz`, `test_kes_soak`).
+
+**`make check-all` is NOT currently reliably clean, and this is
+expected, not a regression to chase**: `tests/test_kes_soak.c`
+(Track A.7.2) is specifically designed to surface real concurrency
+bugs under sustained load, and it does -- `kes_cache_flush_extent()`
+checks only `KES_EXTENT_DIRTY`, not `KES_EXTENT_LOADING` (unlike
+`sweep_flush_and_maybe_evict()`, which checks both), so it can race a
+still-in-flight `kes_cache_get_extent()` load on the same entry. TSan
+catches this often enough that even a plain `make tsan` (which now
+includes `test_kes_soak` at its default 2-second smoke duration via
+the `TEST_SOURCES` wildcard) can intermittently fail on it -- see the
+"`make check-all` bookkeeping run" entry under Phase 5 progress below
+for the full citation trail. This is a real, reported, deliberately
+NOT-fixed bug (rule 0.3), not flakiness in the test itself: every
+individual test's own PASS/FAIL assertions hold every time; only the
+sanitizer's own nonzero exit status on a caught race fails the
+Makefile target around it. Do not "fix" this by weakening or excluding
+`test_kes_soak` from a sanitizer run -- that would hide the exact
+signal it exists to produce. Whoever fixes the underlying
+`kes_cache_flush_extent()` race (see that entry for the two candidate
+fix shapes) should see `make tsan`/`make check-all` become reliably
+clean again as a direct consequence.
+
+Do not assume any of the above stays true without rerunning it -- see
 `KES_HARDENING_PLAN.md` §0's standing rule about pasted evidence.
 
 ---
@@ -792,10 +819,59 @@ for *readers*) to `kes_cache_flush_extent()`, but choosing between
 those two shapes is a real design decision for `src/kes_cache.c`, out
 of scope for this test-only commit.
 
+**Update, discovered while completing the plan-wide `make check-all`
+bookkeeping gate below**: this is not a rare, only-under-10-minutes
+race. A plain `make tsan` re-run (which now includes
+`tests/test_kes_soak.c` via the `TEST_SOURCES` wildcard, at its
+default `KES_SOAK_SECONDS=2`) reproduced the identical TSan report
+inside a 2-second run: `ThreadSanitizer: reported 1 warnings`,
+`test_kes_soak` itself still `PASS` (its own invariants never caught
+anything), but the nonzero TSan exit status fails the `tsan` target
+(`make: *** [Makefile:208: tsan] Error 1`). **Practical consequence:
+`make tsan`/`make check-all` are not currently reliably clean --
+they can intermittently fail specifically because
+`tests/test_kes_soak.c` is exactly the kind of sustained
+mark_dirty+concurrent-load workload that triggers the real,
+already-documented `kes_cache_flush_extent()` race above, and does so
+often enough to show up even in a short smoke run, not just a full
+10-minute soak.** This is being reported as-is, per rule 0.3, rather
+than silently adding a workaround (e.g. excluding `test_kes_soak`'s
+short default form from `make tsan`) that would hide a real,
+reproducible bug behind a green build.
+
 A.7.1 (perf smoke) was intentionally left undone: the plan marks it
 optional/stretch, explicitly non-blocking, "do not block finishing
 this plan on this item" -- skipped in favor of finishing the required
 A.7.2 soak run and the plan-wide bookkeeping below.
+
+### `make check-all` bookkeeping run -- one real Makefile gap found and FIXED, one real code bug found and left NOT FIXED
+
+Running `make check-all` for real (the plan_phase5.md S6 gate before
+updating `AGENTS.md`'s Ground Truth section) surfaced two distinct
+issues, one fixed here and one deliberately not:
+
+- **Fixed**: the `tsan` target had no equivalent of the `asan`
+  target's scoped `ASAN_OPTIONS=allocator_may_return_null=1`
+  workaround for `test_kes_fault_injection`'s deliberate 200GiB
+  allocator-OOM case (A.4.2) -- TSan shares the same sanitizer-common
+  allocator and abort-on-OOM default (confirmed by TSan's own hint
+  text), so it aborted the same way ASan originally did before A.4.2
+  added that workaround. Fixed by mirroring the `asan` target's
+  pattern exactly, scoped to that one binary via `TSAN_OPTIONS`. This
+  is a test-harness fix (making the sanitizer behave as intended for
+  a test that deliberately induces OOM), not a production-code change,
+  so it is not a rule-0.3 "drive-by fix."
+- **Not fixed**: with that gap closed, `make tsan` still fails
+  intermittently -- see the "Update, discovered while completing the
+  plan-wide `make check-all` bookkeeping gate" paragraph above. This
+  is the real, already-documented `kes_cache_flush_extent()` vs.
+  `KES_EXTENT_LOADING` race, not a new bug, but it means **`make
+  check-all` cannot currently be reported as reliably clean** -- it is
+  gated on a real, known, unfixed concurrency bug that the plan's own
+  new soak test (Track A.7.2) is working exactly as intended by
+  surfacing. `AGENTS.md`'s Ground Truth section below is updated to
+  state this precisely rather than claim a clean `check-all` that
+  is not actually reproducible on demand.
 
 ## Infrastructure notes for whoever picks this up
 
