@@ -686,12 +686,116 @@ each:
 - ~~§6.F randomized/fuzz-adjacent testing~~ DONE -- see "Track A.6 --
   randomized/fuzz-adjacent testing (DONE)" under Resolved above
   (`tests/test_kes_fuzz.c`, 2/2).
-- §6.G performance smoke tests: not done (informational only, not
-  blocking).
-- §6.H long-run soak test (a `make soak` target running the mixed
-  workload for 10+ minutes under ASan/TSan): not done.
+- §6.G performance smoke tests: not done -- intentionally skipped,
+  optional/non-blocking per the plan (see "Phase 5 progress -- Track
+  A.7.2" above).
+- ~~§6.H long-run soak test~~ DONE -- `make soak` (TSan, 10 minutes)
+  actually run to completion; see "Phase 5 progress -- Track A.7.2"
+  above (`tests/test_kes_soak.c`) for the real, TSan-confirmed data
+  race it found and did not fix.
 
 ---
+
+### Phase 5 progress -- Track A.7.2: `make soak` -- 10-minute run (DONE, real TSan-confirmed data race found and FLAGGED, NOT FIXED)
+
+New `tests/test_kes_soak.c` (plan_phase5.md Track A.7.2): extends
+`test_concurrent_sync_vs_get_put`'s shape (`tests/test_kes_cache.c`)
+into a widened get/put/pin/unpin/mark_dirty/flush/invalidate op mix
+(mirroring `test_kes_fuzz.c`'s A.6.1 switch) running for
+`KES_SOAK_SECONDS` (default 2, so it stays fast and harmless inside a
+normal `make test` run -- confirmed, adds 1 test, 92/92 after this
+commit). Every `SOAK_CHECK_INTERVAL_MS` (500ms) the monitor thread
+parks every worker/sync thread at a checkpoint boundary
+(`soak_worker_checkpoint()`), then walks the cache's hash table
+directly (`kes_extent_entry_t`/`kes_cache_bucket_t` are both
+non-opaque) to recompute `entries_cached`/`memory_used` from scratch
+and cross-check against `kes_cache_get_stats()`, plus sanity-bound
+`ref_count`/`pin_count` and `entries_pinned <= entries_cached` -- the
+same quiescent-checkpoint design `test_kes_fuzz.c`'s A.6.1 invariant
+checks use, extended to run periodically over wall-clock time instead
+of after every op. New `make soak` target (`Makefile`): clean rebuild
+under TSan (chosen over ASan -- see the Makefile comment above the
+target for the reasoning: this is fundamentally about counters
+drifting out of sync, a data-race symptom TSan is built to catch,
+where ASan's LeakSanitizer would only catch a strict subset), then
+runs `test_kes_soak` with `KES_SOAK_SECONDS=600`.
+
+**Actually run for the full 10 minutes, not just written** -- pasted
+evidence: `make soak` ran to completion (1189 quiescent checkpoint
+cycles, ~55M worker ops, ~700K sync ops observed by the time of the
+finding below); the soak test's own invariant assertions never failed
+across any checkpoint (`Tests run: 1 / Tests passed: 1 / Tests failed:
+0` -- entries_cached/memory_used matched the live hash-table walk
+exactly at every one of the 1189 checks, `entries_pinned` never
+exceeded `entries_cached`, no `ref_count`/`pin_count` sanity-ceiling
+violation, no leak-shaped drift in the observed `memory_used` range).
+
+**However, TSan itself reported exactly 1 data race during this run
+(`ThreadSanitizer: reported 1 warnings`), which is why `make soak`'s
+own exit code is nonzero (`Error 66`) even though the test's own
+PASS/FAIL logic reported PASS -- this is the correct, intended
+outcome of a soak test actually catching something, not a test bug.**
+Reading the TSan report plus `src/kes_cache.c` confirms a real,
+previously only speculated data race, exactly matching what the
+`soak` Makefile target's comment already predicted from earlier
+manual development testing (see that comment, written before this run
+produced the first automated, reproducible confirmation):
+
+- `kes_cache_get_extent()`'s cache-miss/load path (`src/kes_cache.c`
+  lines ~891-925) publishes the new entry into the hash table (state
+  `KES_EXTENT_LOADING`) via `hash_find_or_insert()` *before* actually
+  reading its data from disk, and deliberately performs that
+  `read_extent()` call (which writes the loaded bytes into
+  `entry->data`) *without holding `entry->lock`* -- by design, to
+  avoid blocking other threads for the duration of the I/O.
+  `entry->lock` is only acquired afterward, to publish the final
+  `KES_EXTENT_CLEAN`/`KES_EXTENT_ERROR` state (line ~927).
+- `kes_cache_flush_extent()` (the direct single-entry flush call,
+  `src/kes_cache.c` lines 1178-1230) finds this same
+  already-published, still-loading entry via `hash_find()`, takes
+  `entry->lock`, and checks only `entry->state & KES_EXTENT_DIRTY`
+  before calling `write_extent()` (which reads `entry->data`) --
+  it does **not** check `KES_EXTENT_LOADING` the way
+  `sweep_flush_and_maybe_evict()` does (`src/kes_cache.c` line 476:
+  `(entry->state & KES_EXTENT_DIRTY) && !(entry->state &
+  KES_EXTENT_LOADING)`, used by `kes_cache_sync()`'s sweep path and
+  eviction). If another thread had already called
+  `kes_cache_mark_dirty()` on this same still-loading entry (which
+  only sets the `KES_EXTENT_DIRTY` bit under `entry->lock`, so `state`
+  can legitimately be `LOADING | DIRTY` at once), `flush_extent()`'s
+  `DIRTY` check passes and it reads `entry->data` (locked) while the
+  original load's `read_extent()` call is still writing into the
+  exact same buffer (unlocked) -- a genuine, TSan-confirmed data race
+  on `entry->data` between an intentionally-unlocked in-flight load
+  write and a lock-guarded flush read. TSan's report: `Read of size 8
+  ... by thread T1 (mutexes: write M0)` at `soak_mock_write ->
+  kes_cache_flush_extent (src/kes_cache.c:1202)`, racing a `Previous
+  write of size 8 ... by thread T3` (no mutex held) at `soak_mock_read
+  -> kes_cache_get_extent (src/kes_cache.c:916)`, both on the same
+  heap block allocated by `extent_alloc_data()` inside that same
+  `kes_cache_get_extent()` miss path.
+- This sharpens, and is a more severe variant of, the A.4.1 finding
+  above ("`kes_cache_flush_extent()` doesn't set `KES_EXTENT_ERROR` on
+  a write failure the same way the sweep path does") -- both point at
+  the same root cause: `kes_cache_flush_extent()` is missing the
+  `KES_EXTENT_LOADING` guard `sweep_flush_and_maybe_evict()` already
+  has. A.4.1 only observed a state-tracking inconsistency; this soak
+  run demonstrates the same gap is a genuine, TSan-confirmed data race
+  under real concurrent load, not just a bookkeeping quirk.
+
+**Not fixed** -- per rule 0.3, this is reported, not silently patched.
+The fix is almost certainly to add the same `!(entry->state &
+KES_EXTENT_LOADING)` guard `sweep_flush_and_maybe_evict()` already
+uses (or block/wait on the loading condvar the way `kes_cache_get_extent()`'s
+own "wait for an in-flight load" branch around line 1013 already does
+for *readers*) to `kes_cache_flush_extent()`, but choosing between
+those two shapes is a real design decision for `src/kes_cache.c`, out
+of scope for this test-only commit.
+
+A.7.1 (perf smoke) was intentionally left undone: the plan marks it
+optional/stretch, explicitly non-blocking, "do not block finishing
+this plan on this item" -- skipped in favor of finishing the required
+A.7.2 soak run and the plan-wide bookkeeping below.
 
 ## Infrastructure notes for whoever picks this up
 

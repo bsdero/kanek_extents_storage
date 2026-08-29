@@ -210,6 +210,42 @@ sanitize-all: asan tsan
 	$(MAKE) clean
 	$(MAKE) all
 
+# Soak test (A.7.2, plan_phase5.md). tests/test_kes_soak.c runs its
+# mixed get/put/pin/unpin/mark_dirty/flush/invalidate worker threads
+# vs. dedicated sync() threads for KES_SOAK_SECONDS wall-clock seconds
+# (default 2, so it stays fast and harmless as part of a normal
+# "make test" run) -- this target overrides that to 600 (10 minutes).
+#
+# Layered under TSan, not ASan: KES_HARDENING_PLAN.md S6.H's two soak
+# concerns are slow memory drift and counters drifting out of sync.
+# The latter is a data-race symptom, and TSan is what actually finds
+# the race that causes it -- ASan's LeakSanitizer only catches
+# genuinely unfreed allocations, which the test's own periodic
+# quiesce-and-compare of memory_used against a live hash-table walk
+# already covers more precisely than ASan could here. (This choice
+# already paid off during development: a real, reproducible TSan-
+# detected data race was found this way -- kes_cache_flush_extent(),
+# unlike make_room_for_new_entry()'s internal eviction-flush path,
+# does not check KES_EXTENT_LOADING before writing out an entry's
+# data buffer, so a flush racing a still-in-flight load on the same
+# entry can read partially-written data concurrently with the load's
+# own write into it. See PENDING_ITEMS.md's Phase 5 progress section
+# for the full writeup -- not fixed here per this plan's "report, do
+# not silently fix" rule.)
+#
+# Follows the asan/tsan targets' clean-rebuild pattern; must run
+# under "setarch $$(uname -m) -R" in this WSL2 environment, same
+# reason as the "tsan" target.
+.PHONY: soak
+soak:
+	$(MAKE) clean
+	$(MAKE) all tests CFLAGS="$(CFLAGS) $(TSAN_FLAGS)" \
+	    LDFLAGS="$(LDFLAGS) $(TSAN_FLAGS)"
+	@echo "Running 10-minute soak test under TSan " \
+	     "(KES_SOAK_SECONDS=600)..."
+	KES_SOAK_SECONDS=600 setarch $$(uname -m) -R \
+	    $(BUILD_DIR)/tests/test_kes_soak
+
 # Valgrind pass: independent leak/error checker on a plain (non-
 # sanitized) build -- ASan and Valgrind's instrumentation conflict,
 # so this always starts from a clean, unsanitized rebuild.
@@ -439,6 +475,8 @@ help:
 	@echo "  stress        - repeat test_kes_cache/test_kes_multiprocess" \
 	     "STRESS_RUNS times (default 100); SANITIZER=asan|tsan to" \
 	     "layer a sanitizer on top"
+	@echo "  soak          - clean rebuild under TSan + run" \
+	     "test_kes_soak for 10 minutes (KES_SOAK_SECONDS=600)"
 	@echo ""
 	@echo "kanek_foundations (KFL) sibling repo:"
 	@echo "  foundations-fetch - clone KFL next to this repo if" \
