@@ -199,10 +199,22 @@ tsan:
 	$(MAKE) all tests CFLAGS="$(CFLAGS) $(TSAN_FLAGS)" \
 	    LDFLAGS="$(LDFLAGS) $(TSAN_FLAGS)"
 	@echo "Running tests under TSan..."
+	# Same test_kes_fault_injection OOM case the "asan" target above
+	# handles (A.4.2, plan_phase5.md) -- TSan shares the sanitizer
+	# allocator's abort-on-OOM default and the same
+	# allocator_may_return_null=1 escape hatch (via TSAN_OPTIONS
+	# instead of ASAN_OPTIONS), confirmed by TSan's own hint text when
+	# this was first hit unguarded under "make check-all". Scoped to
+	# this one binary for the same reason as the asan target.
 	@for test in $(TEST_TARGETS); do \
 		testname=$$(basename $$test); \
 		echo "--- $$testname (tsan) ---"; \
-		setarch $$(uname -m) -R $$test || exit 1; \
+		if [ "$$testname" = "test_kes_fault_injection" ]; then \
+			TSAN_OPTIONS=allocator_may_return_null=1 \
+			    setarch $$(uname -m) -R $$test || exit 1; \
+		else \
+			setarch $$(uname -m) -R $$test || exit 1; \
+		fi; \
 	done
 
 .PHONY: sanitize-all
