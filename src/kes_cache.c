@@ -1189,6 +1189,32 @@ int kes_cache_flush_extent( kes_cache_t *cache,
     pthread_mutex_lock( &entry->lock);
     __atomic_fetch_sub( &entry->lookup_pins, 1, __ATOMIC_SEQ_CST);
 
+    /*
+     * kes_cache_get_extent()'s cache-miss path publishes a new entry
+     * (state KES_EXTENT_LOADING) before reading its data from disk,
+     * and deliberately performs that read_extent() call -- which
+     * writes into entry->data -- without holding entry->lock, so it
+     * doesn't block other threads for the duration of the I/O. A
+     * concurrent kes_cache_mark_dirty() call is legal while an entry
+     * is still loading (state becomes LOADING | DIRTY), which used
+     * to let this function's DIRTY check below pass while the load
+     * was still in flight -- a TSan-confirmed data race reading
+     * entry->data (locked, here) against the unlocked in-flight
+     * write (see PENDING_ITEMS.md's Track A.7.2 entry). Wait the
+     * load out first, the same way kes_cache_get_extent()'s own
+     * "attach to an in-flight load" branch does, using cond_waiters
+     * to stop try_evict_entry_locked() from freeing this entry while
+     * parked here (see the cond_waiters field doc comment in
+     * kes_cache.h).
+     */
+    if ( entry->state & KES_EXTENT_LOADING) {
+        entry->cond_waiters++;
+        while ( entry->state & KES_EXTENT_LOADING) {
+            pthread_cond_wait( &entry->cond, &entry->lock);
+        }
+        entry->cond_waiters--;
+    }
+
     if ( entry->state & KES_EXTENT_DIRTY) {
         if ( cache->write_extent == NULL) {
             TRACE_ERR( "kes_cache_flush_extent: entry is dirty but no "

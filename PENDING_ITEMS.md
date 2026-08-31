@@ -21,27 +21,32 @@ build) passes clean -- 92/92 tests across all 12 test binaries
 `test_kes_cache_full`, `test_kes_multiprocess`, `test_kes_fault_injection`,
 `test_kes_crash_consistency`, `test_kes_fuzz`, `test_kes_soak`).
 
-**`make check-all` is NOT currently reliably clean, and this is
-expected, not a regression to chase**: `tests/test_kes_soak.c`
-(Track A.7.2) is specifically designed to surface real concurrency
-bugs under sustained load, and it does -- `kes_cache_flush_extent()`
-checks only `KES_EXTENT_DIRTY`, not `KES_EXTENT_LOADING` (unlike
-`sweep_flush_and_maybe_evict()`, which checks both), so it can race a
-still-in-flight `kes_cache_get_extent()` load on the same entry. TSan
-catches this often enough that even a plain `make tsan` (which now
-includes `test_kes_soak` at its default 2-second smoke duration via
-the `TEST_SOURCES` wildcard) can intermittently fail on it -- see the
-"`make check-all` bookkeeping run" entry under Phase 5 progress below
-for the full citation trail. This is a real, reported, deliberately
-NOT-fixed bug (rule 0.3), not flakiness in the test itself: every
-individual test's own PASS/FAIL assertions hold every time; only the
-sanitizer's own nonzero exit status on a caught race fails the
-Makefile target around it. Do not "fix" this by weakening or excluding
-`test_kes_soak` from a sanitizer run -- that would hide the exact
-signal it exists to produce. Whoever fixes the underlying
-`kes_cache_flush_extent()` race (see that entry for the two candidate
-fix shapes) should see `make tsan`/`make check-all` become reliably
-clean again as a direct consequence.
+**`kes_cache_flush_extent()`'s `KES_EXTENT_LOADING` race is now
+FIXED** -- see the "`kes_cache_flush_extent()` vs. in-flight load
+race (FIXED)" entry under Resolved below for the fix and the evidence
+that `make tsan` is now clean (previously this reproduced often
+enough to fail even a 2-second `make tsan` smoke run; see the
+Track A.7.2 entry for the original finding).
+
+**`make check-all` is STILL NOT currently reliably clean, but for a
+different, unrelated, already-documented reason**: `block_count == 0`
+is not validated in `kes_cache_get_extent()` (flagged at A.1.3 below),
+so the miss path reaches `aligned_alloc(64, 0)`; glibc returns
+non-NULL and nothing crashes, but Valgrind's Memcheck flags the
+zero-size call itself, failing `make valgrind`/`make check-all` via
+their `--error-exitcode=1`. See the "Update" note under A.1.3 below
+for the full citation trail. `make test`/`make asan`/`make tsan` all
+stay clean regardless -- only Valgrind's stricter zero-size check
+surfaces this. This is a real, reported, deliberately NOT-fixed gap
+(rule 0.3), not a regression to chase.
+
+Separately, the `kes_cache_destroy()` vs. concurrent-access
+use-after-free (Track A.3.1 below) also remains unfixed, but does
+**not** itself gate any Makefile target: the test that demonstrates it
+deliberately forks a disposable child process to contain the crash,
+and neither Valgrind's `--error-exitcode` nor a sanitizer's exit
+status for the *parent* process reflects what happens inside that
+forked child.
 
 Do not assume any of the above stays true without rerunning it -- see
 `KES_HARDENING_PLAN.md` §0's standing rule about pasted evidence.

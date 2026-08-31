@@ -206,7 +206,9 @@ into — unlike KFL).
 ```bash
 make all          # build build/libkes.a and build/libkes.so.1.0.0
 make test-core    # build + run test_kes_minimal only — 9/9 pass, stable
-make test         # build + run all 6 test binaries — 70/70 passing
+make test         # build + run all 12 test binaries — 92/92 passing
+                   # (see "Ground truth" above — this is the number
+                   # as of this writing, re-verify before trusting it)
 make debug        # DEBUG=1: -g3 -O0 -DDEBUG build
 make examples     # build examples/example_kes_usage.c
 make run-example  # build and run the example program
@@ -222,6 +224,12 @@ make tsan         # clean rebuild + run tests under TSan
 make sanitize-all # asan + tsan, then a plain rebuild
 make valgrind     # clean rebuild + run tests under Valgrind
 make check-all    # normal + asan + tsan + valgrind, gated on all passing
+make soak         # clean TSan rebuild + 10-min test_kes_soak run
+                   # (KES_SOAK_SECONDS=600) — this is what found the
+                   # kes_cache_flush_extent() race documented above
+make stress       # repeat test_kes_cache/test_kes_multiprocess
+                   # $(STRESS_RUNS) times each; SANITIZER=asan|tsan
+                   # selects a sanitized rebuild first, unset is plain
 ```
 
 There is no per-test filtering flag — each `tests/test_*.c` maps to
