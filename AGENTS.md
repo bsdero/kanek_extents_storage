@@ -49,12 +49,14 @@ and wrong. Concretely, as of this writing:
   `test_kes_storage_edge`, `test_kes_cache`, `test_kes_cache_edge`,
   `test_kes_cache_full`, `test_kes_multiprocess`,
   `test_kes_fault_injection`, `test_kes_crash_consistency`,
-  `test_kes_fuzz`, `test_kes_soak`). **`make check-all` is NOT
-  currently reliably clean** — see the `kes_cache_flush_extent()`
-  race bullet below; this is a real, known, unfixed bug, not test
-  flakiness, and is the expected consequence of the soak test (Track
-  A.7.2, `PENDING_ITEMS.md`) doing its job. **Don't assume any of this
-  stays true without rerunning it** — this is exactly the failure mode
+  `test_kes_fuzz`, `test_kes_soak`). **`make check-all` (test + asan +
+  tsan + valgrind) is now reliably clean** — re-run in full as of this
+  writing: exit 0, "ALL CHECKS PASSED". This was not always true: the
+  `kes_cache_flush_extent()` race (Track A.7.2) and the `block_count
+  == 0`-unvalidated Valgrind gap (Track A.1.3) each failed it in turn;
+  both are now fixed and closed, see `PENDING_ITEMS.md`'s `## Resolved`
+  section for each. **Don't assume any of this stays true without
+  rerunning it** — this is exactly the failure mode
   `KES_HARDENING_PLAN.md` §0 warns about, and it applies to this file
   too.
 - `test_kes_multiprocess` covers a case none of the other binaries
@@ -82,25 +84,36 @@ and wrong. Concretely, as of this writing:
   comment in `src/kes_cache.c` and the Phase 3 entry in
   `PENDING_ITEMS.md` for the full explanation before touching this
   code — the locking here is more subtle than it looks.
-- **`kes_cache_flush_extent()` (`src/kes_cache.c`) has a real,
+- **`kes_cache_flush_extent()` (`src/kes_cache.c`) had a real,
   TSan-confirmed data race, found by the Track A.7.2 soak test and
-  reported, not fixed, per `plan_phase5.md` rule 0.3**:
+  reported before being fixed, per `plan_phase5.md` rule 0.3**:
   `kes_cache_get_extent()`'s cache-miss path deliberately calls
   `read_extent()` (writing into `entry->data`) without holding
   `entry->lock`, to avoid blocking other threads during I/O, even
   though the entry is already published in the hash table (state
-  `KES_EXTENT_LOADING`) at that point. `kes_cache_flush_extent()`
-  checks only `entry->state & KES_EXTENT_DIRTY` before reading
+  `KES_EXTENT_LOADING`) at that point. `kes_cache_flush_extent()` used
+  to check only `entry->state & KES_EXTENT_DIRTY` before reading
   `entry->data` under `entry->lock` — unlike
   `sweep_flush_and_maybe_evict()` (used by `kes_cache_sync()`'s sweep
   path and eviction), which also requires `!(entry->state &
   KES_EXTENT_LOADING)`. A `kes_cache_mark_dirty()` call on a
   still-loading entry (legal — `state` can be `LOADING | DIRTY` at
-  once) lets `kes_cache_flush_extent()` race the in-flight load. This
-  is why `make tsan`/`make check-all` are not currently reliably clean
-  — see `PENDING_ITEMS.md`'s "Track A.7.2" and "`make check-all`
-  bookkeeping run" entries for the full citation trail and candidate
-  fix shapes.
+  once) let `kes_cache_flush_extent()` race the in-flight load. **Fixed
+  and closed as of commit `97ab19a`**: `kes_cache_flush_extent()` now
+  waits out an in-flight load via `entry->cond`/`entry->cond_waiters`
+  before checking `KES_EXTENT_DIRTY`, mirroring
+  `kes_cache_get_extent()`'s own wait pattern — see the matching
+  "Resolved" entry in `PENDING_ITEMS.md` for the full citation trail.
+- **`block_count == 0` was not validated in `kes_cache_get_extent()`**
+  (Track A.1.3): a request with `block_count == 0` fell through to
+  `extent_data_size()` computing 0 and `aligned_alloc(64, 0)`, which
+  glibc returns non-NULL for, producing a "successful" but nonsensical
+  0-byte cached entry — and separately tripping Valgrind's Memcheck on
+  the zero-size allocation, failing `make valgrind`/`make check-all`.
+  **Fixed and closed**: `kes_cache_get_extent()` now rejects
+  `id->block_count == 0` with `KES_ERROR_INVALID` before any
+  allocation, mirroring the `id->block_size` guard above — see the
+  matching "Resolved" entry in `PENDING_ITEMS.md`.
 
 `docs/CONTINUATION_PROMPT.md` has been corrected to match current
 reality and is safe to read now. Treat everything else under `docs/`
@@ -118,12 +131,14 @@ both **complete**: `KES_HARDENING_PLAN.md` §6's edge-case/fault-
 injection/crash-consistency/fuzz/soak-test matrix is fully covered
 (92/92 tests across 12 binaries, `make test`), and the 8 remaining
 `docs/` files got their truth pass. What remains: allocation
-strategies beyond first-fit, fixing the two real concurrency bugs this
-pass found and deliberately left unfixed per rule 0.3 (the
-`kes_cache_destroy()`-vs-concurrent-access use-after-free above, and
-the `kes_cache_flush_extent()` data race above), and the smaller
-non-concurrency gaps `PENDING_ITEMS.md` catalogs (`block_count == 0`
-not validated, load-failure entries never auto-retrying, etc.).
+strategies beyond first-fit, the still-open
+`kes_cache_destroy()`-vs-concurrent-access use-after-free (deliberately
+left unfixed per rule 0.3 pending an API-contract decision — the
+`kes_cache_flush_extent()` race and `block_count == 0` gap that used
+to sit alongside it are both now fixed, see `PENDING_ITEMS.md`'s
+`## Resolved` section), and the smaller non-concurrency gaps
+`PENDING_ITEMS.md` catalogs (load-failure entries never auto-retrying,
+etc.).
 
 **`plan_phase5.md` is the detailed execution record for that Phase
 5/6 work** — a task-by-task breakdown (exact files added/edited, exact

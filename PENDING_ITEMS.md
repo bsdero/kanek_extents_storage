@@ -22,31 +22,31 @@ build) passes clean -- 92/92 tests across all 12 test binaries
 `test_kes_crash_consistency`, `test_kes_fuzz`, `test_kes_soak`).
 
 **`kes_cache_flush_extent()`'s `KES_EXTENT_LOADING` race is now
-FIXED** -- see the "`kes_cache_flush_extent()` vs. in-flight load
-race (FIXED)" entry under Resolved below for the fix and the evidence
-that `make tsan` is now clean (previously this reproduced often
-enough to fail even a 2-second `make tsan` smoke run; see the
-Track A.7.2 entry for the original finding).
+FIXED and CLOSED** -- see the "`kes_cache_flush_extent()` vs.
+in-flight load race (FIXED, CLOSED)" entry under Resolved below for
+the fix and the evidence that `make tsan` is now clean (re-verified
+this pass: `make tsan` exits 0, no data race reported anywhere near
+`kes_cache_flush_extent`; previously this reproduced often enough to
+fail even a 2-second `make tsan` smoke run -- see the Track A.7.2
+entry, also now marked CLOSED, for the original finding).
 
-**`make check-all` is STILL NOT currently reliably clean, but for a
-different, unrelated, already-documented reason**: `block_count == 0`
-is not validated in `kes_cache_get_extent()` (flagged at A.1.3 below),
-so the miss path reaches `aligned_alloc(64, 0)`; glibc returns
-non-NULL and nothing crashes, but Valgrind's Memcheck flags the
-zero-size call itself, failing `make valgrind`/`make check-all` via
-their `--error-exitcode=1`. See the "Update" note under A.1.3 below
-for the full citation trail. `make test`/`make asan`/`make tsan` all
-stay clean regardless -- only Valgrind's stricter zero-size check
-surfaces this. This is a real, reported, deliberately NOT-fixed gap
-(rule 0.3), not a regression to chase.
+**`block_count == 0` is now FIXED and CLOSED** -- see the "`block_count
+== 0` rejected in `kes_cache_get_extent()` (FIXED, CLOSED)" entry
+under Resolved below for the fix and the evidence. `make check-all`
+was re-run for real after the fix (not assumed clean): **exit 0, "ALL
+CHECKS PASSED"** -- `make test`/`make asan`/`make tsan`/`make
+valgrind` all clean in sequence. `make check-all` is now reliably
+clean end-to-end for everything this repo currently gates on.
 
-Separately, the `kes_cache_destroy()` vs. concurrent-access
-use-after-free (Track A.3.1 below) also remains unfixed, but does
-**not** itself gate any Makefile target: the test that demonstrates it
-deliberately forks a disposable child process to contain the crash,
-and neither Valgrind's `--error-exitcode` nor a sanitizer's exit
-status for the *parent* process reflects what happens inside that
-forked child.
+The `kes_cache_destroy()` vs. concurrent-access use-after-free (Track
+A.3.1 below) remains unfixed, but does **not** itself gate any
+Makefile target: the test that demonstrates it deliberately forks a
+disposable child process to contain the crash, and neither Valgrind's
+`--error-exitcode` nor a sanitizer's exit status for the *parent*
+process reflects what happens inside that forked child -- confirmed
+again in this `make check-all` run (the only TSan/Valgrind findings
+are all inside that forked child, at `kes_cache_destroy`/
+`destroy_race_thread`, and the overall run still exited 0).
 
 Do not assume any of the above stays true without rerunning it -- see
 `KES_HARDENING_PLAN.md` §0's standing rule about pasted evidence.
@@ -231,6 +231,87 @@ Verified: `make test` 72/72 across all 7 binaries (was 70/70
 baseline; +2 from this file). `make asan` (full clean rebuild, all 7
 binaries including `test_kes_fuzz`) exits 0 with no
 AddressSanitizer/UBSan/LeakSanitizer output anywhere in the log.
+
+### `kes_cache_flush_extent()` vs. in-flight load race (FIXED, CLOSED)
+
+**Closes the Track A.7.2 finding below and the matching `make check-all`
+bookkeeping-run bullet.** Fixed in commit `97ab19a` ("Bugs fixed.").
+
+- Was: `kes_cache_flush_extent()` checked only `entry->state &
+  KES_EXTENT_DIRTY` before reading `entry->data` under `entry->lock`,
+  unlike `sweep_flush_and_maybe_evict()`, which also requires
+  `!(entry->state & KES_EXTENT_LOADING)`. Since
+  `kes_cache_get_extent()`'s cache-miss path publishes the entry
+  (state `KES_EXTENT_LOADING`) and then calls `read_extent()`
+  (writing `entry->data`) *without* holding `entry->lock` by design,
+  and `kes_cache_mark_dirty()` is legal on a still-loading entry
+  (state can be `LOADING | DIRTY`), a concurrent
+  `kes_cache_flush_extent()` call could read `entry->data` while the
+  original load's unlocked write was still in flight -- a genuine,
+  TSan-confirmed data race, first caught by the Track A.7.2 soak run
+  and reproducible even in a 2-second `make tsan` smoke run.
+- Fix: `kes_cache_flush_extent()` (`src/kes_cache.c`, immediately
+  after acquiring `entry->lock`) now waits out an in-flight load the
+  same way `kes_cache_get_extent()`'s own "attach to an in-flight
+  load" branch does -- incrementing `entry->cond_waiters` and looping
+  on `pthread_cond_wait( &entry->cond, &entry->lock)` while
+  `entry->state & KES_EXTENT_LOADING`, so `try_evict_entry_locked()`
+  won't free the entry out from under the wait -- before the existing
+  `KES_EXTENT_DIRTY` check runs.
+- Verified (this pass, re-run to confirm rather than trusting the
+  commit message): `make tsan` -- clean, exit 0. The only
+  `ThreadSanitizer: data race` reports in the full log are all at
+  `kes_cache_destroy` (`src/kes_cache.c:776`/`779`/`787`), which is
+  the separate, still-open, deliberately-unfixed Track A.3.1 race
+  contained inside a forked child process (does not gate the `tsan`
+  target) -- no report anywhere at `kes_cache_flush_extent`/line
+  ~1202 this run, where the fixed race used to reproduce reliably.
+  `make test`: all binaries still pass (92/92 baseline unaffected --
+  this is a pure concurrency fix, no new test cases added in this
+  commit).
+- **Not closed by this fix**: the related-but-distinct A.4.1 finding
+  that `kes_cache_flush_extent()` doesn't set `KES_EXTENT_ERROR` on a
+  *write* failure the way `sweep_flush_and_maybe_evict()` does (it
+  only returns `KES_ERROR_IO`) is a separate behavioral inconsistency,
+  confirmed still present by reading the current
+  `kes_cache_flush_extent()` body (`src/kes_cache.c` around line
+  1247-1250) -- still open, see A.4.1 below.
+
+### `block_count == 0` rejected in `kes_cache_get_extent()` (FIXED, CLOSED)
+
+**Closes Track A.1.3 below and the matching `make check-all`
+bookkeeping-run bullet.**
+
+- Was: `kes_cache_get_extent()` validated `id->block_size` (A.1.2) but
+  never `id->block_count`. A request with `block_count == 0` fell
+  through to `extent_data_size()` computing `0 * block_size == 0` and
+  `aligned_alloc(64, 0)`, which glibc returns non-NULL for on this
+  platform -- producing a "successful" but nonsensical 0-byte cached
+  entry instead of an error. No crash, no oversized-allocation risk,
+  but Valgrind's Memcheck flags the zero-size `aligned_alloc()` call
+  itself, failing `make valgrind`/`make check-all` via their
+  `--error-exitcode=1`.
+- Fix: `kes_cache_get_extent()` (`src/kes_cache.c`) now rejects
+  `id->block_count == 0` with `KES_ERROR_INVALID` before any
+  allocation is attempted, immediately after the existing
+  `id->block_size` guard (A.1.2) and before `*buffer` is touched --
+  same shape, same place in the function, same error code.
+  `tests/test_kes_cache_edge.c`'s `test_block_count_zero_and_max`
+  updated to assert `KES_ERROR_INVALID`/`buf == NULL` for the
+  `block_count == 0` case instead of the old "succeeds with a 0-byte
+  buffer" assertion; the `block_count == UINT32_MAX` half of that test
+  (expects `KES_ERROR_BUSY`) is untouched.
+- Verified: `make test` (92/92, no regressions), `make asan` (clean),
+  code review pass (no defects). Then `make check-all` re-run in full
+  from a clean tree: **exit 0, "ALL CHECKS PASSED"** --
+  test/asan/tsan/valgrind all clean in sequence, including Valgrind
+  (previously the one target this gap failed). The only TSan/Valgrind
+  findings anywhere in that run are the already-known, non-gating
+  `kes_cache_destroy()` race (Track A.3.1) inside its disposable
+  forked child.
+- **Not closed by this fix**: the `kes_cache_destroy()` vs.
+  concurrent-access use-after-free (Track A.3.1) -- unrelated, still
+  open, still deliberately unfixed pending an API-contract decision.
 
 ### Phase 6 -- documentation truth pass (DONE)
 
@@ -463,14 +544,18 @@ evidence:
   now rejects an invalid `id->block_size` with `KES_ERROR_INVALID`
   before any allocation is attempted.
 - **A.1.3** (`test_block_count_zero_and_max`): `block_count == 0`
-  currently produces a valid 0-byte cached entry (`aligned_alloc(64,
-  0)` returns non-NULL on this platform) -- asserted as observed
-  behavior, flagged below as a real but minor, not-yet-fixed gap.
-  `block_count == UINT32_MAX` is cleanly rejected as
+  originally produced a valid 0-byte cached entry (`aligned_alloc(64,
+  0)` returns non-NULL on this platform) -- asserted at the time as
+  observed behavior, flagged as a real but minor gap. **Since FIXED
+  and CLOSED** -- see the "`block_count == 0` rejected in
+  `kes_cache_get_extent()` (FIXED, CLOSED)" entry under Resolved
+  above; the test now asserts `KES_ERROR_INVALID`/`buf == NULL`
+  instead. `block_count == UINT32_MAX` is cleanly rejected as
   `KES_ERROR_BUSY` (the `max_memory` capacity check in
   `make_room_for_new_entry()` fails before any allocation is
   attempted for the resulting ~16TiB request) -- not the `NOMEM` the
-  original plan speculated.
+  original plan speculated. This half was never broken and is
+  unchanged by the fix.
 - **A.1.4** (`test_start_block_near_max_no_size_wrap`): confirmed by
   reading `src/kes_cache.c` that `id->start_block` is only ever used
   for hashing/equality/logging in this module, never in size
@@ -543,14 +628,13 @@ evidence:
   run under both per the plan's concurrency rule) -- no crash, no
   ASan/TSan finding, in either.
 
-Real gap found but deliberately NOT fixed in this pass, per rule 0.3
-(no drive-by fixes -- reported instead): **`block_count == 0` is not
-validated anywhere in `kes_cache_get_extent()`** and currently
-produces a "successful" but nonsensical 0-byte cached entry rather
-than being rejected with `KES_ERROR_INVALID`. Low severity (no crash,
-no oversized-allocation risk, unlike the `UINT32_MAX` case which *is*
-already handled cleanly) but worth a small follow-up guard alongside
-the `block_size` check A.1.2 added.
+Real gap found in this pass, initially left deliberately NOT fixed per
+rule 0.3 (no drive-by fixes -- reported instead): `block_count == 0`
+was not validated anywhere in `kes_cache_get_extent()` and produced a
+"successful" but nonsensical 0-byte cached entry rather than being
+rejected with `KES_ERROR_INVALID`. **Since fixed as its own follow-up
+piece of work** -- see the "`block_count == 0` rejected in
+`kes_cache_get_extent()` (FIXED, CLOSED)" entry under Resolved above.
 
 `make test` after this pass: 81/81 (was 70/70 baseline -- 11 new
 tests added: 9 in `tests/test_kes_cache_edge.c`, 1 in the new
@@ -728,7 +812,7 @@ each:
 
 ---
 
-### Phase 5 progress -- Track A.7.2: `make soak` -- 10-minute run (DONE, real TSan-confirmed data race found and FLAGGED, NOT FIXED)
+### Phase 5 progress -- Track A.7.2: `make soak` -- 10-minute run (DONE, real TSan-confirmed data race found and FLAGGED; race since FIXED -- see "Resolved" above -- CLOSED)
 
 New `tests/test_kes_soak.c` (plan_phase5.md Track A.7.2): extends
 `test_concurrent_sync_vs_get_put`'s shape (`tests/test_kes_cache.c`)
@@ -815,7 +899,18 @@ produced the first automated, reproducible confirmation):
   run demonstrates the same gap is a genuine, TSan-confirmed data race
   under real concurrent load, not just a bookkeeping quirk.
 
-**Not fixed** -- per rule 0.3, this is reported, not silently patched.
+**Not fixed at the time this section was written** -- per rule 0.3,
+this was reported, not silently patched, in the commit that added
+this test. **Since fixed in commit `97ab19a`** by adding exactly the
+condvar-wait shape speculated below (waiting out
+`KES_EXTENT_LOADING` on `entry->cond`/`cond_waiters`, mirroring
+`kes_cache_get_extent()`'s own reader-side wait) -- see the
+"`kes_cache_flush_extent()` vs. in-flight load race (FIXED, CLOSED)"
+entry under `## Resolved` above for the fix and re-verification
+evidence (`make tsan` clean, no report at `kes_cache_flush_extent`).
+This paragraph is left in place as the historical record of the
+original finding:
+
 The fix is almost certainly to add the same `!(entry->state &
 KES_EXTENT_LOADING)` guard `sweep_flush_and_maybe_evict()` already
 uses (or block/wait on the loading condvar the way `kes_cache_get_extent()`'s
@@ -844,12 +939,16 @@ than silently adding a workaround (e.g. excluding `test_kes_soak`'s
 short default form from `make tsan`) that would hide a real,
 reproducible bug behind a green build.
 
+**CLOSED as of commit `97ab19a`** -- see the "Resolved" entry above;
+`make tsan` re-run clean after the fix, no further action needed
+here.
+
 A.7.1 (perf smoke) was intentionally left undone: the plan marks it
 optional/stretch, explicitly non-blocking, "do not block finishing
 this plan on this item" -- skipped in favor of finishing the required
 A.7.2 soak run and the plan-wide bookkeeping below.
 
-### `make check-all` bookkeeping run -- one real Makefile gap found and FIXED, one real code bug found and left NOT FIXED
+### `make check-all` bookkeeping run -- one real Makefile gap found and FIXED, one real code bug found and left NOT FIXED at the time (since FIXED -- CLOSED)
 
 Running `make check-all` for real (the plan_phase5.md S6 gate before
 updating `AGENTS.md`'s Ground Truth section) surfaced two distinct
@@ -866,17 +965,24 @@ issues, one fixed here and one deliberately not:
   is a test-harness fix (making the sanitizer behave as intended for
   a test that deliberately induces OOM), not a production-code change,
   so it is not a rule-0.3 "drive-by fix."
-- **Not fixed**: with that gap closed, `make tsan` still fails
-  intermittently -- see the "Update, discovered while completing the
-  plan-wide `make check-all` bookkeeping gate" paragraph above. This
-  is the real, already-documented `kes_cache_flush_extent()` vs.
-  `KES_EXTENT_LOADING` race, not a new bug, but it means **`make
-  check-all` cannot currently be reported as reliably clean** -- it is
-  gated on a real, known, unfixed concurrency bug that the plan's own
-  new soak test (Track A.7.2) is working exactly as intended by
-  surfacing. `AGENTS.md`'s Ground Truth section below is updated to
-  state this precisely rather than claim a clean `check-all` that
-  is not actually reproducible on demand.
+- **Was not fixed at the time this section was written**: with that
+  gap closed, `make tsan` still failed intermittently -- see the
+  "Update, discovered while completing the plan-wide `make check-all`
+  bookkeeping gate" paragraph above. This was the real,
+  already-documented `kes_cache_flush_extent()` vs.
+  `KES_EXTENT_LOADING` race, not a new bug. **CLOSED as of commit
+  `97ab19a`** -- see the "`kes_cache_flush_extent()` vs. in-flight
+  load race (FIXED, CLOSED)" entry under `## Resolved` above;
+  `make tsan` now re-runs clean. The remaining `block_count == 0`
+  Memcheck-gating gap (A.1.3) is **also now fixed and closed** -- see
+  the "`block_count == 0` rejected in `kes_cache_get_extent()` (FIXED,
+  CLOSED)" entry under `## Resolved` above. With both closed,
+  `make check-all` was re-run for real (not assumed): **exit 0, "ALL
+  CHECKS PASSED."** The only remaining open item is:
+  - The `kes_cache_destroy()` vs. concurrent-access use-after-free
+    (Track A.3.1) remains unfixed, though it does not itself gate any
+    Makefile target (contained in a forked child process) -- see that
+    section.
 
 ## Infrastructure notes for whoever picks this up
 

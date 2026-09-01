@@ -829,6 +829,20 @@ int kes_cache_get_extent( kes_cache_t *cache,
         return(KES_ERROR_INVALID);
     }
 
+    /*
+     * A block_count of 0 describes an extent with no blocks at all --
+     * a meaningless request. Without this guard it falls through to
+     * extent_data_size() computing 0 and aligned_alloc(64, 0), which
+     * glibc happily returns non-NULL for, producing a "successful"
+     * but nonsensical 0-byte cached entry (see PENDING_ITEMS.md,
+     * item A.1.3, and the Valgrind Memcheck finding it cites).
+     */
+    if ( id->block_count == 0) {
+        TRACE_ERR( "kes_cache_get_extent: invalid id->block_count 0 "
+                   "(extent must span at least one block)");
+        return(KES_ERROR_INVALID);
+    }
+
     *buffer = NULL;
 
     /* Fast-path lookup: avoids building a candidate entry for the

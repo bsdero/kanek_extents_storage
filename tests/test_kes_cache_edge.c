@@ -253,21 +253,20 @@ static bool test_get_extent_rejects_non_power_of_2_block_size(void) {
  * A.1.3 -- block_count = 0 / UINT32_MAX in a kes_extent_id_t passed
  * to kes_cache_get_extent().
  *
- * block_count = 0: extent_data_size() (src/kes_cache.c) computes
- * (size_t)0 * block_size == 0. Reading further: extent_alloc_data()
- * calls aligned_alloc(64, KES_ALIGN(0, 64)) i.e. aligned_alloc(64, 0)
- * -- on this platform's glibc that returns a valid non-NULL, zero-
- * size, freeable pointer (confirmed empirically, not assumed), so
- * the miss path proceeds normally: the mock read_extent callback is
- * invoked with size == 0 and the call succeeds, producing a real but
- * empty (0-byte) cached entry. Nothing here crashes, corrupts state,
- * or leaks, so this is asserted as-is (KES_SUCCESS, non-NULL buffer)
- * rather than an assumed rejection -- block_count == 0 is simply not
- * validated anywhere in this module today. This is a real, minor gap
- * (a 0-block extent is a nonsensical request) but is NOT the same
- * class of bug as the UINT32_MAX case below (no oversized allocation
- * risk, no crash risk), so per rule 0.3 it is reported rather than
- * silently fixed here -- see this pass's final report.
+ * block_count = 0: previously fell through to extent_data_size()
+ * computing (size_t)0 * block_size == 0, then extent_alloc_data()
+ * calling aligned_alloc(64, KES_ALIGN(0, 64)) i.e. aligned_alloc(64,
+ * 0) -- on this platform's glibc that returns a valid non-NULL,
+ * zero-size, freeable pointer, so the miss path used to proceed
+ * normally and produce a real but empty (0-byte) cached entry.
+ * Nothing there crashed, corrupted state, or leaked, but it was a
+ * real, minor gap (a 0-block extent is a nonsensical request), also
+ * flagged separately because it is exactly what causes Valgrind's
+ * Memcheck to fail `make valgrind`/`make check-all` on a zero-size
+ * allocation. kes_cache_get_extent() (src/kes_cache.c) now rejects
+ * block_count == 0 with KES_ERROR_INVALID before any allocation is
+ * attempted, mirroring the block_size guard above -- see
+ * PENDING_ITEMS.md for the fix commit.
  *
  * block_count = UINT32_MAX: extent_data_size() computes
  * (size_t)UINT32_MAX * block_size (EDGE_BLOCK_SIZE == 4096) ==
@@ -306,14 +305,13 @@ static bool test_block_count_zero_and_max(void) {
     kes_cache_set_io_callbacks( cache, mock_read, mock_write, mock_sync);
 
     result = kes_cache_get_extent( cache, &zero_count, &buf);
-    TEST_ASSERT( result == KES_SUCCESS,
-                "block_count == 0 currently succeeds with a 0-byte "
-                "cached entry -- observed behavior, not an assumed "
-                "one (see comment above); no crash either way");
-    TEST_ASSERT( buf != NULL,
-                "buffer for a 0-byte entry is still a valid, non-NULL "
-                "pointer (aligned_alloc(64, 0) on this platform)");
-    kes_cache_put_extent( cache, &zero_count);
+    TEST_ASSERT( result == KES_ERROR_INVALID,
+                "block_count == 0 is now cleanly rejected as INVALID "
+                "(a 0-block extent is a meaningless request; see the "
+                "guard added to kes_cache_get_extent())");
+    TEST_ASSERT( buf == NULL,
+                "buffer is left NULL when block_count == 0 is "
+                "rejected");
 
     result = kes_cache_get_extent( cache, &max_count, &buf);
     TEST_ASSERT( result == KES_ERROR_BUSY,
@@ -323,8 +321,9 @@ static bool test_block_count_zero_and_max(void) {
                 "trying to allocate ~16TiB");
 
     kes_cache_destroy( cache);
-    TEST_SUCCESS( "block_count == 0 / UINT32_MAX handled without "
-                  "crash or unbounded allocation");
+    TEST_SUCCESS( "block_count == 0 rejected as INVALID, "
+                  "block_count == UINT32_MAX handled without crash "
+                  "or unbounded allocation");
 }
 
 /* ================================================================
