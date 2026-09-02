@@ -261,11 +261,13 @@ bookkeeping-run bullet.** Fixed in commit `97ab19a` ("Bugs fixed.").
 - Verified (this pass, re-run to confirm rather than trusting the
   commit message): `make tsan` -- clean, exit 0. The only
   `ThreadSanitizer: data race` reports in the full log are all at
-  `kes_cache_destroy` (`src/kes_cache.c:776`/`779`/`787`), which is
-  the separate, still-open, deliberately-unfixed Track A.3.1 race
-  contained inside a forked child process (does not gate the `tsan`
-  target) -- no report anywhere at `kes_cache_flush_extent`/line
-  ~1202 this run, where the fixed race used to reproduce reliably.
+  `kes_cache_destroy` (`src/kes_cache.c:776`/`779`/`787`), which was
+  at the time the separate, still-open, deliberately-unfixed Track
+  A.3.1 race contained inside a forked child process (did not gate
+  the `tsan` target) -- that race is now also fixed and closed, see
+  the "Track A.3.1" entry under `## Resolved` -- no report anywhere
+  at `kes_cache_flush_extent`/line ~1202 this run, where the fixed
+  race used to reproduce reliably.
   `make test`: all binaries still pass (92/92 baseline unaffected --
   this is a pure concurrency fix, no new test cases added in this
   commit).
@@ -306,12 +308,171 @@ bookkeeping-run bullet.**
   from a clean tree: **exit 0, "ALL CHECKS PASSED"** --
   test/asan/tsan/valgrind all clean in sequence, including Valgrind
   (previously the one target this gap failed). The only TSan/Valgrind
-  findings anywhere in that run are the already-known, non-gating
+  findings anywhere in that run were the already-known, non-gating
   `kes_cache_destroy()` race (Track A.3.1) inside its disposable
-  forked child.
-- **Not closed by this fix**: the `kes_cache_destroy()` vs.
-  concurrent-access use-after-free (Track A.3.1) -- unrelated, still
-  open, still deliberately unfixed pending an API-contract decision.
+  forked child -- since fixed and closed, see the "Track A.3.1" entry
+  under `## Resolved`.
+- **Not closed by this fix**: at the time, the `kes_cache_destroy()`
+  vs. concurrent-access use-after-free (Track A.3.1) was unrelated,
+  still open, still deliberately unfixed pending an API-contract
+  decision -- that decision was made and implemented separately, see
+  the "Track A.3.1" entry under `## Resolved`.
+
+### Track A.3.1 -- `kes_cache_destroy()` use-after-free under concurrent access (FIXED, CLOSED)
+
+**Closes the "Phase 5 progress -- Track A.3.1" finding and the "Track
+A.3.1 fix plan" design section, both formerly below this point (see
+git history for their original text) -- this is the fix that plan
+described, implemented as specified.**
+
+- Was: `kes_cache_destroy()` walked `cache->mru_head` unconditionally,
+  freeing every entry's data buffer, destroying its `lock`/`cond`, and
+  `free()`-ing the struct -- without ever checking `ref_count`/
+  `pin_count`, and without acquiring `entry->lock` while doing so. A
+  standalone repro (one thread in a tight `get_extent()`/
+  `put_extent()` loop, `kes_cache_destroy()` called from another
+  thread ~2ms later) reproduced a heap-use-after-free under ASan on
+  every run, and multiple data races plus "use of an invalid mutex"
+  reports under TSan. The automated regression
+  (`test_cache_destroy_races_concurrent_access`,
+  `tests/test_kes_cache.c`) ran the race inside a forked child process
+  specifically so it couldn't take down the whole test binary, and did
+  not previously assert on the outcome.
+- Fix, in `src/kes_cache.c`/`include/kes/kes_cache.h`:
+  - `kes_cache_destroy()` now walks the LRU list the same
+    lookup-pin-protected way `cache_sweep()` already does (pin the
+    next node via `lookup_pins` under `cache_lock` before releasing it
+    and processing the current node), then calls
+    `try_evict_entry_locked( cache, entry, true /* discard_dirty */)`
+    per node -- the same `ref_count == 0 && pin_count == 0 &&
+    cond_waiters == 0 && lookup_pins == 0` eligibility check every
+    other evictor in this file already uses -- instead of freeing
+    directly. Deliberately does NOT pin traversal nodes via
+    `entry->ref_count` itself; that specific approach is the one the
+    Phase 3 entry above already documents as tried and
+    ASan-confirmed broken.
+  - A new `uint32_t inflight_lookups` field on `kes_cache_t`, protected
+    by `cache_lock` only, closes a residual gap `ref_count` alone
+    can't cover: a brand-new `kes_cache_get_extent()` miss publishes
+    its candidate into the hash table (`hash_find_or_insert()`)
+    *before* it takes `cache_lock` to add it to the LRU list -- a
+    `destroy()` call observing an empty LRU list at exactly that
+    instant could otherwise free `cache->buckets`/`cache->cache_lock`/
+    `cache` itself while that `get_extent()` call is still about to
+    touch them. `kes_cache_get_extent()` increments this counter once,
+    right after its existing `block_size`/`block_count` validation,
+    and decrements it (also under `cache_lock`) on every subsequent
+    return path -- six call sites total: the cache-full `BUSY` path,
+    both candidate-allocation `NOMEM` paths, the win-the-race insert
+    bookkeeping block (before the actual `read_extent()` I/O, per this
+    project's "never hold cache-wide locks across I/O" discipline),
+    the hit-path `KES_EXTENT_ERROR` early return, and the hit-path
+    success block (which also covers the lose-the-race fallthrough,
+    since both routes converge on that one block). Never held across
+    the `read_extent()` call itself.
+  - A new `bool destroying` field, also `cache_lock`-protected and
+    distinct from the existing `shutdown` bool (`kes_cache_start()`
+    documents `shutdown` as clearable via a `stop()`/`start()` restart
+    cycle -- reusing it here would silently break that), is set by
+    `kes_cache_destroy()` once it commits to tearing the cache down.
+    While set, `kes_cache_get_extent()` rejects new lookups with
+    `KES_ERROR_INVALID`.
+  - `kes_cache_destroy()` is fail-fast, not blocking: if
+    `inflight_lookups != 0` up front, or the LRU list is non-empty
+    after one eviction pass, it leaves the cache object itself fully
+    intact and usable (resetting `destroying` back to `false` in the
+    latter case) and returns `KES_ERROR_BUSY` -- the same contract
+    `kes_cache_invalidate()` already uses for referenced/pinned
+    entries. New callers are NOT permanently locked out by a
+    `BUSY`-returning `destroy()` attempt; only a call that returns
+    `KES_SUCCESS` makes that rejection permanent.
+  - A real bug was caught by this change's own `make tsan` run before
+    landing: the `BUSY`-path `TRACE_ERR()` call originally read
+    `cache->inflight_lookups` for its log message *after* `cache_lock`
+    had already been unlocked -- an unlocked read racing
+    `kes_cache_get_extent()`'s locked increment/decrement of the same
+    field, caught as a TSan data race at `kes_cache_destroy()`'s
+    `TRACE_ERR` line. Fixed by capturing the value into a local
+    variable before unlocking.
+- Fallout from the corrected contract, fixed in the same change: three
+  pre-existing tests (`test_kes_cache_full.c`'s
+  `test_kes_cache_pin_unpin`/`test_kes_cache_mark_dirty`/
+  `test_kes_cache_flush_extent`/`test_kes_cache_get_stats`, and
+  `test_kes_cache_edge.c`'s `test_destroy_with_outstanding_reference`)
+  called `kes_cache_get_extent()` and never released the reference
+  before `destroy()` -- harmless under the old unconditional-free
+  behavior, but a real ASan-detected leak now that `destroy()`
+  correctly refuses. Fixed by adding the missing `put_extent()` calls
+  (and, for the A.1.6 edge test, rewriting it to assert the new
+  `KES_ERROR_BUSY`/intact-cache/succeeds-once-released contract
+  instead of the old "frees unconditionally" one). `test_kes_fuzz.c`'s
+  `test_cache_invariant_fuzz()` needed a different fix: its random
+  op sequence has no guarantee of ending with every reference
+  released, so it now tracks each pool id's outstanding
+  `ref_count`/`pin_count` locally (bumped only on an operation's own
+  `KES_SUCCESS`) and drains them precisely after the loop, before
+  asserting `destroy()` now succeeds.
+- Test changes: `test_cache_destroy_races_concurrent_access()`
+  (`tests/test_kes_cache.c`) now asserts a clean child exit
+  (`WIFEXITED && WEXITSTATUS == 0`) under both plain and sanitized
+  builds, instead of accepting a crash/sanitizer-kill as documented,
+  expected behavior -- it now proves the fix rather than the bug. A
+  new non-concurrent test, `test_destroy_busy_when_referenced()`,
+  proves the `KES_ERROR_BUSY` contract on a single thread: get an
+  extent, don't put it, `destroy()` returns `BUSY`, `put_extent()`,
+  `destroy()` then returns `SUCCESS`.
+- Verified, actually run (not assumed): `make test` -- **93/93**
+  across all 12 binaries (was 92/92; +1 for the new BUSY test).
+  `make asan` -- clean, exit 0, 0 leak/error findings (confirmed by
+  grepping the full log for `leak`/`AddressSanitizer`/
+  `LeakSanitizer` after the test-hygiene fixes above; before those
+  fixes, this run genuinely caught 280KB+ across two binaries, which
+  is what surfaced the need for them). `make tsan` -- clean, exit 0,
+  no `ThreadSanitizer` warnings anywhere in the log, including inside
+  the destroy-race child that used to reliably trip it (this is also
+  what caught the unlocked-`TRACE_ERR`-read bug above, before this
+  entry was written).
+- `make check-all`'s Valgrind phase caught one more thing on the
+  first real run, unrelated to `kes_cache_destroy()` itself: the
+  destroy-race child's forked process (Valgrind auto-follows `fork()`
+  in this setup, giving each forked child its own independent
+  memcheck instance/report) reported "3 errors from 3 contexts,
+  possibly lost: 1,088 bytes in 4 blocks" -- all `calloc` via glibc's
+  `allocate_dtv`/`_dl_allocate_tls`/`allocate_stack`/`pthread_create`,
+  i.e. cached-but-unreferenced thread-stack TLS blocks from two
+  *earlier*, unrelated tests in the same binary
+  (`test_concurrent_sync_vs_get_put`/
+  `test_concurrent_miss_no_duplicate_entry`) that the child inherited
+  at `fork()` time. `--error-exitcode=1` makes Valgrind override a
+  traced process's own exit status with 1 whenever it finds any
+  memcheck error in that process -- so the child's real exit status
+  (0, or whatever `kes_cache_destroy()` actually returned) was being
+  silently replaced with 1 by Valgrind itself, which is exactly what
+  `test_cache_destroy_races_concurrent_access()`'s new clean-exit
+  assertion (this fix, see above) correctly flagged as a failure.
+  Confirmed via a side-by-side `make valgrind` run against the
+  pre-fix tree (`git worktree add ... ab1e419`) that this exact
+  "possibly lost: 1,088 bytes in 4 blocks" finding, in the same
+  forked child, already existed before this fix too -- it was simply
+  never asserted on previously, since the old test's assertion always
+  passed regardless of the child's outcome. This is a well-known,
+  benign Valgrind/glibc interaction (glibc caches a joined thread's
+  stack for reuse rather than unmapping it immediately, which
+  Memcheck's conservative reachability scanner can't always prove
+  reachable from a live pointer) -- not a real leak, and not
+  introduced by this fix. Added `valgrind.supp` (repo root) with a
+  suppression matching that specific `pthread_create` stack-allocation
+  pattern, and wired it into the `valgrind` Makefile target via
+  `--suppressions=valgrind.supp`. Re-verified after adding it: the
+  same child now reports "possibly lost: 0 bytes in 0 blocks...
+  suppressed: 3 from 3", exits 0, and the destroy-race test passes
+  under `make valgrind` alone.
+- `make check-all` -- re-run in full from a clean tree with the
+  suppression file in place: exit 0, "ALL CHECKS PASSED".
+- **Not closed by this fix**: allocation strategies beyond first-fit
+  (KES-2), the missing bitmap checksum (KES-6), and unsynchronized
+  cross-process storage access (KES-5) are all separate, unrelated
+  gaps -- see `PENDING_FIXES_SEP2026.md`.
 
 ### Phase 6 -- documentation truth pass (DONE)
 
@@ -414,69 +575,17 @@ see "Cross-process synchronized extent I/O test" above) adds the
 first real multi-process (`fork()`-based) coverage, distinct from
 every other test binary's thread-based concurrency.
 
-### Phase 5 progress -- Track A.3.1: `kes_cache_destroy()` vs concurrent access (DONE, real bug found and FLAGGED, NOT FIXED)
+### Phase 5 progress -- Track A.3.1: `kes_cache_destroy()` vs concurrent access (DONE -- FIXED, CLOSED)
 
-`Cache Destroy Races Concurrent Access` added to `tests/test_kes_cache.c`
-(plan_phase5.md Track A.3.1). Reading `kes_cache_destroy()`
-(`src/kes_cache.c`) first, before writing any assertion, established
-its actual contract: it calls `kes_cache_stop()` (which only joins
-*background* flush threads started by `kes_cache_start()`), then
-walks the LRU list under `cache_lock`, freeing each entry's data
-buffer, destroying `entry->lock`/`entry->cond`, and `free()`ing the
-entry struct -- without ever acquiring `entry->lock` while doing so
-and without checking `ref_count`/`pin_count` first. Nothing waits
-for, rejects, or otherwise coordinates with a caller still inside
-`kes_cache_get_extent()`/`kes_cache_put_extent()` on the same cache.
-The actual, currently-inferred contract is therefore "the caller
-must quiesce every other thread using this cache before calling
-`kes_cache_destroy()`" -- not "`destroy()` is safe to call
-concurrently." `include/kes/kes_cache.h` does not state this
-explicitly today.
-
-**This is a genuine, confirmed bug, per rule 0.3 reported here and
-NOT fixed in this commit.** A standalone, minimal reproduction
-(one thread in a tight `get_extent()`/`put_extent()` loop,
-`kes_cache_destroy()` called from another thread ~2ms later) was
-built outside the test tree and run under both sanitizers:
-
-- **ASan**: heap-use-after-free -- `lru_remove()`
-  (`src/kes_cache.c:125`) reads a `kes_extent_entry_t` already freed
-  by `kes_cache_destroy()` (`src/kes_cache.c:779`). Reproduced on
-  every run of the standalone repro.
-- **TSan**: multiple data races on the freed entry's lock/fields
-  (`kes_cache_destroy()` vs. `kes_cache_get_extent()`/
-  `kes_cache_put_extent()`), plus explicit "heap-use-after-free" and
-  "use of an invalid mutex (e.g. uninitialized or destroyed)"
-  reports -- all pointing at the same destroy()-vs-get/put
-  interleaving.
-
-The automated `tests/test_kes_cache.c` version of this race runs the
-racer threads and `kes_cache_destroy()` inside a forked, disposable
-child process (mirroring `test_cross_process_racing_io()`'s pattern
-in `tests/test_kes_multiprocess.c`) precisely so this real,
-unfixed use-after-free cannot nondeterministically crash the whole
-test binary: the parent test process only asserts that it observes
-the child end (cleanly or via a sanitizer-reported crash) without
-hanging or itself crashing, and prints which outcome occurred. Under
-`make tsan` this reliably shows the child exiting with TSan's
-nonzero status (66) on every observed run; under `make asan` it has
-not been observed to reproduce inside this specific multi-threaded
-test-binary timing, even though the same bug reproduces every time
-in the separate, simpler standalone repro described above (a known
-ASan-detection timing artifact, not evidence the bug is
-ASan-specific). `make test`/`make asan`/`make tsan` all still pass
-71/71 -- the test's own assertions do not depend on the race
-actually triggering.
-
-**Not fixed** -- deciding between "make `kes_cache_destroy()`
-synchronize with in-flight callers" and "document
-caller-must-quiesce-first and let callers enforce it" is a real API
-contract decision, not a bug fix, and is out of scope for this
-commit per rule 0.3. Whoever picks this up next should read the
-`Cache Destroy Races Concurrent Access` test's doc comment in
-`tests/test_kes_cache.c` (immediately above
-`test_cache_destroy_races_concurrent_access()`) for the full
-citation trail before deciding.
+`Cache Destroy Races Concurrent Access` (`tests/test_kes_cache.c`,
+plan_phase5.md Track A.3.1) found a real, confirmed
+`kes_cache_destroy()` use-after-free under concurrent access, and a
+design session on 2026-09-02 produced an agreed fix plan for it. Both
+the original finding and that fix plan's full detail have been moved
+into the "Track A.3.1" entry under `## Resolved` above, now that the
+fix itself is implemented, tested, and closed -- see that entry (and
+its git history, for the finding/plan's original text) rather than
+this pointer.
 
 ### Phase 5 progress -- Track A.3.2: `make stress` harness (DONE)
 
@@ -978,11 +1087,61 @@ issues, one fixed here and one deliberately not:
   the "`block_count == 0` rejected in `kes_cache_get_extent()` (FIXED,
   CLOSED)" entry under `## Resolved` above. With both closed,
   `make check-all` was re-run for real (not assumed): **exit 0, "ALL
-  CHECKS PASSED."** The only remaining open item is:
-  - The `kes_cache_destroy()` vs. concurrent-access use-after-free
-    (Track A.3.1) remains unfixed, though it does not itself gate any
-    Makefile target (contained in a forked child process) -- see that
-    section.
+  CHECKS PASSED."** The `kes_cache_destroy()` vs. concurrent-access
+  use-after-free (Track A.3.1), the one item still open at the time
+  this paragraph was written, is now **also fixed and closed** -- see
+  the "Track A.3.1" entry under `## Resolved` above.
+
+## Open items from ad-hoc review (2026-09-01, not yet in a plan track)
+
+Found while reviewing current repo state against `AGENTS.md`/this
+file; none of these were previously called out as their own item, so
+recorded here rather than assumed covered by the "allocation
+strategies beyond first-fit" one-liner in the summary above.
+
+### `kes_extent_allocate()` silently substitutes first-fit for unimplemented strategies (OPEN, not fixed)
+
+`kes_allocation_strategy_t` (`include/kes/kes_types.h:58-64`) declares
+`KES_ALLOC_FIRST_FIT`/`BEST_FIT`/`WORST_FIT`/`NEXT_FIT` as public,
+settable enum values (`kes_storage_config_t.strategy`,
+`include/kes/kes_types.h:103`) -- a caller can set
+`KES_ALLOC_BEST_FIT` today with no compile or runtime error. But
+`kes_extent_allocate()`'s strategy dispatch (`src/kes_storage.c:269-274`)
+is:
+
+```c
+switch ( storage->strategy) {
+    case KES_ALLOC_FIRST_FIT:
+    default:
+        result = allocate_extent_first_fit( storage, request, extent);
+        break;
+}
+```
+
+Only `KES_ALLOC_FIRST_FIT` has an explicit case; every other value
+(including the three declared-but-unimplemented ones) falls through
+`default:` to `allocate_extent_first_fit()` with no error and no log
+line -- a caller who explicitly asks for `BEST_FIT` silently gets
+`FIRST_FIT` placement instead, with no signal anything different
+happened. This is the same category of gap the cache layer already
+guards against deliberately: `kes_cache_create()` (`src/kes_cache.c`)
+returns `NULL` for `KES_CACHE_LFU`/`KES_CACHE_CUSTOM` rather than
+silently falling back to LRU (see "Phase 3" under Resolved above).
+`kes_extent_allocate()`/`kes_storage_open()` have no equivalent guard
+for the allocation-strategy enum. Not covered by any existing test
+(`test_kes_storage_full.c`/`test_kes_storage_edge.c` never set
+`strategy` to anything but the default/`FIRST_FIT`).
+
+**Not fixed here** -- per rule 0.3, reported rather than patched
+inline. Two independent decisions for whoever picks this up: (1)
+should the short-term fix be rejecting `BEST_FIT`/`WORST_FIT`/`NEXT_FIT`
+at `kes_storage_open()` or `kes_extent_allocate()` time (mirroring the
+cache layer's pattern) until they're implemented for real, and (2) is
+implementing them the actual goal (`KES_HARDENING_PLAN.md` still
+describes `allocate_extent_first_fit()`'s sibling functions as the
+main remaining piece of work, but has no section written for *how* to
+implement best/worst/next-fit the way it does for the cache-layer
+work above).
 
 ## Infrastructure notes for whoever picks this up
 

@@ -44,7 +44,7 @@ and wrong. Concretely, as of this writing:
   still no LFU or Clock eviction logic anywhere, despite both being
   described as complete in older versions of `docs/CONTINUATION_PROMPT.md`.
 - Verified as of this writing: `make test` (plain, unsanitized build)
-  passes clean — 92/92 tests across all twelve test binaries
+  passes clean — 93/93 tests across all twelve test binaries
   (`test_kes_minimal`, `test_kes_bitmap_full`, `test_kes_storage_full`,
   `test_kes_storage_edge`, `test_kes_cache`, `test_kes_cache_edge`,
   `test_kes_cache_full`, `test_kes_multiprocess`,
@@ -129,16 +129,16 @@ picking up any cache or storage work. Phase 5 (test expansion,
 `plan_phase5.md` Track A) and Phase 6 (docs truth pass, Track B) are
 both **complete**: `KES_HARDENING_PLAN.md` §6's edge-case/fault-
 injection/crash-consistency/fuzz/soak-test matrix is fully covered
-(92/92 tests across 12 binaries, `make test`), and the 8 remaining
+(93/93 tests across 12 binaries, `make test`), and the 8 remaining
 `docs/` files got their truth pass. What remains: allocation
-strategies beyond first-fit, the still-open
-`kes_cache_destroy()`-vs-concurrent-access use-after-free (deliberately
-left unfixed per rule 0.3 pending an API-contract decision — the
-`kes_cache_flush_extent()` race and `block_count == 0` gap that used
-to sit alongside it are both now fixed, see `PENDING_ITEMS.md`'s
-`## Resolved` section), and the smaller non-concurrency gaps
+strategies beyond first-fit, and the smaller non-concurrency gaps
 `PENDING_ITEMS.md` catalogs (load-failure entries never auto-retrying,
-etc.).
+etc.). The `kes_cache_destroy()`-vs-concurrent-access use-after-free —
+formerly deliberately left unfixed per rule 0.3 pending an
+API-contract decision — is now also fixed, alongside the
+`kes_cache_flush_extent()` race and `block_count == 0` gap that used
+to sit next to it in this list: see the "Track A.3.1" entry under
+`PENDING_ITEMS.md`'s `## Resolved` section for the full fix.
 
 **`plan_phase5.md` is the detailed execution record for that Phase
 5/6 work** — a task-by-task breakdown (exact files added/edited, exact
@@ -221,7 +221,7 @@ into — unlike KFL).
 ```bash
 make all          # build build/libkes.a and build/libkes.so.1.0.0
 make test-core    # build + run test_kes_minimal only — 9/9 pass, stable
-make test         # build + run all 12 test binaries — 92/92 passing
+make test         # build + run all 12 test binaries — 93/93 passing
                    # (see "Ground truth" above — this is the number
                    # as of this writing, re-verify before trusting it)
 make debug        # DEBUG=1: -g3 -O0 -DDEBUG build

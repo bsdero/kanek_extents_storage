@@ -1631,14 +1631,17 @@ static void *destroy_race_thread( void *arg) {
  * cache, starts DESTROY_RACE_THREAD_COUNT destroy_race_thread()
  * instances, gives them a short head start, then calls
  * kes_cache_destroy() while they may still be mid
- * get_extent()/put_extent(). Never reaches its own _exit(0) on a
- * build where a sanitizer catches the race -- the sanitizer's own
- * abort path ends the process first. On a plain build, where the
- * race may not trip anything visible this particular run, it
- * returns after kes_cache_destroy() and _exit()s -- any
- * still-running racer threads are simply torn down by the OS along
- * with the rest of the process, which is fine since this function
- * only ever runs inside a disposable forked child.
+ * get_extent()/put_extent(). kes_cache_destroy()'s return value is
+ * deliberately ignored here: with the fix (see the big comment
+ * above test_cache_destroy_races_concurrent_access() below),
+ * KES_ERROR_BUSY is a legitimate, expected outcome if any racer
+ * thread still holds a reference at the moment destroy() runs --
+ * given only a 2ms head start and a tight loop, this is likely on
+ * most runs. Either return value proves the same thing: no
+ * use-after-free occurred. Any still-running racer threads (whether
+ * destroy() succeeded or returned BUSY) are simply torn down by the
+ * OS along with the rest of the process, which is fine since this
+ * function only ever runs inside a disposable forked child.
  */
 static void run_destroy_race_child( void) {
     kes_cache_config_t config;
@@ -1674,72 +1677,51 @@ static void run_destroy_race_child( void) {
  * kes_cache_destroy() racing a concurrent get_extent()/put_extent()
  * thread (KES_HARDENING_PLAN.md S6.C / plan_phase5.md A.3.1).
  *
- * kes_cache_destroy()'s current implementation (src/kes_cache.c)
- * calls kes_cache_stop() first, but kes_cache_stop() only joins
- * *background* flush threads started by kes_cache_start() -- it has
- * no way to know about, and does not wait for, a caller's own
- * foreground threads still inside kes_cache_get_extent()/
- * kes_cache_put_extent(). kes_cache_destroy() then walks the LRU
- * list under cache_lock, freeing each entry's data buffer,
+ * This used to be a genuine, confirmed heap-use-after-free: a
+ * standalone, minimal repro of exactly this scenario (one thread in
+ * a tight get_extent()/put_extent() loop, kes_cache_destroy() called
+ * from another thread shortly after) reproduced under ASan
+ * (heap-use-after-free: lru_remove(), src/kes_cache.c:125, reading a
+ * kes_extent_entry_t already freed by kes_cache_destroy()) and
+ * independently under TSan (multiple data races on the freed
+ * entry's lock/fields, plus "heap-use-after-free" and "use of an
+ * invalid mutex" reports). Root cause: kes_cache_destroy() walked
+ * the LRU list under cache_lock, freeing each entry's data buffer,
  * destroying entry->lock/entry->cond, and free()ing the entry
- * struct -- without ever acquiring entry->lock while doing so, and
- * without checking ref_count/pin_count first. Nothing here waits
- * for, rejects, or otherwise coordinates with a caller still inside
- * get_extent()/put_extent() on this same cache. That makes the
- * actual, currently-inferred contract "the caller must quiesce
- * every other thread using this cache before calling
- * kes_cache_destroy()" -- not "destroy() is safe to call
- * concurrently." Nothing in include/kes/kes_cache.h states this
- * explicitly today.
+ * struct -- without ever acquiring entry->lock, and without
+ * checking ref_count/pin_count first.
  *
- * This is not a hypothetical reading of the code: a standalone,
- * minimal repro of exactly this scenario (one thread in a tight
- * get_extent()/put_extent() loop, kes_cache_destroy() called from
- * another thread shortly after) was confirmed under ASan
- * (heap-use-after-free: lru_remove(), src/kes_cache.c:125, reading
- * a kes_extent_entry_t already freed by kes_cache_destroy() at
- * src/kes_cache.c:779) and independently under TSan (multiple data
- * races on the freed entry's lock/fields, plus explicit
- * "heap-use-after-free" and "use of an invalid mutex (e.g.
- * uninitialized or destroyed)" reports), both pointing at the same
- * destroy()-vs-get/put interleaving. See the matching
- * PENDING_ITEMS.md entry for full detail. Per rule 0.3 (no
- * drive-by rewrites), this is reported here as a documented, NOT
- * fixed, known limitation -- not silently patched.
+ * Fixed (see the "Track A.3.1" Resolved entry in PENDING_ITEMS.md
+ * for the full design/citation trail): kes_cache_destroy() now
+ * walks the LRU list the same lookup-pin-protected way cache_sweep()
+ * does, and evicts each entry via try_evict_entry_locked() -- the
+ * same ref_count/pin_count/cond_waiters/lookup_pins eligibility
+ * check every other evictor in this file already uses -- instead of
+ * freeing unconditionally. A new cache-wide inflight_lookups counter
+ * (incremented/decremented under cache_lock by
+ * kes_cache_get_extent()) closes the remaining gap ref_count alone
+ * can't cover: a brand-new entry is published into the hash table
+ * before it is ever added to the LRU list, so a destroy() call
+ * observing an empty LRU list at exactly that moment could otherwise
+ * free cache->buckets/cache->cache_lock/cache itself out from under
+ * a lookup that is still about to touch them. If anything is still
+ * referenced, pinned, waited-on, or mid-lookup, destroy() evicts
+ * whatever it safely can and returns KES_ERROR_BUSY, leaving the
+ * cache object itself fully intact and usable -- it does not block,
+ * and it does not leave the cache half torn down.
  *
- * The automated version of the race below (four racer threads
- * inside a forked child, see run_destroy_race_child()) reliably
- * reproduces the TSan finding -- the child reports it and exits
- * with TSan's nonzero status on every observed run. It has not been
- * observed to reproduce the ASan finding inside this specific
- * multi-threaded/multi-test-binary timing (ASan's use-after-free
- * detector needs the racer thread to actually touch the freed
- * memory before it is reused, which this exact interleaving did not
- * hit in repeated runs here even though the standalone single-
- * threaded repro above hits it every time) -- this is a timing
- * artifact of ASan's detection mechanism, not evidence the bug is
- * ASan-build-specific; the ASan finding above was independently and
- * repeatably confirmed outside this test file.
- *
- * Because the race is a genuine use-after-free, it can crash the
- * process it runs in -- reliably under TSan, confirmed but timing-
- * sensitive under ASan, only intermittently (if at all) under a
- * plain build, since unsynchronized heap corruption does not always
- * trip a visible fault right away. Running the race directly in
- * this test process would make this one assertion
- * nondeterministically bring down the *entire* test binary, failing
- * every other test in the same run, for a bug this task is
- * explicitly told to report rather than fix.
- * So, like test_cross_process_racing_io() in
- * tests/test_kes_multiprocess.c, this test isolates the race inside
- * a forked child process: the child is disposable, and this test's
- * pass/fail criterion is only that the *parent* (this test harness)
- * observes the child end -- cleanly or via a crash -- without
- * hanging or itself crashing. The child's outcome is printed for a
- * human to read, not asserted on, matching how
- * KES_HARDENING_PLAN.md S6.C's "if it finds a genuine
- * use-after-free... do not silently fix it" guidance is meant to be
- * acted on.
+ * This test's job now is to prove the fix, not just document the
+ * bug: the automated race below (four racer threads inside a forked
+ * child, see run_destroy_race_child()) is asserted to always exit
+ * cleanly, under both plain and sanitized (ASan/TSan) builds --
+ * where it used to reliably trip TSan's race detector (nonzero exit
+ * status 66) and occasionally ASan's use-after-free detector. Like
+ * test_cross_process_racing_io() in tests/test_kes_multiprocess.c,
+ * the race itself still runs inside a forked child process (rather
+ * than this test process directly) purely so a *regression* here --
+ * if this fix is ever weakened -- fails loudly via this test's
+ * assertion instead of nondeterministically crashing the whole test
+ * binary and taking every other test down with it.
  */
 static bool test_cache_destroy_races_concurrent_access( void) {
     pid_t pid = fork();
@@ -1758,34 +1740,85 @@ static bool test_cache_destroy_races_concurrent_access( void) {
 
     if ( WIFEXITED(status) && WEXITSTATUS(status) == 0) {
         printf( "  destroy-race child exited normally with status "
-                "0 (no crash observed this run -- see this test's "
-                "comment; a plain, non-sanitized build often does "
-                "not trip on this race even though it is real)\n");
+                "0 -- no use-after-free, no sanitizer report\n");
     } else if ( WIFEXITED(status)) {
-        /* A sanitizer detects the race and reports it, then calls
-         * its own exit() with a nonzero status (ASan: 1 by default,
-         * TSan: 66 by default) rather than raising a signal -- this
-         * branch, not WIFSIGNALED below, is what actually fires
-         * under make asan/make tsan when the race is caught. */
+        /* A sanitizer detects a real problem and reports it, then
+         * calls its own exit() with a nonzero status (ASan: 1 by
+         * default, TSan: 66 by default) rather than raising a
+         * signal -- this branch, not WIFSIGNALED below, is what
+         * would fire under make asan/make tsan if this fix
+         * regressed. */
         printf( "  destroy-race child exited with nonzero status "
-                "%d -- consistent with the documented "
-                "kes_cache_destroy() use-after-free being caught "
-                "by a sanitizer, see this test's comment and "
-                "PENDING_ITEMS.md\n", WEXITSTATUS(status));
+                "%d -- a sanitizer caught a problem, see this "
+                "test's comment and PENDING_ITEMS.md\n",
+                WEXITSTATUS(status));
     } else if ( WIFSIGNALED(status)) {
         printf( "  destroy-race child was killed by signal %d "
-                "(%s) -- consistent with the documented "
-                "kes_cache_destroy() use-after-free, see this "
-                "test's comment and PENDING_ITEMS.md\n",
+                "(%s) -- see this test's comment and "
+                "PENDING_ITEMS.md\n",
                 WTERMSIG(status), strsignal( WTERMSIG(status)));
     } else {
         printf( "  destroy-race child ended with unexpected wait "
                 "status 0x%x\n", status);
     }
 
-    TEST_PASS("Cache Destroy Races Concurrent Get/Put (documents "
-              "known kes_cache_destroy() UAF, not fixed -- see "
+    TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+               "destroy-race child did not exit cleanly (status "
+               "indicates a crash or sanitizer-caught race -- "
+               "kes_cache_destroy()'s concurrent-access fix may "
+               "have regressed)");
+
+    TEST_PASS("Cache Destroy Races Concurrent Get/Put (verifies "
+              "the kes_cache_destroy() UAF fix -- see "
               "PENDING_ITEMS.md)");
+}
+
+/*
+ * Non-concurrent companion to the race test above: proves the new
+ * KES_ERROR_BUSY contract on a single thread, no forking or
+ * sanitizer needed. An entry that is still referenced
+ * (kes_cache_get_extent() called, never put back) must make
+ * kes_cache_destroy() refuse rather than free it out from under the
+ * caller -- and the cache must stay fully usable afterward, not
+ * permanently wedged by the failed attempt.
+ */
+static bool test_destroy_busy_when_referenced( void) {
+    kes_cache_config_t config;
+    kes_cache_get_default_config( &config, false);
+
+    kes_cache_t *cache = kes_cache_create( &config);
+    TEST_ASSERT(cache != NULL, "kes_cache_create() failed");
+
+    kes_cache_set_io_callbacks( cache, mock_read_extent,
+                                 mock_write_extent, mock_sync_device);
+
+    kes_extent_id_t id = {
+        .start_block = 0,
+        .block_count = 1,
+        .block_size = TEST_BLOCK_SIZE
+    };
+    void *buffer = NULL;
+    int rc = kes_cache_get_extent( cache, &id, &buffer);
+    TEST_ASSERT(rc == KES_SUCCESS, "get_extent() failed");
+    TEST_ASSERT(buffer != NULL, "get_extent() returned NULL buffer");
+
+    /* Entry is still referenced (never put back) -- destroy() must
+     * refuse, leaving the cache fully intact and usable. */
+    rc = kes_cache_destroy( cache);
+    TEST_ASSERT(rc == KES_ERROR_BUSY,
+               "destroy() should return BUSY while referenced");
+
+    /* Cache must still be fully usable after the BUSY return --
+     * prove it by releasing the reference and destroying again. */
+    rc = kes_cache_put_extent( cache, &id);
+    TEST_ASSERT(rc == KES_SUCCESS, "put_extent() failed");
+
+    rc = kes_cache_destroy( cache);
+    TEST_ASSERT(rc == KES_SUCCESS,
+               "destroy() should succeed once unreferenced");
+
+    TEST_PASS("Destroy returns BUSY while referenced, cache stays "
+              "usable, succeeds once released");
 }
 
 /* =================================================================
@@ -1848,6 +1881,8 @@ static test_case_t test_suite[] = {
       test_concurrent_sync_vs_get_put },
     { "Cache Destroy Races Concurrent Access",
       test_cache_destroy_races_concurrent_access },
+    { "Destroy Returns Busy When Referenced",
+      test_destroy_busy_when_referenced },
     { NULL, NULL } /* Terminator */
 };
 

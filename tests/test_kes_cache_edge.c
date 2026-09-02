@@ -529,24 +529,21 @@ static bool test_pin_unpin_refcount_semantics(void) {
  * A.1.6 -- kes_cache_destroy() with an outstanding, never-released
  * kes_cache_get_extent() reference.
  *
- * Reading kes_cache_destroy() (src/kes_cache.c) first: it walks
- * cache->mru_head to cache->list_next unconditionally, freeing every
- * entry's data buffer, destroying its mutex/cond, and free()-ing the
- * struct -- it does NOT check entry->ref_count (or pin_count) at
- * all before doing so. So the actual, observed contract is: destroy()
- * frees every entry regardless of outstanding references, it does
- * not refuse or defer. This test proves that doing so does not crash
- * or corrupt anything by itself (get an extent, deliberately never
- * put_extent() it, then destroy()) -- it deliberately does NOT then
- * dereference the now-dangling buffer pointer afterward, since doing
- * that would be a real use-after-free this test is not trying to
- * prove is safe (it isn't -- destroy() invalidates the buffer, it
- * just doesn't check first). Per the task instructions this specific
- * test must also be confirmed under `make asan`, not just plain
- * `make test`, since a subtler defect here (e.g. destroy() itself
- * double-freeing, or corrupting bucket/LRU bookkeeping while an
- * entry is still logically referenced) is exactly the shape ASan
- * catches and a plain run would not.
+ * This test used to prove that kes_cache_destroy() freed every entry
+ * unconditionally, ref_count included -- a real, ASan/TSan-confirmed
+ * use-after-free hazard against any concurrent caller, tracked as
+ * Track A.3.1 in PENDING_ITEMS.md. That is now fixed: destroy()
+ * reuses try_evict_entry_locked()'s ref_count/pin_count/cond_waiters
+ * eligibility check (the same one every other evictor in
+ * src/kes_cache.c already uses) instead of freeing directly, so an
+ * entry that is still referenced makes destroy() refuse it and
+ * return KES_ERROR_BUSY, leaving the cache object itself fully
+ * intact and usable rather than freeing it out from under the
+ * caller. See the "Track A.3.1" Resolved entry in PENDING_ITEMS.md
+ * for the full fix design. This test now proves that contract: get
+ * an extent, deliberately never put_extent() it, confirm destroy()
+ * returns BUSY and `buf` is still safe to use (it was never freed),
+ * then release the reference and confirm destroy() succeeds.
  */
 static bool test_destroy_with_outstanding_reference(void) {
     kes_cache_config_t cfg;
@@ -567,19 +564,24 @@ static bool test_destroy_with_outstanding_reference(void) {
     TEST_ASSERT( buf != NULL, "buffer non-NULL before destroy");
 
     result = kes_cache_destroy( cache);
-    TEST_ASSERT( result == KES_SUCCESS,
-                "destroy() with an outstanding reference still "
-                "succeeds -- observed behavior: it frees the entry "
-                "unconditionally rather than refusing or deferring, "
-                "per this function's actual implementation");
+    TEST_ASSERT( result == KES_ERROR_BUSY,
+                "destroy() with an outstanding reference must "
+                "refuse (KES_ERROR_BUSY), not free the entry out "
+                "from under the caller that still holds it");
 
-    /* Deliberately does not touch `buf` here -- it is dangling now
-     * that destroy() has freed the entry that owned it. */
+    /* `buf` is still valid here -- destroy() refused, so the entry
+     * (and its data buffer) was never freed. Release the reference
+     * and confirm the cache is still fully usable afterward. */
+    TEST_ASSERT( kes_cache_put_extent( cache, &id) == KES_SUCCESS,
+                "put_extent() after a BUSY destroy() attempt");
+
+    result = kes_cache_destroy( cache);
+    TEST_ASSERT( result == KES_SUCCESS,
+                "destroy() succeeds once the reference is released");
 
     TEST_SUCCESS( "kes_cache_destroy() with an outstanding "
-                  "get_extent() reference: no crash (frees the "
-                  "entry regardless of ref_count -- run under "
-                  "make asan to confirm no corruption)");
+                  "get_extent() reference returns BUSY and leaves "
+                  "the cache intact; succeeds once released");
 }
 
 /* ================================================================

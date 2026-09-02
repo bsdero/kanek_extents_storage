@@ -1,0 +1,25 @@
+# Valgrind suppressions for KES.
+#
+# glibc caches a just-joined/detached pthread's stack (including its
+# TLS block) internally for reuse rather than immediately unmapping
+# it, so Memcheck's leak checker -- which can only prove reachability
+# via pointers it can find, not via glibc's own internal free-list --
+# conservatively classifies that cached block as "possibly lost". This
+# is a well-known, benign Valgrind/glibc interaction (not a real leak:
+# the block is still tracked and reusable by glibc, just not reachable
+# via a pointer Valgrind's scanner can locate), independent of this
+# project's own code. It's suppressed here rather than left for every
+# caller of `make valgrind`/`make check-all` to triage by hand each
+# time -- see the "Track A.3.1" Resolved entry in PENDING_ITEMS.md for
+# how this was found and confirmed to also reproduce against
+# pre-fix code, unrelated to any kes_cache.c logic.
+{
+   glibc_pthread_stack_tls_possibly_lost
+   Memcheck:Leak
+   match-leak-kinds: possible
+   ...
+   fun:allocate_dtv
+   fun:_dl_allocate_tls
+   fun:allocate_stack
+   fun:pthread_create*
+}

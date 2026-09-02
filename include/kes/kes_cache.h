@@ -180,6 +180,33 @@ struct kes_cache {
     pthread_mutex_t cache_lock;  /* Cache-wide lock */
     pthread_cond_t bg_cond;      /* Background thread condition */
 
+    /* Number of kes_cache_get_extent() calls currently past
+     * validation and still touching cache-wide bookkeeping (hash
+     * table publish or LRU list touch) for their own lookup, not yet
+     * released. Protected by cache_lock only. kes_cache_destroy()
+     * requires this to be 0, in addition to an empty LRU list,
+     * before it is safe to free cache->buckets/cache->cache_lock/
+     * cache->bg_cond/cache itself -- ref_count/pin_count alone
+     * cannot gate this window because a brand-new entry is published
+     * into the hash table before it is ever added to the LRU list.
+     * Never held across the actual read_extent() I/O call, only
+     * across the shared-structure bookkeeping around it. */
+    uint32_t inflight_lookups;
+
+    /* Set (under cache_lock) by a kes_cache_destroy() call while it
+     * attempts to drain the cache. If that attempt succeeds
+     * (returns KES_SUCCESS), this stays true permanently -- the
+     * cache is gone. If it instead finds entries still
+     * referenced/pinned and returns KES_ERROR_BUSY, this is reset
+     * to false before returning, since the cache remains fully
+     * usable in that case. Distinct from `shutdown` above, which
+     * kes_cache_start() clears again on a kes_cache_stop()/
+     * kes_cache_start() restart cycle -- reusing `shutdown` here
+     * would silently break that cycle. While true,
+     * kes_cache_get_extent() rejects new lookups with
+     * KES_ERROR_INVALID. Read and written only under cache_lock. */
+    bool destroying;
+
     /* I/O callback functions */
     int (*read_extent)( void *device, const kes_extent_id_t *id,
                          void *buffer, size_t size);
@@ -202,9 +229,22 @@ struct kes_cache {
 kes_cache_t *kes_cache_create( const kes_cache_config_t *config);
 
 /**
- * Destroy cache and free all resources
+ * Destroy cache and free all resources. Safe to call concurrently
+ * with kes_cache_get_extent()/kes_cache_put_extent()/etc. calls that
+ * began before this call: if any cached entry is still referenced
+ * (ref_count > 0) or pinned (pin_count > 0), or a
+ * kes_cache_get_extent() call is still mid-lookup, this evicts
+ * whatever entries it safely can and then returns KES_ERROR_BUSY,
+ * leaving the cache object itself fully intact and usable -- callers
+ * may retry once outstanding references are released via
+ * kes_cache_put_extent()/kes_cache_unpin_extent(). A KES_ERROR_BUSY
+ * return does NOT permanently reject new kes_cache_get_extent()
+ * calls; only a call that returns KES_SUCCESS does that. It remains
+ * undefined behavior to call any kes_cache_* function on this handle
+ * after a call that returned KES_SUCCESS.
  * @param cache Cache handle
- * @return KES_SUCCESS or error code
+ * @return KES_SUCCESS, or KES_ERROR_BUSY if entries are still
+ *         referenced/pinned or a lookup is still in flight
  */
 int kes_cache_destroy( kes_cache_t *cache);
 
@@ -240,7 +280,8 @@ int kes_cache_stop( kes_cache_t *cache);
  * checked instead. On a cache miss, evicts from the LRU tail as
  * needed to stay within config.max_entries/config.max_memory;
  * returns KES_ERROR_BUSY if eviction cannot free enough room (every
- * cached entry is currently referenced or pinned).
+ * cached entry is currently referenced or pinned). Returns
+ * KES_ERROR_INVALID if the cache is mid-kes_cache_destroy().
  * @param cache Cache handle
  * @param id Extent identifier
  * @param buffer Pointer to receive data buffer

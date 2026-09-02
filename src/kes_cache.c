@@ -745,6 +745,7 @@ kes_cache_t *kes_cache_create( const kes_cache_config_t *config) {
     memset( &cache->stats, 0, sizeof(kes_cache_stats_t));
 
     cache->shutdown = false;
+    cache->destroying = false;
 
     return(cache);
 }
@@ -760,26 +761,71 @@ int kes_cache_destroy( kes_cache_t *cache) {
     /* Stop background threads first */
     kes_cache_stop( cache);
 
-    /* Free all cached entries */
     pthread_mutex_lock( &cache->cache_lock);
+    if ( cache->inflight_lookups != 0) {
+        uint32_t inflight = cache->inflight_lookups;
+        pthread_mutex_unlock( &cache->cache_lock);
+        TRACE_ERR( "kes_cache_destroy: %u lookup(s) still in "
+                   "flight, cache left intact", inflight);
+        return(KES_ERROR_BUSY);
+    }
+    cache->destroying = true;
 
+    /* Walk the LRU list the same lookup-pin-protected way
+     * cache_sweep() does: pin the next node via lookup_pins under
+     * cache_lock before releasing it and processing the current
+     * node, so a concurrent evictor (there should be none once
+     * destroying is set and inflight_lookups is 0, but put_extent()/
+     * pin_extent()/unpin_extent()/mark_dirty()/flush_extent() on an
+     * already-referenced entry remain legal concurrently -- see the
+     * doc comment above) cannot free a node this walk still holds a
+     * raw pointer to. */
     kes_extent_entry_t *entry = cache->mru_head;
-    while ( entry != NULL) {
-        kes_extent_entry_t *next = entry->list_next;
+    if ( entry != NULL) {
+        __atomic_fetch_add( &entry->lookup_pins, 1, __ATOMIC_SEQ_CST);
+    }
+    pthread_mutex_unlock( &cache->cache_lock);
 
-        /* Free entry data */
-        if ( entry->data != NULL) {
-            extent_free_data( cache, entry->data, entry->data_size);
+    while ( entry != NULL) {
+        pthread_mutex_lock( &cache->cache_lock);
+        kes_extent_entry_t *next = entry->list_next;
+        if ( next != NULL) {
+            __atomic_fetch_add( &next->lookup_pins, 1,
+                                 __ATOMIC_SEQ_CST);
+        }
+        pthread_mutex_unlock( &cache->cache_lock);
+
+        pthread_mutex_lock( &entry->lock);
+        __atomic_fetch_sub( &entry->lookup_pins, 1, __ATOMIC_SEQ_CST);
+
+        /* discard_dirty=true: destroy() has never flushed dirty
+         * data and that is not what this fix is changing. Evicts
+         * the entry (freeing it) if ref_count == 0 && pin_count ==
+         * 0 && cond_waiters == 0 && no concurrent lookup_pins;
+         * otherwise leaves it in place, still holding entry->lock,
+         * which we must then release ourselves. */
+        if ( !try_evict_entry_locked( cache, entry, true)) {
+            pthread_mutex_unlock( &entry->lock);
         }
 
-        /* Cleanup entry locks */
-        pthread_mutex_destroy( &entry->lock);
-        pthread_cond_destroy( &entry->cond);
-
-        free( entry);
         entry = next;
     }
 
+    pthread_mutex_lock( &cache->cache_lock);
+    bool fully_drained = ( cache->mru_head == NULL &&
+                            cache->inflight_lookups == 0);
+    if ( !fully_drained) {
+        /* Some entries survived the pass (still referenced/pinned/
+         * waited-on), or a lookup started concurrently and is still
+         * in flight. Leave the cache object itself fully usable --
+         * do not leave new callers permanently locked out over a
+         * destroy() attempt that did not actually succeed. */
+        cache->destroying = false;
+        pthread_mutex_unlock( &cache->cache_lock);
+        TRACE_ERR( "kes_cache_destroy: entries still referenced or "
+                   "pinned after eviction pass, cache left usable");
+        return(KES_ERROR_BUSY);
+    }
     pthread_mutex_unlock( &cache->cache_lock);
 
     /* Cleanup hash table */
@@ -843,6 +889,16 @@ int kes_cache_get_extent( kes_cache_t *cache,
         return(KES_ERROR_INVALID);
     }
 
+    pthread_mutex_lock( &cache->cache_lock);
+    if ( cache->destroying) {
+        pthread_mutex_unlock( &cache->cache_lock);
+        TRACE_ERR( "kes_cache_get_extent: cache is being destroyed, "
+                   "rejecting new lookup");
+        return(KES_ERROR_INVALID);
+    }
+    cache->inflight_lookups++;
+    pthread_mutex_unlock( &cache->cache_lock);
+
     *buffer = NULL;
 
     /* Fast-path lookup: avoids building a candidate entry for the
@@ -869,6 +925,9 @@ int kes_cache_get_extent( kes_cache_t *cache,
                        "start_block=%llu block_count=%u",
                        (unsigned long long)id->start_block,
                        id->block_count);
+            pthread_mutex_lock( &cache->cache_lock);
+            cache->inflight_lookups--;
+            pthread_mutex_unlock( &cache->cache_lock);
             return(KES_ERROR_BUSY);
         }
 
@@ -883,6 +942,9 @@ int kes_cache_get_extent( kes_cache_t *cache,
         kes_extent_entry_t *candidate = calloc( 1,
                                              sizeof(kes_extent_entry_t));
         if ( candidate == NULL) {
+            pthread_mutex_lock( &cache->cache_lock);
+            cache->inflight_lookups--;
+            pthread_mutex_unlock( &cache->cache_lock);
             return(KES_ERROR_NOMEM);
         }
 
@@ -899,6 +961,9 @@ int kes_cache_get_extent( kes_cache_t *cache,
             pthread_mutex_destroy( &candidate->lock);
             pthread_cond_destroy( &candidate->cond);
             free( candidate);
+            pthread_mutex_lock( &cache->cache_lock);
+            cache->inflight_lookups--;
+            pthread_mutex_unlock( &cache->cache_lock);
             return(KES_ERROR_NOMEM);
         }
 
@@ -922,6 +987,7 @@ int kes_cache_get_extent( kes_cache_t *cache,
             cache->stats.entries_cached++;
             cache->stats.memory_used +=
                 KES_ALIGN( entry->data_size, KES_CACHE_ALIGNMENT);
+            cache->inflight_lookups--;
             pthread_mutex_unlock( &cache->cache_lock);
 
             /* Load data from disk */
@@ -1032,6 +1098,9 @@ int kes_cache_get_extent( kes_cache_t *cache,
 
     if ( entry->state & KES_EXTENT_ERROR) {
         pthread_mutex_unlock( &entry->lock);
+        pthread_mutex_lock( &cache->cache_lock);
+        cache->inflight_lookups--;
+        pthread_mutex_unlock( &cache->cache_lock);
         return(KES_ERROR_IO);
     }
 
@@ -1046,6 +1115,7 @@ int kes_cache_get_extent( kes_cache_t *cache,
     pthread_mutex_lock( &cache->cache_lock);
     lru_touch( cache, entry);
     cache->stats.hits++;
+    cache->inflight_lookups--;
     pthread_mutex_unlock( &cache->cache_lock);
 
     return(KES_SUCCESS);

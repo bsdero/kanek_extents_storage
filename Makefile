@@ -270,7 +270,8 @@ valgrind:
 		testname=$$(basename $$test); \
 		echo "--- $$testname (valgrind) ---"; \
 		valgrind --leak-check=full --error-exitcode=1 \
-		    --track-origins=yes $$test || exit 1; \
+		    --track-origins=yes \
+		    --suppressions=valgrind.supp $$test || exit 1; \
 	done
 
 # Single gate: normal build+tests, ASan, TSan, Valgrind, in sequence.

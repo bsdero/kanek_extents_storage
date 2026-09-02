@@ -221,6 +221,19 @@ static bool test_cache_invariant_fuzz(void) {
                      fuzz_mock_write, fuzz_mock_sync) == KES_SUCCESS,
                  "fuzz cache set callbacks");
 
+    /* Tracks each pool id's outstanding ref_count/pin_count so they
+     * can be precisely drained after the random loop below, since
+     * kes_cache_destroy() now correctly refuses (KES_ERROR_BUSY,
+     * see PENDING_ITEMS.md's Track A.3.1 fix) rather than freeing a
+     * still-referenced/pinned entry out from under this test -- a
+     * random op sequence has no other guarantee of ending balanced.
+     * Only bumped on an operation's own KES_SUCCESS, so it always
+     * matches the cache's real per-entry counts; invalidate()'s
+     * own KES_ERROR_BUSY-if-referenced-or-pinned contract means it
+     * only ever succeeds when both are already tracked as 0 here. */
+    int ref_counts[FUZZ_POOL_SIZE] = { 0};
+    int pin_counts[FUZZ_POOL_SIZE] = { 0};
+
     for ( long iter = 0; iter < iterations; iter++) {
         int op = rand() % 8;
         int idx = rand() % FUZZ_POOL_SIZE;
@@ -236,6 +249,9 @@ static bool test_cache_invariant_fuzz(void) {
                         "iter=%ld seed=%u\n", rc, iter, seed);
                 return(false);
             }
+            if ( rc == KES_SUCCESS) {
+                ref_counts[idx]++;
+            }
             break;
         case 1:
             rc = kes_cache_put_extent( cache, id);
@@ -243,6 +259,9 @@ static bool test_cache_invariant_fuzz(void) {
                 printf( "FAIL: put_extent unexpected rc=%d at "
                         "iter=%ld seed=%u\n", rc, iter, seed);
                 return(false);
+            }
+            if ( rc == KES_SUCCESS && ref_counts[idx] > 0) {
+                ref_counts[idx]--;
             }
             break;
         case 2:
@@ -252,6 +271,9 @@ static bool test_cache_invariant_fuzz(void) {
                         "iter=%ld seed=%u\n", rc, iter, seed);
                 return(false);
             }
+            if ( rc == KES_SUCCESS) {
+                pin_counts[idx]++;
+            }
             break;
         case 3:
             rc = kes_cache_unpin_extent( cache, id);
@@ -259,6 +281,9 @@ static bool test_cache_invariant_fuzz(void) {
                 printf( "FAIL: unpin_extent unexpected rc=%d at "
                         "iter=%ld seed=%u\n", rc, iter, seed);
                 return(false);
+            }
+            if ( rc == KES_SUCCESS && pin_counts[idx] > 0) {
+                pin_counts[idx]--;
             }
             break;
         case 4:
@@ -294,6 +319,18 @@ static bool test_cache_invariant_fuzz(void) {
                         "iter=%ld seed=%u\n", rc, iter, seed);
                 return(false);
             }
+            if ( rc == KES_SUCCESS &&
+                 ( ref_counts[idx] != 0 || pin_counts[idx] != 0)) {
+                printf( "FAIL: invalidate succeeded while this "
+                        "test's own tracking still shows "
+                        "ref_count=%d pin_count=%d for idx=%d at "
+                        "iter=%ld seed=%u (invalidate() is "
+                        "documented to refuse a referenced/pinned "
+                        "entry with KES_ERROR_BUSY)\n",
+                        ref_counts[idx], pin_counts[idx], idx, iter,
+                        seed);
+                return(false);
+            }
             break;
         }
 
@@ -323,7 +360,26 @@ static bool test_cache_invariant_fuzz(void) {
         }
     }
 
-    kes_cache_destroy( cache);
+    /* A random op sequence has no guarantee of ending balanced --
+     * drain every pool id's tracked outstanding ref_count/pin_count
+     * exactly, so kes_cache_destroy() below finds nothing referenced
+     * or pinned and actually succeeds (destroy() now correctly
+     * refuses via KES_ERROR_BUSY otherwise, per the Track A.3.1 fix
+     * in PENDING_ITEMS.md). */
+    for ( int i = 0; i < FUZZ_POOL_SIZE; i++) {
+        while ( ref_counts[i] > 0) {
+            kes_cache_put_extent( cache, &pool[i]);
+            ref_counts[i]--;
+        }
+        while ( pin_counts[i] > 0) {
+            kes_cache_unpin_extent( cache, &pool[i]);
+            pin_counts[i]--;
+        }
+    }
+
+    TEST_ASSERT( kes_cache_destroy( cache) == KES_SUCCESS,
+                "destroy() should succeed once every pool id's "
+                "tracked ref_count/pin_count has been drained");
 
     TEST_SUCCESS( "Cache invariant fuzz (random get/put/pin/unpin/"
                    "mark_dirty/flush/sync/invalidate against a "

@@ -264,6 +264,7 @@ static bool test_kes_cache_pin_unpin(void) {
     TEST_ASSERT( kes_cache_unpin_extent( NULL, &id) == KES_ERROR_INVALID,
                 "unpin: NULL cache rejected");
 
+    kes_cache_put_extent( cache, &id);
     kes_cache_destroy( cache);
     TEST_SUCCESS( "kes_cache_pin_extent/kes_cache_unpin_extent");
 }
@@ -301,6 +302,7 @@ static bool test_kes_cache_mark_dirty(void) {
     TEST_ASSERT( kes_cache_mark_dirty( NULL, &id) == KES_ERROR_INVALID,
                 "NULL cache rejected");
 
+    kes_cache_put_extent( cache, &id);
     kes_cache_destroy( cache);
     TEST_SUCCESS( "kes_cache_mark_dirty");
 }
@@ -340,6 +342,7 @@ static bool test_kes_cache_flush_extent(void) {
     TEST_ASSERT( kes_cache_flush_extent( NULL, &id) == KES_ERROR_INVALID,
                 "NULL cache rejected");
 
+    kes_cache_put_extent( cache, &id);
     kes_cache_destroy( cache);
     TEST_SUCCESS( "kes_cache_flush_extent");
 }
@@ -369,6 +372,10 @@ static bool test_kes_cache_get_stats(void) {
     TEST_ASSERT( kes_cache_get_stats( cache, NULL) == KES_ERROR_INVALID,
                 "NULL stats output rejected");
 
+    /* Two get_extent() calls above (miss then hit) each took a
+     * reference -- release both before destroy(). */
+    kes_cache_put_extent( cache, &id);
+    kes_cache_put_extent( cache, &id);
     kes_cache_destroy( cache);
     TEST_SUCCESS( "kes_cache_get_stats");
 }
