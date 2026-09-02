@@ -33,9 +33,9 @@ documentation, or a gap in a path that's optional/uncommon.
 ## KES-1 -- `kes_cache_destroy()` use-after-free under concurrent access
 
 **Severity: Critical. Status: CLOSED -- fixed 2026-09-02, commit
-`<pending>` (hash recorded in a follow-up commit; see the "Track
-A.3.1" entry in `PENDING_ITEMS.md`'s `## Resolved` section for the
-full implementation writeup and verification evidence).**
+`8d40167` (see the "Track A.3.1" entry in `PENDING_ITEMS.md`'s
+`## Resolved` section for the full implementation writeup and
+verification evidence).**
 
 `kes_cache_destroy()` (`src/kes_cache.c`) frees every LRU entry
 unconditionally -- no check of `ref_count`/`pin_count`, no

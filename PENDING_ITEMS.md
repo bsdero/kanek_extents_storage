@@ -323,7 +323,9 @@ bookkeeping-run bullet.**
 **Closes the "Phase 5 progress -- Track A.3.1" finding and the "Track
 A.3.1 fix plan" design section, both formerly below this point (see
 git history for their original text) -- this is the fix that plan
-described, implemented as specified.**
+described, implemented as specified. Fixed in commit `8d40167` ("fix:
+kes_cache_destroy() use-after-free under concurrent access
+(KES-1)").**
 
 - Was: `kes_cache_destroy()` walked `cache->mru_head` unconditionally,
   freeing every entry's data buffer, destroying its `lock`/`cond`, and
