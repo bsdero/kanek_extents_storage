@@ -1,8 +1,26 @@
 # macOS Port Work Plan
 
-**Status:** not started. This is an execution plan, not a status
-report — do not edit "done" language into this file casually; see
-§6 (bookkeeping) for how to mark items complete once verified.
+**Status:** blocked, not started. This is an execution plan, not a
+status report — do not edit "done" language into this file casually;
+see §6 (bookkeeping) for how to mark items complete once verified.
+
+**Blocked on:** the open items in `PENDING_FIXES_SEP2026.md`
+(`KES-2` through `KES-12`; `KES-1` is already closed) are to be fixed
+on the primary development platform (Linux) first, before any of the
+work below starts. Rationale: several of those items touch the same
+files this plan touches (`src/kes_cache.c`, `src/kes_storage.c`,
+`tests/test_kes_multiprocess.c`) and fixing them first, on the
+platform where `make check-all` (ASan/TSan/Valgrind) already runs
+reliably, avoids doing this port's platform-specific work twice or
+against a moving target. **This plan should be expected to need
+rework once those fixes land** — new/changed error paths, struct
+fields, or test files from the `KES-*` fixes may shift exact line
+numbers and function shapes cited below, and may add new
+platform-portability surface of their own (e.g. any file-locking work
+for `KES-5` would need its own Darwin-vs-Linux check). Re-read
+`PENDING_FIXES_SEP2026.md`'s status before resuming this plan, and
+re-verify every citation below against the code as it exists then,
+not as captured here.
 
 **Audience:** any LLM coding agent or human picking up this port.
 Assume zero prior context beyond this repo: read `AGENTS.md` first
