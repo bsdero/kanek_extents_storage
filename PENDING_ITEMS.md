@@ -785,6 +785,145 @@ elsewhere between a behavior fix and a documented-as-is decision.**
   runs confirm only that the comment-only diff introduced no
   regression, not that any new behavior was exercised.
 
+### KES-3/KES-4 -- `kes_cache_flush_extent()` didn't set `KES_EXTENT_ERROR` on write failure; stale `KES_EXTENT_ERROR` entries never auto-retried (FIXED, CLOSED)
+
+**Closes the `KES-3` and `KES-4` entries in
+`PENDING_FIXES_SEP2026.md`. Fixed 2026-09-11, commit `8f777ce`. Full
+implementation plan: `kes_3_kes_4_plan.md` (the two are grouped there
+deliberately -- see below for why, this is not an arbitrary pairing).**
+
+- **KES-3 was**: `sweep_flush_and_maybe_evict()` (used by
+  `kes_cache_sync()`'s sweep path and eviction) sets `KES_EXTENT_ERROR`
+  on a failed flush; `kes_cache_flush_extent()` -- the direct
+  single-entry flush call, a different code path in `src/kes_cache.c`
+  -- did not, only returning `KES_ERROR_IO` with no state change. A
+  caller relying on the entry's own state (rather than the return
+  value alone) to detect a previous flush failure had no way to do so
+  via `flush_extent()`.
+- **KES-3 fix**: `kes_cache_flush_extent()`'s write-failure branch now
+  sets `entry->state |= KES_EXTENT_ERROR` (an OR, deliberately leaving
+  `KES_EXTENT_DIRTY` set -- the data was never actually persisted),
+  mirroring `sweep_flush_and_maybe_evict()` exactly, plus a `TRACE_ERR`
+  call.
+- **A gap the plan's own snippet didn't cover, found during
+  verification**: `kes_cache_flush_extent()`'s pre-existing *success*
+  branch only cleared `KES_EXTENT_DIRTY`, never `KES_EXTENT_ERROR` --
+  harmless before this fix (ERROR was never set on this path), but
+  once KES-3 lets a failed attempt set ERROR, a later *successful*
+  flush left the entry stuck at `ERROR | CLEAN` instead of exactly
+  `CLEAN`. Caught by this pass's own new test (below) failing on first
+  run, not by code review. Fixed to also clear `KES_EXTENT_ERROR` on
+  success, matching `sweep_flush_and_maybe_evict()`'s success branch
+  (`src/kes_cache.c`), which already did this correctly.
+- **KES-4 was**: after a `read_extent()` failure,
+  `kes_cache_get_extent()` left the entry permanently in
+  `KES_EXTENT_ERROR`. A second call for the same id -- even once
+  whatever caused the failure was fully resolved -- returned
+  `KES_ERROR_IO` immediately without ever calling `read_extent()`
+  again; `kes_cache_invalidate()` was the only recovery path.
+  Confirmed via a call-count assertion in the (then-titled)
+  `test_load_failure_hash_table_state`,
+  `tests/test_kes_fault_injection.c`.
+- **KES-4 fix (decision confirmed with the project owner: real
+  auto-retry, not just documentation)**: `kes_cache_get_extent()` now
+  retries the load exactly once, synchronously, when it finds an entry
+  already in `KES_EXTENT_ERROR` -- inserted between the existing
+  `KES_EXTENT_LOADING` wait loop and the existing `KES_EXTENT_ERROR`
+  check. Deliberately bounded (one retry per call, not a loop) so a
+  permanently broken backend cannot turn one `get_extent()` call into
+  an indefinite hang; a caller still stuck after the retry gets
+  `KES_ERROR_IO` back exactly as before, and the *next* caller's own
+  call gets its own fresh retry attempt. Reuses `KES_EXTENT_LOADING`
+  as the in-progress marker during the retry rather than adding a new
+  state flag, so every existing piece of code that already protects a
+  loading entry (`try_evict_entry_locked()`'s refusal to evict,
+  `cond_waiters`' protection against a concurrent free,
+  `kes_cache_flush_extent()`'s own wait-for-loading logic) protects a
+  mid-retry entry for free, and a second thread reaching this function
+  for the same id during a retry takes the existing `LOADING` wait
+  path rather than attempting its own concurrent retry. Lock
+  discipline matches the existing miss path exactly: `entry->lock` is
+  released before the real I/O call and never held simultaneously with
+  `cache_lock`. On a successful retry, `stats.bytes_read` is updated
+  but `stats.misses` is **not** incremented again (the miss was
+  already counted once, at original failure time -- a retry is a
+  recovery of an existing entry, not a new distinct miss event).
+- **Critical interaction between the two fixes (the reason they're one
+  plan, not two independent ones)**: KES-3 can leave an entry in
+  `KES_EXTENT_ERROR | KES_EXTENT_DIRTY` -- write failed, but the data
+  in `entry->data` is still completely valid and simply unflushed. A
+  naive KES-4 retry ("on `KES_EXTENT_ERROR`, just read again") would
+  fire for this case too, and a **read** into `entry->data` would
+  silently overwrite that valid, unflushed data with stale on-disk
+  bytes -- real, silent data loss, worse than the bug KES-4 fixes.
+  Verified by reading every place `state` is set to
+  `KES_EXTENT_ERROR` in `src/kes_cache.c`: a load failure always does a
+  plain overwrite (`entry->state = KES_EXTENT_ERROR`) on a
+  brand-new, never-dirty candidate -- always ERROR-without-DIRTY; a
+  flush failure always does `entry->state |= KES_EXTENT_ERROR`,
+  deliberately preserving whatever DIRTY bit was already set (you
+  don't flush a clean entry) -- always ERROR-with-DIRTY. So `ERROR`
+  alone unambiguously means "no valid data, safe to retry via a fresh
+  read", and `ERROR | DIRTY` unambiguously means "valid but unflushed
+  data, must not be overwritten by a read" -- not a heuristic, it
+  follows directly from every code path that can produce each
+  combination. KES-4's retry condition is therefore gated on
+  `(entry->state & KES_EXTENT_ERROR) && !(entry->state &
+  KES_EXTENT_DIRTY)`; the `ERROR | DIRTY` case falls through unchanged
+  to the pre-existing `KES_ERROR_IO` return, with a direct
+  `kes_cache_flush_extent()` retry remaining the correct recovery path
+  for it (unchanged by this plan).
+- Test changes (`tests/test_kes_fault_injection.c`):
+  - Rewrote `test_load_failure_hash_table_state`: its entire
+    "stuck-forever" premise was what KES-4 removes. The second
+    `kes_cache_get_extent()` call (after clearing the injected fault)
+    now asserts `KES_SUCCESS` (not `KES_ERROR_IO`), a non-NULL buffer,
+    `g_read_fault.call_count == 1` (proof a real retry happened), and
+    `entry->state == KES_EXTENT_CLEAN`. The now-redundant
+    `kes_cache_invalidate()` + third-`get_extent()` demonstration was
+    removed (invalidate remains *a* valid recovery path, just no
+    longer the only one). Header comment and final `TEST_SUCCESS`
+    message rewritten to describe the fix instead of the gap.
+  - Added `test_get_extent_does_not_retry_dirty_error_entry`: dirties
+    an entry with a recognizable payload, forces a flush failure
+    (confirms `state` is `ERROR | DIRTY`, proving KES-3 landed), then
+    confirms a `get_extent()` call on that same id returns
+    `KES_ERROR_IO` with **zero** `read_extent()` calls
+    (`g_read_fault.call_count == 0`) and the original payload
+    byte-for-byte unchanged in `entry->data` -- direct, executable
+    proof of the critical-interaction safety property above, not just
+    a code-review argument. Also confirms a direct
+    `kes_cache_flush_extent()` retry (the correct recovery path)
+    succeeds once the write fault clears and leaves `state` at exactly
+    `KES_EXTENT_CLEAN`.
+- Verified (real runs, not assumed): `make clean && make test` --
+  **98/98 passing** across all 12 binaries (93 previously plus the
+  rewritten test's new assertions plus the one newly-added test; the
+  new test failed on its first run, exactly the `ERROR | CLEAN` gap
+  described above, before that success-branch fix was made -- included
+  here as evidence the test is actually exercising what it claims to,
+  not just passing trivially). `make asan` -- exit 0, clean, no new
+  ASan/UBSan findings, including in the 10-minute-equivalent soak run.
+  `make tsan` -- exit 0, clean -- specifically checked for any new
+  race around the new unlock/I-O/re-lock window KES-4 adds inside
+  `kes_cache_get_extent()`, structurally similar to the existing
+  cache-miss path's own such window; none found. `make valgrind` --
+  exit 0, "ERROR SUMMARY: 0 errors" across every binary, no
+  definitely-or-indirectly-lost bytes. `make check-all` -- exit 0,
+  **"ALL CHECKS PASSED."** `tests/test_kes_cache.c` (25/25) and
+  `tests/test_kes_cache_full.c` (12/12) were also re-run directly per
+  the plan's verification checklist item 6, to confirm nothing that
+  inspects `entry->state` directly broke from the new
+  `KES_EXTENT_LOADING` transition during a retry -- nothing did.
+- Out of scope (per the plan, unchanged): any retry-count/backoff
+  configuration (exactly one retry per call is deliberate and final as
+  scoped here); extending the same auto-retry idea to
+  `kes_cache_sync()`'s sweep path or `kes_cache_flush_extent()`'s own
+  `KES_EXTENT_LOADING` wait; any change to whether `get_extent()`
+  should be allowed to serve still-valid `ERROR | DIRTY` data to a
+  caller instead of returning `KES_ERROR_IO` (pre-existing behavior,
+  untouched).
+
 ### Phase 6 -- documentation truth pass (DONE)
 
 `README.md` and `docs/CONTINUATION_PROMPT.md` were corrected to

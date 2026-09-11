@@ -143,7 +143,11 @@ correctness surprise) regardless of when/whether (2) gets scheduled.
 
 ## KES-3 -- `kes_cache_flush_extent()` doesn't set `KES_EXTENT_ERROR` on a write failure
 
-**Severity: Medium. Status: OPEN.**
+**Severity: Medium. Status: CLOSED -- fixed 2026-09-11, commit
+`8f777ce`, per `kes_3_kes_4_plan.md` (see the matching "KES-3/KES-4"
+entry in `PENDING_ITEMS.md`'s `## Resolved` section for the full
+implementation writeup, the critical KES-3/KES-4 interaction finding,
+and verification evidence).**
 
 `sweep_flush_and_maybe_evict()` (used by `kes_cache_sync()`'s sweep
 path and eviction) sets `KES_EXTENT_ERROR` on a failed flush, keeping
@@ -168,7 +172,12 @@ locking work is settled (both touch nearby code in the same file).
 
 ## KES-4 -- Cache entries stuck permanently in `KES_EXTENT_ERROR` after a load failure never auto-retry
 
-**Severity: Medium. Status: OPEN.**
+**Severity: Medium. Status: CLOSED -- fixed 2026-09-11, commit
+`8f777ce`, per `kes_3_kes_4_plan.md` (decision confirmed with the
+project owner: real auto-retry, not just documentation -- see the
+matching "KES-3/KES-4" entry in `PENDING_ITEMS.md`'s `## Resolved`
+section for the full implementation writeup, the critical KES-3/KES-4
+interaction finding, and verification evidence).**
 
 After a `read_extent()` failure, `kes_cache_get_extent()` leaves the
 entry permanently in `KES_EXTENT_ERROR` state in the hash table
