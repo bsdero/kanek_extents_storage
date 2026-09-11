@@ -14,7 +14,7 @@ typedef struct kes_storage kes_storage_t;
 typedef struct kes_bitmap kes_bitmap_t;
 
 /* Version information */
-#define KES_VERSION_MAJOR    1
+#define KES_VERSION_MAJOR    2   /* v2: KES-6 added bitmap_checksum */
 #define KES_VERSION_MINOR    0
 #define KES_VERSION_PATCH    0
 
@@ -90,8 +90,14 @@ typedef struct {
     uint64_t used_blocks;            /* Current used blocks */
     uint64_t next_extent_id;         /* Next extent ID to allocate */
 
-    /* Reserved for future use */
-    uint8_t reserved[32];
+    /* KES-6: CRC-32C of the on-disk bitmap region (kfl_crc32c() over
+     * bitmap->data, bitmap->total_bytes), refreshed on every save
+     * and verified on kes_storage_open(). */
+    uint32_t bitmap_checksum;
+
+    /* Reserved for future use -- shrunk from 32 to 28 bytes to make
+     * room for bitmap_checksum above without growing the struct. */
+    uint8_t reserved[28];
 } kes_storage_descriptor_t;
 
 /* Storage configuration */

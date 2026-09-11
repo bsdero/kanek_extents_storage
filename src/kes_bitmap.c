@@ -3,6 +3,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include "trace.h"
+#include "crc32c.h"
 
 /* Internal macros for bit manipulation */
 #define BITS_PER_BYTE        8
@@ -288,5 +290,16 @@ int kes_bitmap_save( kes_bitmap_t *bitmap, int fd, off_t offset) {
         return(KES_ERROR_IO);
     }
 
+    return(KES_SUCCESS);
+}
+
+int kes_bitmap_checksum( kes_bitmap_t *bitmap, uint32_t *checksum) {
+    if ( bitmap == NULL || checksum == NULL) {
+        TRACE_ERR( "invalid arguments (bitmap=%p, checksum=%p)",
+                   (void *)bitmap, (void *)checksum);
+        return(KES_ERROR_INVALID);
+    }
+
+    *checksum = kfl_crc32c( 0, bitmap->data, bitmap->total_bytes);
     return(KES_SUCCESS);
 }

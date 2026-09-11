@@ -117,6 +117,15 @@ int kes_bitmap_load( kes_bitmap_t *bitmap, int fd, off_t offset);
  */
 int kes_bitmap_save( kes_bitmap_t *bitmap, int fd, off_t offset);
 
+/**
+ * Compute the CRC-32C checksum of the bitmap's on-disk byte
+ * representation (bitmap->data over bitmap->total_bytes).
+ * @param bitmap Target bitmap
+ * @param checksum Output parameter for the computed checksum
+ * @return KES_SUCCESS or error code
+ */
+int kes_bitmap_checksum( kes_bitmap_t *bitmap, uint32_t *checksum);
+
 #ifdef __cplusplus
 }
 #endif

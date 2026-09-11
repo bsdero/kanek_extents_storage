@@ -279,6 +279,88 @@ bookkeeping-run bullet.** Fixed in commit `97ab19a` ("Bugs fixed.").
   `kes_cache_flush_extent()` body (`src/kes_cache.c` around line
   1247-1250) -- still open, see A.4.1 below.
 
+### KES-6 -- bitmap checksum: silently bit-flipped bitmap block caused real double-allocation (FIXED, CLOSED)
+
+**Closes the `KES-6` entry in `PENDING_FIXES_SEP2026.md`. Full
+implementation plan: `kes_6_plan.md`.**
+
+- Was: `kes_bitmap_load()`/`kes_bitmap_save()` had no integrity check
+  on the on-disk bitmap region. A single silently bit-flipped byte
+  went completely undetected at `kes_storage_open()` time, causing a
+  real double-allocation -- the allocator could hand out a block that
+  was still live and holding another extent's data, silently
+  overwriting it. `tests/test_kes_crash_consistency.c`'s
+  `test_bitflipped_bitmap_block` demonstrated this concretely.
+- Fix (breaking on-disk format change, no migration path -- confirmed
+  with the project owner): added a `uint32_t bitmap_checksum` field to
+  `kes_storage_descriptor_t` (`include/kes/kes_types.h`), shrinking
+  `reserved` from 32 to 28 bytes to keep the struct size unchanged,
+  and bumped `KES_VERSION_MAJOR` to 2. It holds the CRC-32C of the
+  bitmap's on-disk bytes (`bitmap->data`, `bitmap->total_bytes`), via
+  a new `kes_bitmap_checksum()` (`include/kes/kes_bitmap.h`,
+  `src/kes_bitmap.c`) built on `kfl_crc32c()` from the sibling
+  `kanek_foundations` (KFL) repo -- this is the first code in `src/`
+  that actually links `libkfl.a`, not just includes its headers.
+  `src/kes_storage.c`: `load_storage_descriptor()` now rejects any
+  `version_major != KES_VERSION_MAJOR` with `KES_ERROR_CORRUPT` and a
+  `TRACE_ERR` naming the mismatch (a stale pre-KES-6 file's `reserved`
+  bytes would otherwise read as zero, not a real checksum, and
+  spuriously fail the checksum check with a confusing error instead of
+  this precise one); the checksum itself is set on
+  `kes_storage_create()`, verified on `kes_storage_open()`, and
+  refreshed on every `kes_storage_sync()`/`kes_storage_close()`.
+  `Makefile`: `$(FOUNDATIONS_LIB)` is now a real file target (not just
+  a phony convenience alias) linked into `$(SHARED_LIB)` and every
+  test/example binary; `README.md` documents both the breaking format
+  change and the new link-time dependency.
+- Two additional build-system bugs found and fixed while verifying
+  this plan's own checklist, neither described in `kes_6_plan.md`
+  itself (that plan only threaded `FOUNDATIONS_CFLAGS` through
+  `asan`/`tsan`/`soak`, not `FOUNDATIONS_LDFLAGS`, and didn't
+  anticipate either failure mode below):
+  - GNU Make auto-propagates command-line variable overrides (e.g.
+    the `LDFLAGS=...` the `asan`/`tsan`/`soak` targets set on their
+    own `$(MAKE)` invocation) down through nested `$(MAKE)` calls via
+    `MAKEFLAGS`. Since wiring `$(FOUNDATIONS_LIB)` into `all`/`tests`
+    was the first time those targets ever triggered a recursive build
+    of `kanek_foundations`, this silently clobbered that repo's own
+    `LDFLAGS = -L. -lkfl -rdynamic -lpthread` default and broke its
+    own test binaries (e.g. `testrand` failed to link, "undefined
+    reference to `krand64`"). Fixed by adding an explicit
+    `FOUNDATIONS_LDFLAGS` variable (mirroring `FOUNDATIONS_CFLAGS`)
+    that is always passed explicitly on the recursive `$(MAKE) -C
+    $(FOUNDATIONS_SRC)` call, and threaded through the `asan`/`tsan`/
+    `soak` targets the same way `FOUNDATIONS_CFLAGS` already was.
+  - `libkfl.a`'s objects (specifically `crc32c.o`) were never compiled
+    with `-fPIC` in `kanek_foundations`'s own Makefile default, which
+    is fine for a static-only consumer but breaks linking that archive
+    into `libkes.so` (a `-shared` object) outright -- `ld: ... can not
+    be used when making a shared object; recompile with -fPIC`. Not
+    ASan-specific: reproduced on a plain, unsanitized `make all` too.
+    Fixed by adding `-fPIC` to `FOUNDATIONS_CFLAGS`'s base default.
+- Verified (checklist from `kes_6_plan.md`, re-run after both fixes
+  above): `make clean && make test` -- 93/93 passing, including
+  `test_bitflipped_bitmap_block`'s rewritten assertions (now expects
+  `KES_ERROR_CORRUPT`/`st == NULL` on reopen, proving the corruption
+  IS detected, rather than the old "undetected" demonstration).
+  `make asan` -- clean, 12/12 binaries, no ASan/UBSan findings.
+  `make tsan` -- clean, 12/12 binaries, no data races. `make valgrind`
+  -- clean, "ERROR SUMMARY: 0 errors" across all 15 runs. `make
+  check-all` -- **exit 0, "ALL CHECKS PASSED"**. Additionally, a
+  standalone throwaway program confirmed the breaking-change behavior
+  concretely: a storage file created by a build with
+  `KES_VERSION_MAJOR` manually reverted to 1 was then opened by the
+  real (v2) library, producing `kes_storage_open() == KES_ERROR_CORRUPT`
+  (`-7`) with `*storage` left `NULL`, and the log line
+  `incompatible on-disk format version 1.0 (library is 2.0) --
+  storage files created before the KES-6 bitmap-checksum change must
+  be recreated`.
+- Out of scope (per `kes_6_plan.md`, unchanged): `KES-5`
+  (unsynchronized cross-process access, a separate plan that itself
+  depends on this one's `kes_bitmap_checksum()`), a migration/repair
+  tool for pre-KES-6 files, and checksumming anything beyond the
+  bitmap region.
+
 ### `block_count == 0` rejected in `kes_cache_get_extent()` (FIXED, CLOSED)
 
 **Closes Track A.1.3 below and the matching `make check-all`

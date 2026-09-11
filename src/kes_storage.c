@@ -100,6 +100,30 @@ int kes_storage_create( const kes_storage_config_t *config,
         return(result);
     }
 
+    /* KES-6: record the checksum of the freshly-created (all-zero)
+     * in-memory bitmap into the descriptor now, so the descriptor
+     * this function is about to write is self-consistent from the
+     * start rather than carrying a stale/zero checksum until the
+     * first real sync. Note this does NOT itself write the bitmap
+     * bytes to disk -- kes_storage_create() still only writes block 0
+     * (the descriptor) here, same as before this change; see
+     * kes_5_plan.md if that is also being applied, since KES-5 adds
+     * that missing bitmap write for an unrelated reason (making the
+     * file safe to reload-from-disk immediately after create()). The
+     * checksum set here stays correct either way, since it is always
+     * computed from the in-memory bitmap, not from whatever has
+     * physically reached disk. */
+    uint32_t initial_checksum;
+    result = kes_bitmap_checksum( sto->bitmap, &initial_checksum);
+    if ( result != KES_SUCCESS) {
+        kes_bitmap_destroy( sto->bitmap);
+        close( sto->fd);
+        pthread_mutex_destroy( &sto->lock);
+        free( sto);
+        return(result);
+    }
+    sto->desc.bitmap_checksum = initial_checksum;
+
     /* Save initial descriptor to storage */
     result = save_storage_descriptor( sto);
     if ( result != KES_SUCCESS) {
@@ -180,6 +204,31 @@ int kes_storage_open( const char *device_path, uint32_t flags,
         return(result);
     }
 
+    /* KES-6: verify the loaded bitmap against the checksum recorded
+     * in the descriptor at the last successful save, catching silent
+     * on-disk bit flips that kes_bitmap_load()'s own free-bit recount
+     * cannot (a flip that preserves the total population count -- one
+     * bit 1->0, another 0->1 -- is invisible to that recount alone,
+     * but not to a real checksum). */
+    uint32_t computed_checksum;
+    result = kes_bitmap_checksum( sto->bitmap, &computed_checksum);
+    if ( result == KES_SUCCESS &&
+        computed_checksum != sto->desc.bitmap_checksum) {
+        TRACE_ERR( "bitmap checksum mismatch: on-disk 0x%08x, "
+                   "computed 0x%08x -- refusing to open corrupted "
+                   "storage %s",
+                   sto->desc.bitmap_checksum, computed_checksum,
+                   device_path);
+        result = KES_ERROR_CORRUPT;
+    }
+    if ( result != KES_SUCCESS) {
+        kes_bitmap_destroy( sto->bitmap);
+        close( sto->fd);
+        pthread_mutex_destroy( &sto->lock);
+        free( sto);
+        return(result);
+    }
+
     *storage = sto;
     return(KES_SUCCESS);
 }
@@ -196,6 +245,14 @@ int kes_storage_close( kes_storage_t *storage) {
         off_t bitmap_offset = storage->desc.bitmap_start_block *
                                storage->desc.block_size;
         kes_bitmap_save( storage->bitmap, storage->fd, bitmap_offset);
+
+        /* KES-6: refresh the descriptor's bitmap checksum from what
+         * was just written, same reasoning as kes_storage_sync(). */
+        uint32_t checksum;
+        if ( kes_bitmap_checksum( storage->bitmap, &checksum) ==
+            KES_SUCCESS) {
+            storage->desc.bitmap_checksum = checksum;
+        }
 
         /* Save descriptor with updated statistics */
         save_storage_descriptor( storage);
@@ -227,6 +284,18 @@ int kes_storage_sync( kes_storage_t *storage) {
                            storage->desc.block_size;
     int result = kes_bitmap_save( storage->bitmap, storage->fd,
                                    bitmap_offset);
+
+    /* KES-6: refresh the descriptor's checksum from the bitmap bytes
+     * that were just written, before persisting the descriptor itself
+     * -- otherwise the on-disk checksum would keep describing whatever
+     * bitmap contents were current at the LAST sync, not this one. */
+    if ( result == KES_SUCCESS) {
+        uint32_t checksum;
+        result = kes_bitmap_checksum( storage->bitmap, &checksum);
+        if ( result == KES_SUCCESS) {
+            storage->desc.bitmap_checksum = checksum;
+        }
+    }
 
     if ( result == KES_SUCCESS) {
         /* Save descriptor */
@@ -591,6 +660,25 @@ static int load_storage_descriptor( kes_storage_t *storage) {
 
     /* Validate descriptor */
     if ( storage->desc.magic != KES_MAGIC_NUMBER) {
+        return(KES_ERROR_CORRUPT);
+    }
+
+    /* KES-6: the on-disk format gained a bitmap_checksum field and
+     * shrank kes_storage_descriptor_t's reserved bytes accordingly --
+     * a breaking change. Reject anything not written by this exact
+     * major version rather than silently trusting a stale layout
+     * (whose reserved bytes would read as zero, not a real checksum,
+     * and would then always spuriously fail the checksum check in
+     * kes_storage_open() with a confusing KES_ERROR_CORRUPT instead
+     * of this precise one). */
+    if ( storage->desc.version_major != KES_VERSION_MAJOR) {
+        TRACE_ERR( "incompatible on-disk format version %u.%u "
+                   "(library is %u.%u) -- storage files created "
+                   "before the KES-6 bitmap-checksum change must be "
+                   "recreated",
+                   storage->desc.version_major,
+                   storage->desc.version_minor,
+                   KES_VERSION_MAJOR, KES_VERSION_MINOR);
         return(KES_ERROR_CORRUPT);
     }
 

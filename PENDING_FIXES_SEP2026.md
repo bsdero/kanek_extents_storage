@@ -230,7 +230,9 @@ all before building it.
 
 ## KES-6 -- No bitmap checksum: a silently bit-flipped bitmap block causes real double-allocation
 
-**Severity: High. Status: OPEN.**
+**Severity: High. Status: CLOSED -- fixed 2026-09-11, see the matching
+"KES-6" entry in `PENDING_ITEMS.md`'s `## Resolved` section for the
+full implementation writeup and verification evidence.**
 
 `kes_bitmap_load()`/`kes_bitmap_save()` have no checksum or other
 integrity check on the on-disk bitmap region (confirmed by reading

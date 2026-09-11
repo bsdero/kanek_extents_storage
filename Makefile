@@ -20,7 +20,22 @@ FOUNDATIONS_DIR = ../kanek_foundations
 FOUNDATIONS_SRC = $(FOUNDATIONS_DIR)/src
 FOUNDATIONS_LIB = $(FOUNDATIONS_SRC)/libkfl.a
 FOUNDATIONS_REPO = https://github.com/bsdero/kanek_foundations.git
-FOUNDATIONS_CFLAGS = -Wall -DUSER_SPACE -g
+
+# -fPIC is required, not optional: libkfl.a's object code (crc32c.o)
+# gets linked directly into libkes.so (a -shared object, Step 6b of
+# kes_6_plan.md) -- without it, ld refuses to link a non-PIC static
+# archive into a shared object at all ("recompile with -fPIC"), which
+# is not specific to a sanitized build.
+FOUNDATIONS_CFLAGS = -Wall -DUSER_SPACE -g -fPIC
+# Explicit default matching kanek_foundations' own Makefile default.
+# Passed explicitly (not left to inherit) on every recursive $(MAKE)
+# call into that sibling repo below, because GNU Make auto-propagates
+# command-line variable overrides (e.g. the LDFLAGS the asan/tsan/soak
+# targets below set on their own $(MAKE) invocation) down through
+# nested $(MAKE) calls via MAKEFLAGS -- without this, such a recursive
+# build would silently drop kanek_foundations' own "-lkfl" etc. and
+# fail to link its own test binaries (e.g. testrand).
+FOUNDATIONS_LDFLAGS = -L. -lkfl -rdynamic -lpthread
 
 # Compiler and flags
 CC = gcc
@@ -76,14 +91,23 @@ foundations-fetch:
 		git clone $(FOUNDATIONS_REPO) $(FOUNDATIONS_DIR); \
 	fi
 
-# Build libkfl.a from the sibling checkout, using whichever CFLAGS
-# this invocation needs (plain, ASan, or TSan) so instrumentation
-# matches whatever KES itself is being built with. Not a prerequisite
-# of "all" -- only built on demand once code actually links it.
-.PHONY: foundations
-foundations: foundations-fetch
+# libkfl.a is now actually linked (KES-6 needs kfl_crc32c()), not just
+# needed for header resolution -- this is a real file-based Make
+# target so other rules (SHARED_LIB, test/example binaries) can depend
+# on it normally. Always does a clean rebuild: this project already
+# forces full clean rebuilds for asan/tsan/valgrind for the same
+# reason (a stale, differently-instrumented libkfl.a silently linked
+# into a sanitized libkes build/binary would be a real, hard-to-spot
+# bug) -- accept the small extra build time on every invocation as the
+# simple, safe default rather than tracking a CFLAGS fingerprint.
+$(FOUNDATIONS_LIB): foundations-fetch
 	$(MAKE) -C $(FOUNDATIONS_SRC) clean all \
-	    CFLAGS="$(FOUNDATIONS_CFLAGS)"
+	    CFLAGS="$(FOUNDATIONS_CFLAGS)" \
+	    LDFLAGS="$(FOUNDATIONS_LDFLAGS)"
+
+# Convenience alias for manually building/rebuilding libkfl.a.
+.PHONY: foundations
+foundations: $(FOUNDATIONS_LIB)
 
 # Create build directories
 $(BUILD_DIR):
@@ -103,21 +127,21 @@ $(STATIC_LIB): $(OBJECTS)
 	ranlib $@
 
 # Build shared library
-$(SHARED_LIB): $(OBJECTS)
+$(SHARED_LIB): $(OBJECTS) $(FOUNDATIONS_LIB)
 	@echo "Creating shared library $@"
 	$(CC) -shared -Wl,-soname,$(notdir $(SHARED_LIB)) \
 		$(LDFLAGS) -o $@ $^ $(LIBS)
 	ln -sf $(notdir $(SHARED_LIB)) $(SHARED_LIB_LINK)
 
 # Build tests
-$(BUILD_DIR)/tests/%: $(TEST_DIR)/%.c $(STATIC_LIB) | $(BUILD_DIR)
+$(BUILD_DIR)/tests/%: $(TEST_DIR)/%.c $(STATIC_LIB) $(FOUNDATIONS_LIB) | $(BUILD_DIR)
 	@echo "Building test $@"
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(STATIC_LIB) $(LIBS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(STATIC_LIB) $(FOUNDATIONS_LIB) $(LIBS)
 
 # Build examples
-$(BUILD_DIR)/examples/%: $(EXAMPLES_DIR)/%.c $(STATIC_LIB) | $(BUILD_DIR)
+$(BUILD_DIR)/examples/%: $(EXAMPLES_DIR)/%.c $(STATIC_LIB) $(FOUNDATIONS_LIB) | $(BUILD_DIR)
 	@echo "Building example $@"
-	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(STATIC_LIB) $(LIBS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(STATIC_LIB) $(FOUNDATIONS_LIB) $(LIBS)
 
 # Test targets
 .PHONY: tests
@@ -171,7 +195,9 @@ TSAN_FLAGS = -fsanitize=thread -fno-omit-frame-pointer -g
 asan:
 	$(MAKE) clean
 	$(MAKE) all tests CFLAGS="$(CFLAGS) $(ASAN_FLAGS)" \
-	    LDFLAGS="$(LDFLAGS) $(ASAN_FLAGS)"
+	    LDFLAGS="$(LDFLAGS) $(ASAN_FLAGS)" \
+	    FOUNDATIONS_CFLAGS="$(FOUNDATIONS_CFLAGS) $(ASAN_FLAGS)" \
+	    FOUNDATIONS_LDFLAGS="$(FOUNDATIONS_LDFLAGS) $(ASAN_FLAGS)"
 	@echo "Running tests under ASan+UBSan..."
 	# test_kes_fault_injection deliberately triggers a real, expected
 	# allocator OOM (tests/test_kes_fault_injection.c, A.4.2 --
@@ -197,7 +223,9 @@ asan:
 tsan:
 	$(MAKE) clean
 	$(MAKE) all tests CFLAGS="$(CFLAGS) $(TSAN_FLAGS)" \
-	    LDFLAGS="$(LDFLAGS) $(TSAN_FLAGS)"
+	    LDFLAGS="$(LDFLAGS) $(TSAN_FLAGS)" \
+	    FOUNDATIONS_CFLAGS="$(FOUNDATIONS_CFLAGS) $(TSAN_FLAGS)" \
+	    FOUNDATIONS_LDFLAGS="$(FOUNDATIONS_LDFLAGS) $(TSAN_FLAGS)"
 	@echo "Running tests under TSan..."
 	# Same test_kes_fault_injection OOM case the "asan" target above
 	# handles (A.4.2, plan_phase5.md) -- TSan shares the sanitizer
@@ -252,7 +280,9 @@ sanitize-all: asan tsan
 soak:
 	$(MAKE) clean
 	$(MAKE) all tests CFLAGS="$(CFLAGS) $(TSAN_FLAGS)" \
-	    LDFLAGS="$(LDFLAGS) $(TSAN_FLAGS)"
+	    LDFLAGS="$(LDFLAGS) $(TSAN_FLAGS)" \
+	    FOUNDATIONS_CFLAGS="$(FOUNDATIONS_CFLAGS) $(TSAN_FLAGS)" \
+	    FOUNDATIONS_LDFLAGS="$(FOUNDATIONS_LDFLAGS) $(TSAN_FLAGS)"
 	@echo "Running 10-minute soak test under TSan " \
 	     "(KES_SOAK_SECONDS=600)..."
 	KES_SOAK_SECONDS=600 setarch $$(uname -m) -R \

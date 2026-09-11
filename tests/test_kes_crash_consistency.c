@@ -360,44 +360,33 @@ static bool test_truncated_and_corrupted_descriptor(void) {
  * Flips exactly one bit (1 -> 0, i.e. "used" -> "free") in the
  * ON-DISK BITMAP region (not the descriptor) for a block that is
  * genuinely still allocated and holds live written data, then
- * reopens. There is no bitmap checksum anywhere in this codebase
- * (confirmed by reading kes_bitmap_load()/kes_bitmap_save(),
- * src/kes_bitmap.c -- a plain read()/write() of the raw bytes, no
- * validation at all), so no corruption is detected at
- * kes_storage_open() time.
+ * reopens.
  *
- * Characterized precisely, by reading kes_storage_get_stats() and
- * kes_bitmap_load() first: kes_storage_get_stats()'s free_blocks/
- * used_blocks come from storage->desc (loaded from the untouched
- * descriptor block, block 0), so they still report the CORRECT,
- * pre-corruption counts. But the live in-memory bitmap
- * (kes_bitmap_load() recalculates free_bits by actually counting the
- * loaded, now-corrupted bitmap bytes -- see count_used_bits(),
- * src/kes_bitmap.c) silently disagrees with those counts by exactly
- * one bit. This is a real, silent desync between the two redundant
- * sources of truth (storage->desc's stored counters vs. the bitmap's
- * own live bit population), visible only by inspecting
- * storage->bitmap directly (kes_storage_t/kes_bitmap_t are both
- * non-opaque, same pattern tests/test_kes_storage_edge.c already
- * relies on).
+ * This used to go completely undetected: there was no bitmap checksum
+ * anywhere in this codebase (kes_bitmap_load()/kes_bitmap_save() did a
+ * plain read()/write() of the raw bytes, no validation at all), so
+ * kes_storage_open() would succeed despite the corruption, producing a
+ * silent desync between storage->desc's stored counters and the live
+ * bitmap's actual bit population, and concretely handing the
+ * allocator's next request the same still-live, already-allocated
+ * block back -- a real double-allocation and silent-data-corruption
+ * hazard, not just a bookkeeping curiosity.
  *
- * This is then demonstrated as a real double-allocation hazard, not
- * just a bookkeeping curiosity: a fresh 1-block allocation hinted at
- * the exact corrupted block is handed that SAME, still-live block
- * back by the allocator (the bitmap now believes it is free), and
- * writing through the new allocation is shown to silently overwrite
- * the original extent's still-valid data at that block.
+ * KES-6 (see kes_6_plan.md) fixed this by adding a bitmap_checksum
+ * field (CRC-32C of the on-disk bitmap region) to
+ * kes_storage_descriptor_t, refreshed on every save and verified on
+ * every kes_storage_open(). This test now proves the corruption IS
+ * detected: kes_storage_open() fails with KES_ERROR_CORRUPT rather
+ * than silently trusting the corrupted bytes, so none of the old
+ * double-allocation/silent-overwrite demonstration is reachable
+ * anymore.
  */
 static bool test_bitflipped_bitmap_block(void) {
     kes_storage_t *st = NULL;
     kes_extent_descriptor_t ext;
     kes_storage_descriptor_t desc;
-    kes_storage_stats_t stats_before, stats_after;
-    uint64_t bm_total, bm_free_before, bm_used_before;
-    uint64_t bm_free_after, bm_used_after;
+    kes_storage_stats_t stats_before;
     const char *original_data = "still-live-block-0-data";
-    const char *overwrite_data = "OVERWRITTEN-BY-REALLOC";
-    char read_buf[64];
     off_t bit_byte_offset;
     unsigned char bit_byte;
     unsigned char bit_mask;
@@ -452,78 +441,23 @@ static bool test_bitflipped_bitmap_block(void) {
                 "write the corrupted (bit cleared) byte back");
     close( fd);
 
-    /* Reopen -- no corruption is detected (no bitmap checksum). */
-    TEST_ASSERT( kes_storage_open( TEST_FILE, 0, &st) == KES_SUCCESS,
-                "reopen succeeds -- no bitmap-level integrity check "
-                "exists to catch this");
+    /* Reopen -- KES-6's bitmap checksum now catches this. */
+    TEST_ASSERT( kes_storage_open( TEST_FILE, 0, &st) ==
+                    KES_ERROR_CORRUPT,
+                "FIXED (KES-6): a single-bit-flipped bitmap block is "
+                "now detected at open() time via the descriptor's "
+                "bitmap_checksum field, and kes_storage_open() "
+                "correctly refuses to proceed rather than silently "
+                "trusting corrupted bytes");
+    TEST_ASSERT( st == NULL,
+                "*storage was not left pointing at a partially-"
+                "initialized handle on this failure");
 
-    TEST_ASSERT( kes_storage_get_stats( st, &stats_after) ==
-                    KES_SUCCESS,
-                "get_stats after corruption");
-    TEST_ASSERT( stats_after.free_blocks == stats_before.free_blocks &&
-                stats_after.used_blocks == stats_before.used_blocks,
-                "OBSERVED: storage->desc-derived stats are UNCHANGED "
-                "by the bitmap corruption -- they come from the "
-                "untouched descriptor block, not from counting the "
-                "bitmap");
-
-    TEST_ASSERT( kes_bitmap_get_stats( st->bitmap, &bm_total,
-                                       &bm_free_after,
-                                       &bm_used_after) == KES_SUCCESS,
-                "kes_bitmap_get_stats() on the corrupted, reloaded "
-                "bitmap");
-    bm_free_before = stats_before.free_blocks;
-    bm_used_before = stats_before.used_blocks;
-    TEST_ASSERT( bm_free_after == bm_free_before + 1,
-                "OBSERVED SILENT DESYNC: the live bitmap now reports "
-                "exactly one MORE free bit than storage->desc "
-                "believes -- kes_bitmap_load() recalculated free_bits "
-                "by counting the corrupted bytes, while desc's "
-                "counters were loaded unchanged from block 0");
-    TEST_ASSERT( bm_used_after == bm_used_before - 1,
-                "...and correspondingly one fewer used bit, exactly "
-                "matching the single flipped bit");
-
-    /* Concrete consequence: the allocator hands the same, still-live
-     * block back. */
-    kes_extent_descriptor_t realloc_ext;
-    kes_extent_request_t realloc_req = { .block_count = 1,
-                                          .alignment = 0,
-                                          .hint_block = ext.start_block,
-                                          .flags = 0 };
-    TEST_ASSERT( kes_extent_allocate( st, &realloc_req,
-                                      &realloc_ext) == KES_SUCCESS,
-                "a fresh 1-block allocation hinted at the corrupted "
-                "block succeeds");
-    TEST_ASSERT( realloc_ext.start_block == ext.start_block,
-                "OBSERVED HAZARD: it is handed the exact same, "
-                "still-live block back -- the bitmap believes it is "
-                "free");
-
-    TEST_ASSERT( kes_extent_write( st, &realloc_ext, overwrite_data,
-                                   strlen( overwrite_data) + 1, 0) ==
-                    KES_SUCCESS,
-                "write through the new allocation");
-
-    memset( read_buf, 0, sizeof(read_buf));
-    TEST_ASSERT( kes_extent_read( st, &ext, read_buf,
-                                  strlen( overwrite_data) + 1, 0) ==
-                    KES_SUCCESS,
-                "read again via the ORIGINAL extent descriptor");
-    TEST_ASSERT( strcmp( read_buf, overwrite_data) == 0,
-                "CONFIRMED CORRUPTION: the original extent's still-"
-                "referenced data was silently overwritten via the "
-                "reallocated block -- a real, concrete consequence of "
-                "undetected bitmap corruption");
-
-    kes_storage_close( st);
     cleanup();
-    TEST_SUCCESS( "bit-flipped bitmap block: undetected at open() "
-                  "time (no bitmap checksum exists), causes a silent "
-                  "desync between storage->desc's stats and the live "
-                  "bitmap's actual bit population, and concretely "
-                  "leads to double-allocation and silent data "
-                  "corruption of a still-live block");
+    TEST_SUCCESS( "bit-flipped bitmap block: detected at open() time "
+                  "via KES-6's bitmap checksum, refusing to open "
+                  "rather than risking the double-allocation/silent-"
+                  "corruption hazard this test used to demonstrate");
 }
 
 typedef struct {

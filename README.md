@@ -49,6 +49,22 @@ make test
 sudo make install
 ```
 
+> **KES-6 breaking change:** the on-disk storage format gained a
+> `bitmap_checksum` field in `kes_storage_descriptor_t` and bumped
+> `KES_VERSION_MAJOR` to 2. Storage files created by a pre-KES-6 build
+> will fail to open (`KES_ERROR_CORRUPT`, with a log message naming the
+> version mismatch) and must be recreated — there is no migration
+> path.
+>
+> **New link-time dependency:** `libkes.a` now has a real link-time
+> dependency on `kanek_foundations`'s `libkfl.a`, for `kfl_crc32c()`
+> (used to protect the on-disk bitmap, KES-6). `libkes.so` already
+> embeds what it needs and requires nothing extra from consumers. If
+> you link `libkes.a` directly, you must also link `libkfl.a` (build
+> it via `make -C ../kanek_foundations/src`, or point at wherever your
+> project vendors/builds it) — the same way this repo's own `Makefile`
+> now does for its test/example binaries.
+
 ### Basic Usage
 ```c
 #include <kes/kes_storage.h>
