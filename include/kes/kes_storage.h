@@ -33,7 +33,10 @@ struct kes_storage {
 
 /**
  * Create a new KES storage instance
- * @param config Storage configuration
+ * @param config Storage configuration. config->strategy must be
+ *                KES_ALLOC_FIRST_FIT -- BEST_FIT/WORST_FIT/NEXT_FIT
+ *                are declared but not yet implemented and are
+ *                rejected with KES_ERROR_INVALID (KES-2).
  * @param storage Output parameter for created storage handle
  * @return KES_SUCCESS or error code
  */
@@ -45,7 +48,12 @@ int kes_storage_create( const kes_storage_config_t *config,
  * @param device_path Path to storage device or file
  * @param flags Open flags (readonly, sync, etc.)
  * @param storage Output parameter for opened storage handle
- * @return KES_SUCCESS or error code
+ * @return KES_SUCCESS, KES_ERROR_IO if the file is too short to hold
+ *         a full descriptor (e.g. truncated), or KES_ERROR_CORRUPT if
+ *         a full descriptor was read but its magic number, format
+ *         version, or bitmap checksum is invalid -- these are two
+ *         different failure shapes with two different codes, not
+ *         interchangeable (KES-8).
  */
 int kes_storage_open( const char *device_path, uint32_t flags,
                        kes_storage_t **storage);

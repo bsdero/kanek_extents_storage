@@ -178,6 +178,56 @@ static bool test_exhaustion_then_free_and_reallocate(void) {
                   "free-one-and-reallocate");
 }
 
+/*
+ * KES-2: kes_storage_create() must reject a config requesting an
+ * unimplemented allocation strategy, not silently substitute
+ * FIRST_FIT for it. See kes_2_kes_8_plan.md.
+ */
+static bool test_create_rejects_unimplemented_strategy(void) {
+    kes_storage_t *storage = NULL;
+
+    /* Sanity: FIRST_FIT itself must still work -- reuse this file's
+     * existing make_storage() helper (it already sets
+     * .strategy = KES_ALLOC_FIRST_FIT and the rest of a known-good
+     * config), rather than duplicating its fields here. */
+    cleanup();
+    TEST_ASSERT( make_storage( TEST_FILE, &storage) == KES_SUCCESS,
+                "KES_ALLOC_FIRST_FIT is still accepted");
+    kes_storage_close( storage);
+    storage = NULL;
+    cleanup();
+
+    kes_storage_config_t base_cfg = {
+        .device_path = TEST_FILE,
+        .device_size = TEST_SIZE,
+        .block_size = 4096,
+        .flags = KES_STORAGE_CREATE,
+        .strategy = KES_ALLOC_FIRST_FIT,
+    };
+
+    kes_allocation_strategy_t unimplemented[] = {
+        KES_ALLOC_BEST_FIT, KES_ALLOC_WORST_FIT, KES_ALLOC_NEXT_FIT
+    };
+    for ( size_t i = 0; i < sizeof(unimplemented) /
+                            sizeof(unimplemented[0]); i++) {
+        kes_storage_config_t cfg = base_cfg;
+        cfg.strategy = unimplemented[i];
+
+        TEST_ASSERT( kes_storage_create( &cfg, &storage) ==
+                        KES_ERROR_INVALID,
+                    "FIXED (KES-2): an unimplemented allocation "
+                    "strategy is rejected with KES_ERROR_INVALID, "
+                    "not silently substituted with FIRST_FIT");
+        TEST_ASSERT( storage == NULL,
+                    "*storage was not left pointing at a partially-"
+                    "initialized handle on this rejection");
+    }
+
+    TEST_SUCCESS( "kes_storage_create() rejects "
+                  "BEST_FIT/WORST_FIT/NEXT_FIT (unimplemented), "
+                  "accepts FIRST_FIT (implemented)");
+}
+
 typedef struct {
     const char *name;
     bool ( *func)(void);
@@ -186,6 +236,8 @@ typedef struct {
 static test_case_t test_cases[] = {
     {"exhaustion then free and reallocate",
      test_exhaustion_then_free_and_reallocate},
+    {"create rejects unimplemented strategy",
+     test_create_rejects_unimplemented_strategy},
     {NULL, NULL}
 };
 

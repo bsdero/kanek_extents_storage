@@ -463,7 +463,11 @@ int kes_extent_allocate( kes_storage_t *storage,
                                    bitmap_offset);
     }
 
-    /* Use allocation strategy */
+    /* Use allocation strategy. KES-2: validate_config() now rejects
+     * any storage->strategy other than KES_ALLOC_FIRST_FIT before a
+     * kes_storage_t can ever be constructed with one, so the
+     * "default:" case below is defensive/unreachable in practice, not
+     * a silent substitution anymore. */
     if ( result == KES_SUCCESS) {
         switch ( storage->strategy) {
             case KES_ALLOC_FIRST_FIT:
@@ -826,6 +830,22 @@ static int validate_config( const kes_storage_config_t *config) {
         return(KES_ERROR_INVALID);  /* Too small */
     }
 
+    /* KES-2: allocate_extent_first_fit() is the only allocation
+     * strategy actually implemented -- kes_extent_allocate()'s
+     * dispatch switch (below, in this same file) only has a real case
+     * for KES_ALLOC_FIRST_FIT; every other kes_allocation_strategy_t
+     * value falls through its "default:" to the same function
+     * silently. Reject the declared-but-unimplemented strategies here
+     * instead, the same way kes_cache_create() already rejects
+     * KES_CACHE_LFU/_CUSTOM (src/kes_cache.c) rather than silently
+     * substituting a different policy than what was asked for. */
+    if ( config->strategy != KES_ALLOC_FIRST_FIT) {
+        TRACE_ERR( "unimplemented allocation strategy %d requested "
+                   "(only KES_ALLOC_FIRST_FIT is implemented)",
+                   (int)config->strategy);
+        return(KES_ERROR_INVALID);
+    }
+
     return(KES_SUCCESS);
 }
 
@@ -863,7 +883,16 @@ static int load_storage_descriptor( kes_storage_t *storage) {
         return(KES_ERROR_IO);
     }
 
-    /* Read descriptor */
+    /* KES-8: a file shorter than sizeof(kes_storage_descriptor_t)
+     * (e.g. truncated, or never fully written) returns KES_ERROR_IO
+     * here, NOT KES_ERROR_CORRUPT -- deliberately left this way (see
+     * kes_2_kes_8_plan.md; PENDING_FIXES_SEP2026.md's KES-8). A
+     * caller distinguishing "corrupt" from "truncated/missing" by
+     * return code alone should treat KES_ERROR_IO from
+     * kes_storage_open() as "not even a full descriptor's worth of
+     * bytes present" and KES_ERROR_CORRUPT (below) as "a full
+     * descriptor was read, but its magic number is wrong." Either way
+     * kes_storage_open() fails cleanly with no *storage output. */
     ssize_t bytes_read = read( storage->fd, &storage->desc,
                                 sizeof(kes_storage_descriptor_t));
     if ( bytes_read != sizeof(kes_storage_descriptor_t)) {
