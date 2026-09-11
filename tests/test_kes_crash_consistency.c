@@ -87,53 +87,35 @@ static void crash_close( kes_storage_t *storage) {
  * implicit sync entirely) rather than closing cleanly, then reopens
  * and characterizes what actually persisted.
  *
- * include/kes/kes_types.h's KES_STORAGE_SYNC flag doc comment is a
- * single line ("Synchronous I/O") with no explicit durability promise
- * either way for the *default* (non-KES_STORAGE_SYNC) case this test
- * exercises -- per plan_phase5.md's own guidance, that vagueness is
- * treated here as a Track B (docs) finding to flag, not a blocker for
- * writing this test against actually-observed behavior.
+ * This used to demonstrate two distinct, real gaps:
  *
- * TWO DISTINCT OBSERVED BEHAVIORS, discovered by writing this test
- * (not assumed going in):
+ * 1. A storage file that had NEVER been synced/closed even once since
+ *    kes_storage_create() (which used to call save_storage_descriptor()
+ *    for block 0, but never kes_bitmap_save()) was UNOPENABLE after a
+ *    crash before any sync -- kes_bitmap_load() would seek past the
+ *    file's real physical end and fail with KES_ERROR_IO.
+ * 2. Once a storage file HAD been synced/closed at least once, a later
+ *    crash WITHOUT a further sync reopened successfully but into
+ *    STALE bookkeeping, silently "forgetting" any allocations/writes
+ *    made since -- concretely, a fresh allocation after such a reopen
+ *    could be handed the exact same blocks back and silently overwrite
+ *    the "forgotten" data.
  *
- * 1. If a storage file has NEVER been synced/closed even once since
- *    kes_storage_create() (confirmed by reading it: it calls
- *    save_storage_descriptor() for block 0, but never
- *    kes_bitmap_save() -- the bitmap region of the file is never
- *    physically written at create time at all, so the underlying
- *    file is only as large as whatever kes_extent_write() calls have
- *    reached, far short of the bitmap's offset near the end of the
- *    device), a "crash" before any sync makes the storage
- *    UNOPENABLE afterward: kes_storage_open() -> kes_bitmap_load()
- *    seeks to the (never-written) bitmap offset, reads fewer bytes
- *    than expected (past the file's real physical end), and returns
- *    KES_ERROR_IO. This is arguably safer than silent corruption --
- *    the storage refuses to open rather than proceeding with a
- *    garbage bitmap -- but it is a total-unavailability failure mode
- *    worth knowing about, not just a data-loss one.
- * 2. Once a storage file HAS been synced/closed at least once (so
- *    the file is already fully laid out on disk), a later crash
- *    WITHOUT a further sync reopens successfully, but into the
- *    STALE bookkeeping from that last sync -- silently "forgetting"
- *    any allocations/writes made since. Raw extent DATA is still
- *    always durable immediately regardless (kes_extent_write() is a
- *    direct, unbuffered write() syscall, unaffected by any
- *    storage-level sync); what is NOT durable without a sync is
- *    storage->desc.free_blocks/used_blocks and storage->bitmap,
- *    which only reach disk via kes_storage_sync()/
- *    kes_storage_close(). This test demonstrates the concrete,
- *    practical consequence of case 2: a fresh allocation after such
- *    a reopen can be handed the exact same blocks back (the bitmap
- *    thinks they are free) and silently overwrite the "forgotten"
- *    data.
+ * KES-5 (see kes_5_plan.md) fixed both, as a direct consequence of
+ * fixing cross-process storage access correctly (not a separate
+ * change): kes_storage_create() now writes the full bitmap to disk
+ * immediately (fixing case 1), and kes_extent_allocate()/
+ * kes_extent_free() now each perform a full reload-mutate-persist
+ * cycle under an exclusive flock() on every call, so every mutation is
+ * durable on its own the instant it returns -- there is no longer any
+ * unpersisted state left for a crash to lose (fixing case 2). This
+ * test now proves both fixes.
  */
 static bool test_no_sync_reopen_durability(void) {
     kes_storage_t *st = NULL;
     kes_extent_descriptor_t ext;
     kes_storage_stats_t stats_before, stats_after_crash;
     const char *original_data = "original-data-before-crash";
-    const char *new_data = "NEW-DATA-AFTER-REALLOC";
     char read_buf[64];
 
     /* --- Case 1: crash before ANY sync has ever happened. --- */
@@ -143,17 +125,20 @@ static bool test_no_sync_reopen_durability(void) {
     crash_close( st);
     st = NULL;
 
-    TEST_ASSERT( kes_storage_open( TEST_FILE, 0, &st) ==
-                    KES_ERROR_IO,
-                "OBSERVED: a storage file that has never been synced/"
-                "closed even once is UNOPENABLE after a crash -- "
-                "kes_bitmap_load() fails reading a bitmap region that "
-                "was never physically written to the file (see "
-                "comment above); not the KES_ERROR_CORRUPT one might "
-                "assume");
-    TEST_ASSERT( st == NULL,
-                "*storage was not left pointing at a partially-"
-                "initialized handle on this failure");
+    TEST_ASSERT( kes_storage_open( TEST_FILE, 0, &st) == KES_SUCCESS,
+                "FIXED (KES-5): kes_storage_create() now writes the "
+                "full bitmap immediately, so a crash before any "
+                "explicit sync no longer leaves the file too short "
+                "to reopen");
+    kes_storage_stats_t stats_case1;
+    TEST_ASSERT( kes_storage_get_stats( st, &stats_case1) ==
+                    KES_SUCCESS,
+                "get_stats on the reopened, never-allocated storage");
+    TEST_ASSERT( stats_case1.used_blocks == 0,
+                "a storage that crashed before any allocation reopens "
+                "with nothing allocated, as expected");
+    kes_storage_close( st);
+    st = NULL;
     cleanup();
 
     /* --- Case 2: one real sync/close first (fully lays out the
@@ -196,18 +181,16 @@ static bool test_no_sync_reopen_durability(void) {
                     KES_SUCCESS,
                 "get_stats after reopen");
     TEST_ASSERT( stats_after_crash.free_blocks ==
-                    stats_before.free_blocks,
-                "OBSERVED: free_blocks reverted to the pre-allocation "
-                "count -- the allocation was silently forgotten "
-                "because it was never synced");
+                    stats_before.free_blocks - 2,
+                "FIXED (KES-5): the allocation is NOT forgotten -- "
+                "kes_extent_allocate() persisted it immediately, so "
+                "the crash afterward lost nothing");
     TEST_ASSERT( stats_after_crash.used_blocks ==
-                    stats_before.used_blocks,
-                "OBSERVED: used_blocks likewise reverted to 0 -- the "
-                "descriptor on disk is still the one "
-                "kes_storage_create() originally wrote");
+                    stats_before.used_blocks + 2,
+                "used_blocks correctly reflects the allocation that "
+                "survived the crash");
 
-    /* The data itself, however, is still physically present --
-     * kes_extent_write() was a direct, unbuffered write(). */
+    /* The data is still physically present, as before. */
     memset( read_buf, 0, sizeof(read_buf));
     TEST_ASSERT( kes_extent_read( st, &ext, read_buf,
                                   strlen( original_data) + 1, 0) ==
@@ -215,13 +198,13 @@ static bool test_no_sync_reopen_durability(void) {
                 "read via the remembered (pre-crash) extent "
                 "descriptor still succeeds");
     TEST_ASSERT( strcmp( read_buf, original_data) == 0,
-                "OBSERVED: the previously-written data is still "
-                "physically present and readable, even though the "
-                "storage's own bookkeeping has forgotten the "
-                "allocation that produced it");
+                "the previously-written data is still physically "
+                "present and readable");
 
-    /* Concrete consequence: a fresh allocation hinted at the same
-     * start_block is handed the same, still-live blocks back. */
+    /* FIXED (KES-5): a fresh allocation hinted at the same block is
+     * NOT handed the same, still-live block back -- the bitmap
+     * correctly still marks it used, because the reopen above
+     * reloaded the real, persisted state. */
     kes_extent_descriptor_t realloc_ext;
     kes_extent_request_t realloc_req = { .block_count = 2,
                                           .alignment = 0,
@@ -229,39 +212,31 @@ static bool test_no_sync_reopen_durability(void) {
                                           .flags = 0 };
     TEST_ASSERT( kes_extent_allocate( st, &realloc_req,
                                       &realloc_ext) == KES_SUCCESS,
-                "a fresh allocation after reopen succeeds");
-    TEST_ASSERT( realloc_ext.start_block == ext.start_block,
-                "OBSERVED HAZARD: the fresh allocation is handed the "
-                "exact same start_block as the 'forgotten' extent -- "
-                "the bitmap believes those blocks are free");
+                "a fresh allocation after reopen still succeeds "
+                "(there is free space elsewhere)");
+    TEST_ASSERT( realloc_ext.start_block != ext.start_block,
+                "FIXED (KES-5): the fresh allocation is NOT handed "
+                "the original extent's still-live start_block -- the "
+                "bitmap correctly knows those blocks are still used");
 
-    TEST_ASSERT( kes_extent_write( st, &realloc_ext, new_data,
-                                   strlen( new_data) + 1, 0) ==
-                    KES_SUCCESS,
-                "write through the new allocation");
-
+    /* Confirm the original data was NOT touched by the new
+     * allocation. */
     memset( read_buf, 0, sizeof(read_buf));
     TEST_ASSERT( kes_extent_read( st, &ext, read_buf,
-                                  strlen( new_data) + 1, 0) ==
+                                  strlen( original_data) + 1, 0) ==
                     KES_SUCCESS,
-                "read again via the ORIGINAL (pre-crash) extent "
-                "descriptor");
-    TEST_ASSERT( strcmp( read_buf, new_data) == 0,
-                "CONFIRMED CORRUPTION: the original extent's data was "
-                "silently overwritten by the new allocation -- a real, "
-                "concrete consequence of unsynced allocations, not "
-                "just an abstract bookkeeping curiosity");
+                "read again via the original extent descriptor");
+    TEST_ASSERT( strcmp( read_buf, original_data) == 0,
+                "FIXED (KES-5): the original extent's data is "
+                "UNCHANGED -- no double-allocation occurred");
 
     kes_storage_close( st);
     cleanup();
-    TEST_SUCCESS( "no-explicit-sync reopen: extent DATA is always "
-                  "durable (direct write()), but bitmap/descriptor "
-                  "bookkeeping is only durable via sync()/close() -- "
-                  "an unsynced crash can lead to real double-"
-                  "allocation and silent data corruption "
-                  "(KES_STORAGE_SYNC's doc comment does not make this "
-                  "durability boundary explicit -- flagged as a "
-                  "Track B docs gap, not fixed here)");
+    TEST_SUCCESS( "no-explicit-sync reopen: FIXED by KES-5 -- every "
+                  "kes_extent_allocate()/kes_extent_free() call is "
+                  "now durable on its own, so a crash between an "
+                  "allocation and an explicit sync no longer loses "
+                  "bookkeeping or causes double-allocation");
 }
 
 /* ================================================================

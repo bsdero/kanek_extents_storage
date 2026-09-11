@@ -364,12 +364,16 @@ stress:
 		echo "=== stress: clean rebuild under ASan+UBSan ==="; \
 		$(MAKE) clean; \
 		$(MAKE) all tests CFLAGS="$(CFLAGS) $(ASAN_FLAGS)" \
-		    LDFLAGS="$(LDFLAGS) $(ASAN_FLAGS)"; \
+		    LDFLAGS="$(LDFLAGS) $(ASAN_FLAGS)" \
+		    FOUNDATIONS_CFLAGS="$(FOUNDATIONS_CFLAGS) $(ASAN_FLAGS)" \
+		    FOUNDATIONS_LDFLAGS="$(FOUNDATIONS_LDFLAGS) $(ASAN_FLAGS)"; \
 	elif [ "$(SANITIZER)" = "tsan" ]; then \
 		echo "=== stress: clean rebuild under TSan ==="; \
 		$(MAKE) clean; \
 		$(MAKE) all tests CFLAGS="$(CFLAGS) $(TSAN_FLAGS)" \
-		    LDFLAGS="$(LDFLAGS) $(TSAN_FLAGS)"; \
+		    LDFLAGS="$(LDFLAGS) $(TSAN_FLAGS)" \
+		    FOUNDATIONS_CFLAGS="$(FOUNDATIONS_CFLAGS) $(TSAN_FLAGS)" \
+		    FOUNDATIONS_LDFLAGS="$(FOUNDATIONS_LDFLAGS) $(TSAN_FLAGS)"; \
 	elif [ -n "$(SANITIZER)" ]; then \
 		echo "stress: unknown SANITIZER=$(SANITIZER)" \
 		     "(expected asan or tsan)"; \

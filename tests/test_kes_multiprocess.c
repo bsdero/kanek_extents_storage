@@ -329,41 +329,30 @@ static void run_racing_side( kes_storage_t *storage,
  * same file and issue overlapping kes_extent_allocate()/
  * kes_extent_write() calls with no coordination at all.
  *
- * This is intentional and does not test correctness. AGENTS.md and
- * PENDING_ITEMS.md already establish that unsynchronized concurrent
- * access to the same storage file from two independent kes_storage_t
- * instances is a documented, unguarded gap: each process loads its
- * own in-memory bitmap once at open() time and only flushes it back
- * on kes_storage_sync()/close(), with no cross-process locking at
- * all (a pthread_mutex_t inside kes_storage_t, same as
- * test_kes_cross_process_sync_io()'s doc comment explains, cannot
- * coordinate across two OS processes). Two independent processes
- * racing kes_extent_allocate() against the same on-disk bitmap are
- * expected to make conflicting "this block is free" decisions and
- * then overwrite each other's kes_storage_sync() flush of the
- * descriptor/bitmap block, corrupting free/used block accounting.
+ * This used to be intentional and not test correctness: AGENTS.md and
+ * PENDING_ITEMS.md established that unsynchronized concurrent access
+ * to the same storage file from two independent kes_storage_t
+ * instances was a documented, unguarded gap -- each process loaded
+ * its own in-memory bitmap once at open() time and only flushed it
+ * back on kes_storage_sync()/close(), with no cross-process locking
+ * at all (a pthread_mutex_t inside kes_storage_t cannot coordinate
+ * across two OS processes). Two independent processes racing
+ * kes_extent_allocate() against the same on-disk bitmap made
+ * conflicting "this block is free" decisions and then overwrote each
+ * other's kes_storage_sync() flush of the descriptor/bitmap block,
+ * corrupting free/used block accounting.
  *
- * This test's job is only to:
- *   - Run to completion without hanging or crashing the test harness
- *     itself, using a bounded number of racing operations
- *     (RACE_OP_COUNT per side, not an infinite loop).
- *   - Record and print what actually happens -- both sides' final
- *     free_blocks/used_blocks and descriptor magic -- as a
- *     documented, known limitation for a human to read, not as a
- *     pass/fail correctness assertion. It intentionally does NOT
- *     assert the two sides agree, or that free_blocks/used_blocks
- *     end up internally consistent.
- *   - Not attempt to fix the underlying race -- explicitly out of
- *     scope, see PENDING_ITEMS.md's "concurrent open of the same
- *     storage file" item and plan_phase5.md S1.
- *
- * The only real pass/fail assertions here are: fork() succeeded,
- * both processes opened the (already-created) storage file
- * successfully, the child was reaped without a crash signal
- * (WIFSIGNALED), and the descriptor magic number is *some* value
- * (kes_storage_get_descriptor() itself did not fail) -- i.e. this
- * verifies the race does not crash either process, which is the one
- * property this test is actually here to guarantee.
+ * KES-5 (see kes_5_plan.md) fixed this: kes_extent_allocate()/
+ * kes_extent_free() now each acquire an exclusive flock() on the
+ * backing file, reload the descriptor/bitmap fresh from disk, mutate,
+ * and persist the result before releasing the lock -- every mutating
+ * operation from either process is now a self-contained, durable
+ * read-reload-mutate-write cycle, so the two sides can no longer
+ * silently clobber each other. This test now upgrades from "doesn't
+ * crash" to "produces correct accounting": the real on-disk
+ * used_blocks after both processes exit is asserted to exactly match
+ * the sum of both sides' successful allocations, with no allocation
+ * silently lost or clobbered.
  */
 static bool test_cross_process_racing_io(void){
     kes_storage_t *storage = NULL;
@@ -430,85 +419,60 @@ static bool test_cross_process_racing_io(void){
     TEST_ASSERT( shared->child.open_ok,
                 "child independently opened the storage file too");
 
-    printf( "\n  [known limitation -- unsynchronized cross-process "
-            "race, see PENDING_ITEMS.md] "
-            "parent: allocs=%d free_blocks=%llu used_blocks=%llu "
-            "magic=0x%08x | child: allocs=%d free_blocks=%llu "
-            "used_blocks=%llu magic=0x%08x\n",
+    printf( "\n  parent: allocs=%d | child: allocs=%d\n",
             shared->parent.successful_allocs,
-            (unsigned long long)shared->parent.final_free_blocks,
-            (unsigned long long)shared->parent.final_used_blocks,
-            shared->parent.final_magic,
-            shared->child.successful_allocs,
-            (unsigned long long)shared->child.final_free_blocks,
-            (unsigned long long)shared->child.final_used_blocks,
-            shared->child.final_magic);
-
-    if ( shared->parent.final_free_blocks !=
-         shared->child.final_free_blocks ||
-         shared->parent.final_used_blocks !=
-         shared->child.final_used_blocks) {
-        printf( "  [known limitation] parent/child final block "
-                "accounting diverged, as expected for unsynchronized "
-                "concurrent access -- this is the corruption "
-                "PENDING_ITEMS.md documents, not a test failure.\n");
-    }
-    if ( shared->parent.final_magic != KES_MAGIC_NUMBER ||
-         shared->child.final_magic != KES_MAGIC_NUMBER) {
-        printf( "  [known limitation] a racing kes_storage_sync() "
-                "left the on-disk descriptor magic number other "
-                "than KES_MAGIC_NUMBER as observed by one side.\n");
-    }
+            shared->child.successful_allocs);
 
     /*
-     * Each side's final_free_blocks/final_used_blocks above only
-     * reflects that process's own private in-memory view -- both
-     * loaded an independent copy of the bitmap at open() time and
-     * never saw the other's writes, so each one looks internally
-     * "consistent" from its own perspective even though real
-     * corruption occurred. A third, non-racing kes_storage_open()
-     * here, after both processes have exited, reveals the actual
-     * persisted state: whichever process's kes_storage_sync() call
-     * physically landed last silently overwrote the other's bitmap/
-     * descriptor block, so the real on-disk used_blocks is expected
-     * to reflect only one side's allocations (<= RACE_OP_COUNT), not
-     * the sum of both (up to 2 * RACE_OP_COUNT) -- this is where the
-     * lost/clobbered allocations actually become visible.
+     * A third, non-racing kes_storage_open() here, after both
+     * processes have exited, reveals the actual persisted state.
+     * FIXED (KES-5): every kes_extent_allocate() call now performs a
+     * full reload-mutate-persist cycle under an exclusive flock(),
+     * so the real on-disk used_blocks exactly matches the sum of
+     * both sides' successful allocations -- no allocation is lost or
+     * clobbered by the other side's concurrent access.
      */
     kes_storage_t *final_storage = NULL;
-    if ( kes_storage_open( RACE_TEST_FILE, KES_STORAGE_READONLY,
-                           &final_storage) == KES_SUCCESS) {
-        kes_storage_stats_t final_stats;
-        int combined_allocs = shared->parent.successful_allocs +
-                               shared->child.successful_allocs;
+    TEST_ASSERT( kes_storage_open( RACE_TEST_FILE, KES_STORAGE_READONLY,
+                                   &final_storage) == KES_SUCCESS,
+                "FIXED (KES-5): final read-only reopen succeeds");
 
-        if ( kes_storage_get_stats( final_storage,
-                                    &final_stats) == KES_SUCCESS) {
-            printf( "  [known limitation] real on-disk state after "
-                    "both processes exited: used_blocks=%llu "
-                    "free_blocks=%llu, vs. %d combined allocations "
-                    "the two processes each believed succeeded -- "
-                    "any shortfall is allocations one side's "
-                    "kes_storage_sync() silently clobbered.\n",
-                    (unsigned long long)final_stats.used_blocks,
-                    (unsigned long long)final_stats.free_blocks,
-                    combined_allocs);
-        }
-        kes_storage_close( final_storage);
-    } else {
-        printf( "  [known limitation] final read-only re-open of the "
-                "raced storage file failed -- see AGENTS.md/"
-                "PENDING_ITEMS.md's unsynchronized-access gap.\n");
-    }
+    kes_storage_stats_t final_stats;
+    int combined_allocs = shared->parent.successful_allocs +
+                           shared->child.successful_allocs;
+    TEST_ASSERT( kes_storage_get_stats( final_storage,
+                                        &final_stats) == KES_SUCCESS,
+                "get_stats on the final reopen");
+    printf( "  combined=%d | final used_blocks=%llu\n",
+            combined_allocs,
+            (unsigned long long)final_stats.used_blocks);
+
+    /* Each racing allocation in run_racing_side() requests
+     * block_count == 1, so combined_allocs blocks used is exact. */
+    TEST_ASSERT( final_stats.used_blocks == (uint64_t)combined_allocs,
+                "FIXED (KES-5): real on-disk used_blocks now exactly "
+                "matches the sum of both sides' successful "
+                "allocations -- no allocation was silently clobbered");
+
+    kes_storage_descriptor_t final_desc;
+    TEST_ASSERT( kes_storage_get_descriptor( final_storage,
+                                             &final_desc) ==
+                    KES_SUCCESS,
+                "get_descriptor on the final reopen");
+    TEST_ASSERT( final_desc.magic == KES_MAGIC_NUMBER,
+                "FIXED (KES-5): on-disk descriptor magic number is "
+                "intact after the race -- no partial/torn descriptor "
+                "write from either side's racing kes_storage_sync()");
+
+    kes_storage_close( final_storage);
 
     munmap( shared, sizeof( race_shared_t));
     unlink( RACE_TEST_FILE);
 
-    TEST_SUCCESS( "cross-process UNSYNCHRONIZED racing extent "
-                  "allocate/write -- completes without hanging or "
-                  "crashing; any accounting divergence printed above "
-                  "is a documented, known limitation, not a failure "
-                  "of this test");
+    TEST_SUCCESS( "cross-process racing extent allocate/write: FIXED "
+                  "by KES-5 -- real on-disk accounting exactly "
+                  "matches both sides' combined successful "
+                  "allocations, with no lost or clobbered updates");
 }
 
 typedef struct{

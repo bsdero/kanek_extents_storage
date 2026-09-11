@@ -64,6 +64,19 @@ sudo make install
 > it via `make -C ../kanek_foundations/src`, or point at wherever your
 > project vendors/builds it) — the same way this repo's own `Makefile`
 > now does for its test/example binaries.
+>
+> **KES-5 performance trade-off:** every `kes_extent_allocate()`/
+> `kes_extent_free()` call now does a full reload of the descriptor
+> and bitmap from disk, a full write-back, and a synchronous `fsync()`,
+> all under an exclusive file lock (`flock()`) — turning what used to
+> be a pure in-memory operation into a full durable disk operation on
+> every call. This is a deliberate, necessary consequence of making
+> concurrent access from multiple `kes_storage_t*` handles (same
+> process or different processes) on the same backing file safe,
+> rather than an oversight, and it changes the throughput profile for
+> allocate/free-heavy workloads significantly. Reducing how often the
+> fsync/reload happens is a real, separate follow-up design question
+> if either downstream project needs higher throughput later.
 
 ### Basic Usage
 ```c

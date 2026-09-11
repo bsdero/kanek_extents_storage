@@ -361,6 +361,129 @@ implementation plan: `kes_6_plan.md`.**
   tool for pre-KES-6 files, and checksumming anything beyond the
   bitmap region.
 
+### KES-5 -- unsynchronized cross-process/cross-handle storage access corrupted state (FIXED, CLOSED)
+
+**Closes the `KES-5` entry in `PENDING_FIXES_SEP2026.md`. Full
+implementation plan: `kes_5_plan.md`. Depended on KES-6 (bitmap
+checksum) above, which landed first.**
+
+- Was: `kes_storage_t`'s `pthread_mutex_t` only coordinates threads
+  within one process. It could not coordinate two independent
+  processes -- or even two independent `kes_storage_open()` handles in
+  the same process -- against the same backing file.
+  `tests/test_kes_multiprocess.c`'s `test_cross_process_racing_io`
+  demonstrated real, concrete corruption: two processes racing
+  `kes_extent_allocate()`/`kes_extent_write()` against the same file
+  with zero coordination, and the real on-disk `used_blocks` afterward
+  was *less* than the combined allocations both sides believed
+  succeeded -- one side's `kes_storage_sync()` silently clobbered the
+  other's. Simply wrapping the existing code in `flock()` would not
+  have fixed this: the actual defect was a lost-update problem (each
+  handle allocating against a private, increasingly-stale in-memory
+  bitmap copy loaded once at `open()` time), not two writes literally
+  overlapping in time.
+- Fix (OS-level serialization, not a single-writer lock -- confirmed
+  with the project owner; a second concurrent `kes_storage_open()`
+  remains a supported pattern, not rejected): `src/kes_storage.c`'s
+  `kes_extent_allocate()`, `kes_extent_free()`, `kes_storage_sync()`,
+  and the bitmap-save block inside `kes_storage_close()` each now
+  acquire an exclusive `flock(storage->fd, LOCK_EX)` (not `fcntl()`
+  record locks -- those are process+inode scoped and would incorrectly
+  merge/release across independent same-process handles on a `close()`
+  of any one of them; `flock()` is scoped to the open file description
+  and correctly covers both the cross-process and same-process/
+  independent-handle cases), then perform a full **read-reload-mutate-
+  write** cycle against the file -- reloading the descriptor/bitmap
+  fresh from disk (discarding any stale in-memory copy), applying the
+  mutation, and persisting the result (bitmap, then
+  checksum-refreshed descriptor, then `fsync()`) before releasing the
+  lock. `kes_storage_create()` now also writes the freshly-created
+  bitmap to disk immediately (previously only the descriptor block was
+  written at create time), which both the new mandatory reload step
+  and a separate, previously-documented "storage file unopenable after
+  a crash before any sync" gap (`PENDING_ITEMS.md` A.5.1 Case 1)
+  needed. A positive side effect of the correct fix, not a separate
+  feature: every `kes_extent_allocate()`/`kes_extent_free()` call is
+  now durable on its own the instant it returns, so a crash between an
+  allocation and an explicit `kes_storage_sync()` no longer loses
+  bookkeeping either.
+- A real, previously-unknown race found and fixed while verifying this
+  plan's own checklist, not described in `kes_5_plan.md` itself: the
+  plan never added any locking to `kes_storage_open()`, reasoning only
+  that it "does not reject a second concurrent open." But
+  `kes_storage_open()` reads the descriptor and then, separately, the
+  bitmap with no lock at all -- and once `kes_extent_allocate()`/
+  `kes_extent_free()` started writing the bitmap region and the
+  descriptor block as two *separate* `write()` calls while holding
+  `LOCK_EX` (every single call, not just at `sync()`/`close()` time as
+  before), an unlocked concurrent `kes_storage_open()` could land
+  between those two writes and read a torn combination: the new
+  bitmap bytes paired with the not-yet-updated (old-checksum)
+  descriptor -- tripping KES-6's checksum check and failing with
+  `KES_ERROR_CORRUPT` on a perfectly healthy file. First observed as a
+  real, reproducible `test_cross_process_racing_io` failure under
+  `make asan` (slower execution widened the window), not as a
+  theoretical concern. Fixed by having `kes_storage_open()` take a
+  **shared** `flock(LOCK_SH)` around its whole read sequence
+  (descriptor load, bitmap create/load, checksum verification) --
+  compatible with other concurrent readers, but blocks until any
+  in-progress exclusive writer's critical section finishes, so it can
+  never observe a torn intermediate state.
+- Test changes: `tests/test_kes_crash_consistency.c`'s
+  `test_no_sync_reopen_durability` rewritten -- Case 1 (crash before
+  any sync) now expects `kes_storage_open() == KES_SUCCESS` instead of
+  `KES_ERROR_IO` (the file is always fully laid out after `create()`
+  now); Case 2 (crash after an unsynced allocate+write) now asserts
+  the allocation survives the crash and a fresh allocation hinted at
+  the same block is correctly refused the still-live block, instead of
+  asserting the old "forgotten allocation -> double-allocation"
+  hazard. `tests/test_kes_multiprocess.c`'s
+  `test_cross_process_racing_io` upgraded from printing "known
+  limitation" observations to real `TEST_ASSERT`s: the real on-disk
+  `used_blocks` after both processes exit now must exactly equal the
+  sum of both sides' successful allocations (each racing allocation
+  requests `block_count == 1`), and the descriptor magic number must
+  stay intact.
+- A second build-system bug, same class as the two found during KES-6,
+  fixed alongside the `kes_storage_open()` race above:
+  `Makefile`'s pre-existing `stress` target (`make stress
+  SANITIZER=asan|tsan`) had the identical `FOUNDATIONS_CFLAGS`/
+  `FOUNDATIONS_LDFLAGS`-propagation gap the `asan`/`tsan`/`soak`
+  targets had before KES-6 fixed it for them -- never triggered before
+  because `stress` predates `$(FOUNDATIONS_LIB)` being a real
+  prerequisite of `all`/`tests`. Fixed the same way: both flags now
+  threaded through its `asan`/`tsan` rebuild branches.
+- Verified (checklist from `kes_5_plan.md`, re-run after the
+  `kes_storage_open()` fix above): `make clean && make test` -- 93/93
+  passing, including both rewritten tests' new assertions. `make asan`
+  -- clean across three separate runs (12/12 binaries each; the first
+  run before the `kes_storage_open()` fix reproduced the
+  `KES_ERROR_CORRUPT` race exactly once, confirming it was real, not
+  flaky test logic). `make tsan` -- clean, 12/12, no data races and no
+  lock-related hangs (the most relevant sanitizer for this change's
+  new `flock()`/`pthread_mutex_t` paths). `make valgrind` -- clean,
+  "ERROR SUMMARY: 0 errors" across all 15 runs. `make check-all` --
+  **exit 0, "ALL CHECKS PASSED."** `make stress SANITIZER=tsan
+  STRESS_RUNS=30` -- **"ALL RUNS PASSED"**, 30/30 for both
+  `test_kes_cache` and `test_kes_multiprocess`. Additionally, the
+  `test_kes_multiprocess` binary was run standalone 40 times in a row
+  (plain build) and 25 more times with a 15s timeout per run (to
+  specifically watch for a `flock()` deadlock/hang from a missing
+  unlock on some path) -- 0 failures, 0 hangs, total wall time ~4s for
+  the 25-run batch.
+- Out of scope (per `kes_5_plan.md`, unchanged): `kes_extent_read()`/
+  `kes_extent_write()` (unchanged -- they operate on raw block data at
+  a fixed offset and never touch the shared bitmap/descriptor state
+  this plan protects; two callers racing a write to the *same* extent
+  is a separate, application-level concern), `kes_storage_get_stats()`/
+  `kes_storage_get_descriptor()` still returning a possibly-stale
+  snapshot from this handle's last reload (call `kes_storage_sync()`
+  first for a guaranteed-fresh cross-process view), concurrent
+  `kes_storage_create()` calls racing to create the same not-yet-
+  existing file, any change to `kes_cache.c`/`kes_cache.h` (unaffected
+  -- the cache layer does not depend on `kes_storage.c`), and a
+  non-blocking/timeout variant of the `flock()` acquisition.
+
 ### `block_count == 0` rejected in `kes_cache_get_extent()` (FIXED, CLOSED)
 
 **Closes Track A.1.3 below and the matching `make check-all`

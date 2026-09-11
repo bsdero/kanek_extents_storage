@@ -192,7 +192,9 @@ a pure bug fix, so needs a decision before implementing.
 
 ## KES-5 -- Unsynchronized concurrent access to the same storage file from two `kes_storage_t*` instances corrupts state
 
-**Severity: High. Status: OPEN, unguarded.**
+**Severity: High. Status: CLOSED -- fixed 2026-09-11, see the matching
+"KES-5" entry in `PENDING_ITEMS.md`'s `## Resolved` section for the
+full implementation writeup and verification evidence.**
 
 `kes_storage_t`'s `pthread_mutex_t` only coordinates threads within one
 process; it cannot coordinate two independent processes (or even two
