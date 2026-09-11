@@ -210,21 +210,22 @@ find_entry( kes_cache_t *cache, const kes_extent_id_t *id) {
  * before the load was even attempted), so it now counts an entry that
  * will never again be retrievable through the normal hit path.
  *
- * REAL, OBSERVED GAP (reported per rule 0.3, NOT fixed here --
- * production-code changes are out of scope for this file; see this
- * pass's final report and the matching PENDING_ITEMS.md note): a
- * second kes_cache_get_extent() call on the same id, even with the
- * failure condition fully cleared, does NOT retry the load. The hit
- * path (src/kes_cache.c) checks `entry->state & KES_EXTENT_ERROR`
- * and returns KES_ERROR_IO immediately, without ever calling
- * read_extent() again -- the entry is permanently stuck until a
- * caller explicitly calls kes_cache_invalidate() on that exact id (a
- * plausible, but currently undocumented, required recovery step) to
- * remove it, after which a fresh get_extent() succeeds normally. This
- * test demonstrates and asserts all of that as actually-observed
- * behavior, including the successful invalidate()+retry recovery
- * path, and confirms the hash table itself is not corrupted (the
- * stuck state is confined to that one entry).
+ * FIXED (KES-4, see kes_3_kes_4_plan.md): a second
+ * kes_cache_get_extent() call on the same id used to never retry the
+ * load, even with the failure condition fully cleared -- the hit path
+ * (src/kes_cache.c) checked `entry->state & KES_EXTENT_ERROR` and
+ * returned KES_ERROR_IO immediately, without ever calling
+ * read_extent() again, permanently stuck until an explicit
+ * kes_cache_invalidate() call. kes_cache_get_extent() now retries
+ * exactly once, synchronously, whenever an entry is KES_EXTENT_ERROR
+ * without KES_EXTENT_DIRTY also set (the DIRTY case is a failed
+ * flush, not a failed load -- see
+ * test_get_extent_does_not_retry_dirty_error_entry() below and
+ * kes_3_kes_4_plan.md's "Critical interaction" section for why that
+ * combination must NOT be retried via a read). This test demonstrates
+ * the fixed direct-retry recovery path and confirms the hash table
+ * itself is not corrupted (the pre-recovery ERROR state is confined
+ * to that one entry).
  */
 static bool test_load_failure_hash_table_state(void) {
     kes_cache_config_t cfg;
@@ -267,36 +268,29 @@ static bool test_load_failure_hash_table_state(void) {
                 "phantom ref_count was released back to 0 (already "
                 "covered by tests/test_kes_cache.c, reconfirmed here)");
 
-    /* Clear the failure condition and retry -- observed behavior:
-     * this does NOT succeed, because the entry is still present and
-     * still in KES_EXTENT_ERROR state. */
+    /* Clear the failure condition and retry -- FIXED (KES-4): this
+     * now succeeds directly, without needing an explicit
+     * kes_cache_invalidate() first. */
     fi_reset( &g_read_fault);
     buf = NULL;
     result = kes_cache_get_extent( cache, &id, &buf);
-    TEST_ASSERT( result == KES_ERROR_IO,
-                "OBSERVED GAP: retry with the failure condition "
-                "cleared still returns KES_ERROR_IO -- read_extent() "
-                "is never called again for this id (see header "
-                "comment; g_read_fault.call_count below proves it)");
-    TEST_ASSERT( buf == NULL, "buffer stays NULL on the stuck retry");
-    TEST_ASSERT( g_read_fault.call_count == 0,
-                "proof the retry never even attempted a real read: "
-                "the (already-cleared) fault harness saw zero calls");
-
-    /* Only recovery path: explicit invalidate() first. ref_count is
-     * already 0 (verified above), so this is not BUSY. */
-    result = kes_cache_invalidate( cache, &id);
     TEST_ASSERT( result == KES_SUCCESS,
-                "invalidate() removes the stuck ERROR entry");
+                "FIXED (KES-4): retry with the failure condition "
+                "cleared now succeeds -- kes_cache_get_extent() "
+                "auto-retries a stale KES_EXTENT_ERROR entry once "
+                "per call instead of returning KES_ERROR_IO forever");
+    TEST_ASSERT( buf != NULL, "buffer is non-NULL on the recovered "
+                "get");
+    TEST_ASSERT( g_read_fault.call_count == 1,
+                "proof a real retry attempt happened: the "
+                "(already-cleared) fault harness saw exactly one "
+                "call");
 
-    buf = NULL;
-    result = kes_cache_get_extent( cache, &id, &buf);
-    TEST_ASSERT( result == KES_SUCCESS,
-                "after invalidate(), a fresh get_extent() on the same "
-                "id succeeds normally -- confirms the hash table "
-                "itself was never corrupted, only the one entry was "
-                "stuck");
-    TEST_ASSERT( buf != NULL, "buffer non-NULL on the recovered get");
+    entry = find_entry( cache, &id);
+    TEST_ASSERT( entry != NULL && entry->state == KES_EXTENT_CLEAN,
+                "the entry transitioned to KES_EXTENT_CLEAN after "
+                "the successful retry");
+
     kes_cache_put_extent( cache, &id);
 
     kes_cache_get_stats( cache, &stats);
@@ -306,10 +300,9 @@ static bool test_load_failure_hash_table_state(void) {
     kes_cache_destroy( cache);
     TEST_SUCCESS( "load-failure hash-table state: entry survives in "
                   "KES_EXTENT_ERROR state without corrupting the "
-                  "table, but is NOT auto-retried on a cleared "
-                  "failure condition -- real gap reported, not fixed "
-                  "(see header comment, final report, "
-                  "PENDING_ITEMS.md)");
+                  "table, and is now auto-retried once a cleared "
+                  "failure condition allows it to succeed (KES-4, "
+                  "see kes_3_kes_4_plan.md)");
 }
 
 /* ================================================================
@@ -409,6 +402,91 @@ static bool test_flush_failure_dirty_state(void) {
                   "KES_EXTENT_ERROR are both set on a failed sync() "
                   "flush, entry is not evicted, and a later successful "
                   "sync() recovers cleanly (S4.1 point 1)");
+}
+
+/*
+ * KES-3 + KES-4 interaction: an entry left in KES_EXTENT_ERROR |
+ * KES_EXTENT_DIRTY by a failed flush (KES-3) must NOT be
+ * auto-retried via a fresh read (KES-4) -- that would silently
+ * overwrite its still-valid, unflushed data with stale on-disk
+ * bytes. See kes_3_kes_4_plan.md's "Critical interaction" section.
+ */
+static bool test_get_extent_does_not_retry_dirty_error_entry(void) {
+    kes_cache_config_t cfg;
+    kes_cache_t *cache;
+    void *buf = NULL;
+    kes_extent_id_t id = make_id( 20);
+    const char *dirty_payload = "unflushed-dirty-data";
+    kes_extent_entry_t *entry;
+    int result;
+
+    kes_cache_get_default_config( &cfg, true);
+    cache = kes_cache_create( &cfg);
+    TEST_ASSERT( cache != NULL, "cache creation");
+    kes_cache_set_io_callbacks( cache, fi_read, fi_write, fi_sync);
+
+    fi_reset( &g_read_fault);
+    fi_reset( &g_write_fault);
+
+    /* Populate the entry normally, then dirty it with recognizable
+     * data. */
+    result = kes_cache_get_extent( cache, &id, &buf);
+    TEST_ASSERT( result == KES_SUCCESS, "initial load succeeds");
+    memcpy( buf, dirty_payload, strlen( dirty_payload) + 1);
+    TEST_ASSERT( kes_cache_mark_dirty( cache, &id) == KES_SUCCESS,
+                "mark dirty");
+    kes_cache_put_extent( cache, &id);
+
+    /* Force the next flush to fail. */
+    g_write_fault.mode = FI_MODE_FAIL_NTH;
+    g_write_fault.target_n = 1;
+    result = kes_cache_flush_extent( cache, &id);
+    TEST_ASSERT( result == KES_ERROR_IO, "flush fails as configured");
+
+    entry = find_entry( cache, &id);
+    TEST_ASSERT( entry != NULL, "entry still present after failed "
+                "flush");
+    TEST_ASSERT( (entry->state & KES_EXTENT_ERROR) &&
+                (entry->state & KES_EXTENT_DIRTY),
+                "FIXED (KES-3): entry is ERROR *and* DIRTY after the "
+                "failed flush -- proves KES-3's fix landed");
+
+    /* Clear the write fault (irrelevant -- get_extent() only reads)
+     * and confirm a get_extent() call does NOT retry via a read. */
+    fi_reset( &g_write_fault);
+    fi_reset( &g_read_fault);
+    buf = NULL;
+    result = kes_cache_get_extent( cache, &id, &buf);
+    TEST_ASSERT( result == KES_ERROR_IO,
+                "FIXED (KES-4, safely): an ERROR+DIRTY entry is NOT "
+                "auto-retried via a read -- that would destroy its "
+                "still-valid unflushed data");
+    TEST_ASSERT( buf == NULL, "buffer stays NULL");
+    TEST_ASSERT( g_read_fault.call_count == 0,
+                "proof no read was attempted at all for the "
+                "ERROR+DIRTY case");
+
+    /* The original dirty payload must be completely untouched. */
+    TEST_ASSERT( memcmp( entry->data, dirty_payload,
+                         strlen( dirty_payload) + 1) == 0,
+                "CONFIRMED SAFE: the entry's unflushed dirty data is "
+                "byte-for-byte unchanged -- KES-4's retry logic did "
+                "not overwrite it");
+
+    /* Recovery: flush again, now succeeding, clears both flags. */
+    result = kes_cache_flush_extent( cache, &id);
+    TEST_ASSERT( result == KES_SUCCESS, "retrying the flush directly "
+                "(not via get_extent()) succeeds once the write fault "
+                "is cleared");
+    TEST_ASSERT( entry->state == KES_EXTENT_CLEAN,
+                "entry is CLEAN after the successful flush");
+
+    kes_cache_destroy( cache);
+    TEST_SUCCESS( "KES-3/KES-4 interaction: an ERROR+DIRTY entry's "
+                  "unflushed data survives untouched; get_extent()'s "
+                  "auto-retry correctly excludes this case, and a "
+                  "direct flush_extent() retry remains the correct "
+                  "recovery path for it");
 }
 
 /* ================================================================
@@ -599,6 +677,8 @@ static test_case_t test_cases[] = {
      test_load_failure_hash_table_state},
     {"flush failure: dirty + ERROR state (S4.1)",
      test_flush_failure_dirty_state},
+    {"get_extent does not retry dirty+error entry",
+     test_get_extent_does_not_retry_dirty_error_entry},
     {"malloc/aligned_alloc failure: KES_ERROR_NOMEM",
      test_malloc_failure_nomem},
     {"partial read/write transfer: not detected (documented)",

@@ -1096,6 +1096,75 @@ int kes_cache_get_extent( kes_cache_t *cache,
         entry->cond_waiters--;
     }
 
+    /* KES-4: an entry stuck in KES_EXTENT_ERROR from a previous
+     * failed load never got a second chance before this fix -- every
+     * later kes_cache_get_extent() call returned KES_ERROR_IO
+     * immediately, even once whatever caused the original failure was
+     * resolved, until an explicit kes_cache_invalidate(). Retry
+     * exactly once here, synchronously, before giving up for this
+     * call -- deliberately NOT an unbounded retry loop: a
+     * permanently broken backend must not turn a single
+     * kes_cache_get_extent() call into an indefinite hang. If this
+     * retry also fails, the entry is left in KES_EXTENT_ERROR again
+     * and the next caller's own call gets its own one retry attempt,
+     * the same way this one did.
+     *
+     * ONLY safe to do when KES_EXTENT_DIRTY is NOT also set -- see
+     * kes_3_kes_4_plan.md's "Critical interaction between these two
+     * fixes" section. An entry that is ERROR *and* DIRTY (from a
+     * failed flush, KES-3) still holds valid, unflushed caller data;
+     * overwriting it with a fresh read here would silently destroy
+     * it. That case falls through unchanged to the existing
+     * KES_ERROR_IO return below, exactly as it did before this
+     * fix. */
+    if ( ( entry->state & KES_EXTENT_ERROR) &&
+        !( entry->state & KES_EXTENT_DIRTY)) {
+        entry->state = KES_EXTENT_LOADING;
+        pthread_mutex_unlock( &entry->lock);
+
+        int retry_result;
+        if ( cache->read_extent != NULL) {
+            retry_result = cache->read_extent(
+                cache->config.device_handle, id, entry->data,
+                entry->data_size);
+        } else {
+            TRACE_ERR( "kes_cache_get_extent: no read_extent "
+                       "callback registered while retrying a "
+                       "previously-failed load (call "
+                       "kes_cache_set_io_callbacks() before using "
+                       "the cache)");
+            retry_result = KES_ERROR_INVALID;
+        }
+
+        pthread_mutex_lock( &entry->lock);
+        if ( retry_result == KES_SUCCESS) {
+            entry->state = KES_EXTENT_CLEAN;
+        } else {
+            entry->state = KES_EXTENT_ERROR;
+            TRACE_ERR( "kes_cache_get_extent: retry of a previously-"
+                       "failed load did not succeed either, for "
+                       "extent start_block=%llu block_count=%u -- "
+                       "left in KES_EXTENT_ERROR, a future caller "
+                       "will retry again",
+                       (unsigned long long)id->start_block,
+                       id->block_count);
+        }
+        pthread_cond_broadcast( &entry->cond);
+        pthread_mutex_unlock( &entry->lock);
+
+        if ( retry_result == KES_SUCCESS) {
+            pthread_mutex_lock( &cache->cache_lock);
+            cache->stats.bytes_read += entry->data_size;
+            pthread_mutex_unlock( &cache->cache_lock);
+        }
+
+        /* Re-acquire entry->lock -- everything below this point
+         * (the final ERROR check, and the cache-hit success path
+         * past it) still expects to hold it, same as on entry to
+         * this whole function section. */
+        pthread_mutex_lock( &entry->lock);
+    }
+
     if ( entry->state & KES_EXTENT_ERROR) {
         pthread_mutex_unlock( &entry->lock);
         pthread_mutex_lock( &cache->cache_lock);
@@ -1313,7 +1382,15 @@ int kes_cache_flush_extent( kes_cache_t *cache,
                                            id, entry->data,
                                            entry->data_size);
         if ( result == KES_SUCCESS) {
+            /* Mirror sweep_flush_and_maybe_evict()'s success path
+             * (src/kes_cache.c): clear KES_EXTENT_ERROR too, not just
+             * KES_EXTENT_DIRTY. Needed since KES-3 (above) can now
+             * leave a prior failed attempt's KES_EXTENT_ERROR bit set
+             * on this same entry; without clearing it here a
+             * successful recovery flush would leave the entry stuck
+             * in ERROR|CLEAN instead of exactly CLEAN. */
             entry->state &= ~KES_EXTENT_DIRTY;
+            entry->state &= ~KES_EXTENT_ERROR;
             entry->state |= KES_EXTENT_CLEAN;
 
             /*
@@ -1329,6 +1406,25 @@ int kes_cache_flush_extent( kes_cache_t *cache,
             cache->stats.entries_dirty--;
             pthread_mutex_unlock( &cache->cache_lock);
         } else {
+            /* KES-3: mirror sweep_flush_and_maybe_evict()'s failure
+             * handling exactly (src/kes_cache.c) -- set
+             * KES_EXTENT_ERROR via OR, deliberately leaving
+             * KES_EXTENT_DIRTY set since the data was never actually
+             * persisted, instead of only returning an error code with
+             * no state change. Without this, a caller relying on the
+             * entry's own state (rather than this call's return
+             * value alone) to detect a previous flush failure -- the
+             * same thing kes_cache_sync()'s sweep path already lets a
+             * caller do -- had no way to tell this function's
+             * failures apart from success. See kes_3_kes_4_plan.md's
+             * "Critical interaction" section for why KES_EXTENT_DIRTY
+             * must stay set here, not just for symmetry with the
+             * sweep path. */
+            entry->state |= KES_EXTENT_ERROR;
+            TRACE_ERR( "kes_cache_flush_extent: write failed for "
+                       "extent start_block=%llu block_count=%u",
+                       (unsigned long long)id->start_block,
+                       id->block_count);
             pthread_mutex_unlock( &entry->lock);
             return(KES_ERROR_IO);
         }
