@@ -106,7 +106,10 @@ Ground Truth section.
 
 ## KES-2 -- `kes_extent_allocate()` silently substitutes first-fit for unimplemented allocation strategies
 
-**Severity: Medium. Status: OPEN.**
+**Severity: Medium. Status: CLOSED -- fixed 2026-09-11, commit
+`cfa6261`, per `kes_2_kes_8_plan.md` (see the matching "KES-2" entry
+in `PENDING_ITEMS.md`'s `## Resolved` section for the full
+implementation writeup and verification evidence).**
 
 `kes_allocation_strategy_t` (`include/kes/kes_types.h:58-64`) declares
 `KES_ALLOC_BEST_FIT`/`WORST_FIT`/`NEXT_FIT` as public, settable enum
@@ -294,8 +297,12 @@ project makes an assumption about crash durability that isn't true.
 
 ## KES-8 -- Truncated storage descriptor returns `KES_ERROR_IO`, not `KES_ERROR_CORRUPT`
 
-**Severity: Low (API consistency / documentation). Status: OPEN
-(informational, not necessarily a "fix").**
+**Severity: Low (API consistency / documentation). Status: CLOSED --
+documented, deliberately not behavior-changed, 2026-09-11, commit
+`cfa6261`, per `kes_2_kes_8_plan.md` (see the matching "KES-8" entry
+in `PENDING_ITEMS.md`'s `## Resolved` section for the full writeup and
+verification evidence). This is a documentation-only resolution, not
+a behavior fix -- both error codes are unchanged.**
 
 `load_storage_descriptor()`: truncating the backing file to fewer
 bytes than `sizeof(kes_storage_descriptor_t)` returns `KES_ERROR_IO`

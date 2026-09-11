@@ -681,6 +681,110 @@ kes_cache_destroy() use-after-free under concurrent access
   cross-process storage access (KES-5) are all separate, unrelated
   gaps -- see `PENDING_FIXES_SEP2026.md`.
 
+### KES-2 -- `kes_extent_allocate()` silently substituted first-fit for unimplemented allocation strategies (FIXED, CLOSED)
+
+**Closes the `KES-2` entry in `PENDING_FIXES_SEP2026.md` and the
+`kes_extent_allocate() silently substitutes first-fit for
+unimplemented strategies (OPEN, not fixed)` ad-hoc-review entry
+below -- since FIXED, see this entry -- CLOSED. Fixed 2026-09-11,
+commit `cfa6261`. Full implementation plan: `kes_2_kes_8_plan.md`
+(grouped there with KES-8, no dependency between the two).**
+
+- Was: `kes_allocation_strategy_t` (`include/kes/kes_types.h`)
+  declares `KES_ALLOC_BEST_FIT`/`WORST_FIT`/`NEXT_FIT` as public,
+  settable enum values with no runtime guard anywhere.
+  `kes_extent_allocate()`'s strategy dispatch `switch` in
+  `src/kes_storage.c` only had an explicit `case` for
+  `KES_ALLOC_FIRST_FIT`; every other value fell through `default:` to
+  `allocate_extent_first_fit()` silently -- a caller who configured
+  `KES_ALLOC_BEST_FIT` got `FIRST_FIT` placement instead, with no
+  error and no log line.
+- Fix (mechanical, per the plan -- decision was to reject, not
+  implement, per `PENDING_FIXES_SEP2026.md`'s own default framing):
+  `validate_config()` (`src/kes_storage.c`) -- the function
+  `kes_storage_create()` calls first, and the body of the public
+  `kes_config_validate()` wrapper -- now rejects any
+  `config->strategy != KES_ALLOC_FIRST_FIT` with `KES_ERROR_INVALID`,
+  logging via `TRACE_ERR` first (the one new logging call this plan
+  adds; the function's three pre-existing checks were left silent per
+  the "no drive-by rewrites" rule). This mirrors
+  `kes_cache_create()`'s existing rejection of
+  `KES_CACHE_LFU`/`KES_CACHE_CUSTOM`. A comment was added above
+  `kes_extent_allocate()`'s dispatch `switch` noting its `default:`
+  case is now defensive/unreachable in practice rather than a silent
+  substitution point; the `switch` itself is unchanged (the `default:`
+  case is left in place, not removed). `include/kes/kes_storage.h`'s
+  `kes_storage_create()` doc comment now documents the rejection.
+- Test added: `tests/test_kes_storage_edge.c`'s
+  `test_create_rejects_unimplemented_strategy` -- confirms
+  `KES_ALLOC_FIRST_FIT` is still accepted (reusing the file's existing
+  `make_storage()` helper), then confirms
+  `KES_ALLOC_BEST_FIT`/`WORST_FIT`/`NEXT_FIT` are each rejected with
+  `KES_ERROR_INVALID` and leave `*storage` untouched (still `NULL`).
+  Registered in the file's `test_cases[]` array.
+- Grep check (per the plan's verification checklist item 6): searched
+  `tests/`/`examples/` for any `kes_storage_config_t` literal setting
+  `.strategy` to anything other than `KES_ALLOC_FIRST_FIT`. Every real
+  construction outside the new test uses `KES_ALLOC_FIRST_FIT`
+  explicitly (`test_kes_minimal.c`, `test_kes_storage_full.c`,
+  `test_kes_crash_consistency.c`, `test_kes_multiprocess.c`,
+  `examples/example_kes_usage.c`); the only non-`FIRST_FIT` values are
+  the new test's deliberate rejection cases. Nothing broke.
+- Verified (real runs, not assumed): `make clean && make test` --
+  **94/94 passing** (93 previously plus the one new test), including
+  `test_create_rejects_unimplemented_strategy` PASSing and logging its
+  three expected `TRACE_ERR` lines. `make asan` -- exit 0, clean, no
+  new ASan/UBSan findings. `make tsan` -- exit 0, clean (this change
+  touches no concurrency, as expected). `make valgrind` -- exit 0,
+  clean, "ERROR SUMMARY: 0 errors" across every binary, "All heap
+  blocks were freed -- no leaks are possible". `make check-all` --
+  exit 0, **"ALL CHECKS PASSED."**
+- Out of scope (per the plan, unchanged): actually implementing
+  `BEST_FIT`/`WORST_FIT`/`NEXT_FIT` -- that remains the separate,
+  larger "allocation strategies beyond first-fit" item with no
+  detailed implementation plan of its own yet.
+
+### KES-8 -- truncated vs. corrupted storage descriptor error codes documented, not behavior-changed (CLOSED, documentation-only)
+
+**Closes the `KES-8` entry in `PENDING_FIXES_SEP2026.md`. Fixed
+(documented) 2026-09-11, commit `cfa6261`. Full implementation plan:
+`kes_2_kes_8_plan.md`. Unlike every other entry in this section, this
+is a documentation-only resolution -- no behavior changed, matching
+the distinction `PENDING_FIXES_SEP2026.md`/this file already draw
+elsewhere between a behavior fix and a documented-as-is decision.**
+
+- Was: `load_storage_descriptor()` (`src/kes_storage.c`) returns
+  `KES_ERROR_IO` for a file shorter than
+  `sizeof(kes_storage_descriptor_t)` (e.g. truncated) but
+  `KES_ERROR_CORRUPT` for an intact-size file with a bad magic number
+  (or, since KES-6, an incompatible on-disk format version) --
+  undocumented, though not unsafe (both fail cleanly with no
+  `*storage` output).
+- Decision (made by the plan, not re-litigated here): document the
+  distinction precisely; do **not** change either return code.
+  Changing the truncated-file case to also report `KES_ERROR_CORRUPT`
+  would be a real behavior change to an existing, working distinction
+  that `tests/test_kes_crash_consistency.c`'s
+  `test_truncated_and_corrupted_descriptor` already asserts on --
+  not worth the risk for a low-severity, already-non-crashing case.
+- Change made: a comment was added directly above the byte-count check
+  in `load_storage_descriptor()` (`src/kes_storage.c`) spelling out
+  exactly which failure shape maps to which code and why.
+  `kes_storage_open()`'s public doc comment
+  (`include/kes/kes_storage.h`) gained a matching `@return` line so a
+  caller does not have to read the implementation to learn this. No
+  code path in either file changed.
+- Test changes: none needed or made --
+  `test_truncated_and_corrupted_descriptor` already asserts both
+  codes exactly as they are today.
+- Verified: covered by the same `make test`/`asan`/`tsan`/`valgrind`/
+  `check-all` runs as KES-2 above (both were applied and verified
+  together, per the plan) -- **94/94 tests passing**, all four
+  sanitizer/leak-check targets clean, `make check-all` -- **"ALL
+  CHECKS PASSED."** Since this entry changes no code, the passing
+  runs confirm only that the comment-only diff introduced no
+  regression, not that any new behavior was exercised.
+
 ### Phase 6 -- documentation truth pass (DONE)
 
 `README.md` and `docs/CONTINUATION_PROMPT.md` were corrected to
@@ -1306,7 +1410,7 @@ file; none of these were previously called out as their own item, so
 recorded here rather than assumed covered by the "allocation
 strategies beyond first-fit" one-liner in the summary above.
 
-### `kes_extent_allocate()` silently substitutes first-fit for unimplemented strategies (OPEN, not fixed)
+### `kes_extent_allocate()` silently substitutes first-fit for unimplemented strategies (since FIXED -- see the "KES-2" entry under "Resolved" above -- CLOSED)
 
 `kes_allocation_strategy_t` (`include/kes/kes_types.h:58-64`) declares
 `KES_ALLOC_FIRST_FIT`/`BEST_FIT`/`WORST_FIT`/`NEXT_FIT` as public,
@@ -1339,8 +1443,15 @@ for the allocation-strategy enum. Not covered by any existing test
 (`test_kes_storage_full.c`/`test_kes_storage_edge.c` never set
 `strategy` to anything but the default/`FIRST_FIT`).
 
-**Not fixed here** -- per rule 0.3, reported rather than patched
-inline. Two independent decisions for whoever picks this up: (1)
+**Update: fixed and closed** -- see the "KES-2" entry under
+`## Resolved` above for the full fix (short-term rejection, per
+option (1) below; option (2), actually implementing the other
+strategies, remains explicitly out of scope). The rest of this entry
+is left as the original ad-hoc-review record.
+
+**Not fixed here** [at the time this entry was originally written] --
+per rule 0.3, reported rather than patched inline. Two independent
+decisions for whoever picks this up: (1)
 should the short-term fix be rejecting `BEST_FIT`/`WORST_FIT`/`NEXT_FIT`
 at `kes_storage_open()` or `kes_extent_allocate()` time (mirroring the
 cache layer's pattern) until they're implemented for real, and (2) is
