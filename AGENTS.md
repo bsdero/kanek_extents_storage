@@ -72,8 +72,20 @@ and wrong. Concretely, as of this writing:
   This only proves *externally synchronized* cross-process access
   round-trips correctly — it deliberately does not race the two
   processes against each other. **Unsynchronized concurrent access to
-  the same storage file from two `kes_storage_t*` instances remains an
-  open, unguarded gap** — see the matching item in `PENDING_ITEMS.md`.
+  the same storage file from two `kes_storage_t*` instances used to be
+  an open, unguarded gap (KES-5) — now FIXED and CLOSED**, commit
+  `2022272`: `kes_storage_open()`/allocation/free paths take an
+  `flock()` on the backing fd (shared for reads, exclusive around
+  allocation/free/sync), so two independent handles — same process or
+  cross-process — on the same file now serialize correctly instead of
+  silently corrupting each other's bookkeeping. See the matching "KES-5"
+  entry in `PENDING_ITEMS.md`'s `## Resolved` section for the full
+  writeup. Also since fixed: **KES-6**, a missing bitmap checksum that
+  let a silently bit-flipped bitmap block cause real double-allocation
+  — commit `ffa485a` added a CRC32 checksum over the bitmap region,
+  verified at load time and returning `KES_ERROR_CORRUPT` on mismatch;
+  see the matching "KES-6" entry in `PENDING_ITEMS.md`'s `## Resolved`
+  section.
 - Getting the cache-layer concurrency right required going *beyond*
   `KES_HARDENING_PLAN.md` §4's literal suggestions in a few places
   (its "bump `ref_count` to pin the traversal node" pattern turned out
@@ -299,10 +311,15 @@ kes_types.h  (shared enums/structs/error codes, no dependencies)
 `kes_storage_descriptor_t` (magic number, block size, layout offsets,
 free/used counts) that is written to block 0 of the backing file and
 reloaded on `kes_storage_open()`. Extent allocation
-(`kes_extent_allocate`) currently only implements first-fit
-(`allocate_extent_first_fit` in `kes_storage.c`) regardless of the
-`kes_allocation_strategy_t` requested in the config — best-fit/
-worst-fit/next-fit are declared in `kes_types.h` but not yet wired up.
+(`kes_extent_allocate`) only implements first-fit
+(`allocate_extent_first_fit` in `kes_storage.c`); best-fit/worst-fit/
+next-fit are declared in `kes_types.h` but not yet wired up. This used
+to be a silent substitution (any other `kes_allocation_strategy_t` fell
+through to first-fit with no error, KES-2) — **fixed and closed**,
+commit `cfa6261`: `validate_config()` now rejects any strategy other
+than `KES_ALLOC_FIRST_FIT` with `KES_ERROR_INVALID` before a storage
+handle is even created, rather than silently substituting. See the
+matching "KES-2" entry in `PENDING_ITEMS.md`'s `## Resolved` section.
 
 `kes_cache_t` is a hash-table + LRU-list extent cache designed to sit
 in front of a storage backend via caller-supplied read/write/sync

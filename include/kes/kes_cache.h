@@ -207,7 +207,24 @@ struct kes_cache {
      * KES_ERROR_INVALID. Read and written only under cache_lock. */
     bool destroying;
 
-    /* I/O callback functions */
+    /* I/O callback functions. KES-10: read_extent/write_extent's
+     * contract is a plain int status code against a fixed input
+     * `size` -- there is no output parameter for bytes actually
+     * transferred. A callback that returns KES_SUCCESS while only
+     * partially filling/consuming `buffer` (e.g. a network-backed
+     * implementation doing a short read/write) is silently trusted;
+     * the cache layer has no way to detect this. A callback MUST
+     * either fully transfer `size` bytes or return a non-KES_SUCCESS
+     * error code -- confirmed structural (not just untested) by
+     * test_partial_transfer_not_detected
+     * (tests/test_kes_fault_injection.c). Known, accepted API
+     * limitation (see kes_10_kes_11_plan.md / PENDING_FIXES_SEP2026.md
+     * KES-10) -- fixing it would need a breaking change to these
+     * signatures (an added bytes-transferred output parameter),
+     * deliberately not done as of this writing. Matters most for a
+     * callback backed by something other than a local file (e.g. a
+     * network transport), where partial transfers are a real
+     * possibility, not just a theoretical one. */
     int (*read_extent)( void *device, const kes_extent_id_t *id,
                          void *buffer, size_t size);
     int (*write_extent)( void *device, const kes_extent_id_t *id,
@@ -401,7 +418,11 @@ int kes_cache_get_stats( kes_cache_t *cache, kes_cache_stats_t *stats);
 int kes_cache_reset_stats( kes_cache_t *cache);
 
 /**
- * Set I/O callback functions
+ * Set I/O callback functions. KES-10: read_func/write_func must
+ * fully transfer `size` bytes on success or return an error -- there
+ * is no way for the cache layer to detect a partial transfer that
+ * still reports KES_SUCCESS (see the struct kes_cache doc comment on
+ * read_extent/write_extent above for the full explanation).
  * @param cache Cache handle
  * @param read_func Function to read extents from storage
  * @param write_func Function to write extents to storage

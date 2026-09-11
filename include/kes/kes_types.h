@@ -52,8 +52,50 @@ typedef enum {
     KES_STORAGE_READONLY    = 0x01,  /* Read-only access */
     KES_STORAGE_CREATE      = 0x02,  /* Create if not exists */
     KES_STORAGE_TRUNCATE    = 0x04,  /* Truncate existing */
-    KES_STORAGE_SYNC        = 0x08   /* Synchronous I/O */
+    KES_STORAGE_SYNC        = 0x08   /* Synchronous I/O -- see the
+                                       * detailed note below (KES-7)
+                                       * for exactly what this does
+                                       * and does not make durable. */
 } kes_storage_flags_t;
+
+/*
+ * KES-7: KES_STORAGE_SYNC's actual, confirmed effect (by reading
+ * kes_storage_create()/kes_storage_open(), src/kes_storage.c): it
+ * adds O_SYNC to the backing fd's open()/create() flags. Nothing
+ * else. The kes_storage_t.sync_writes field it also sets
+ * (include/kes/kes_storage.h) is stored but never read anywhere else
+ * in this codebase (confirmed by grep across src/) -- it has no
+ * effect of its own beyond that one open()-time O_SYNC flag.
+ *
+ * What this precisely changes:
+ *   - WITHOUT KES_STORAGE_SYNC: kes_extent_write()'s raw write() call
+ *     lands in the OS page cache. It is visible to any other process
+ *     reading the same file immediately (ordinary page-cache
+ *     coherency) and survives this process exiting or crashing
+ *     normally -- but is NOT guaranteed to survive a real power loss
+ *     or kernel crash until something calls fsync() on this fd.
+ *     kes_storage_sync()/kes_storage_close() are the only calls in
+ *     this library that do that.
+ *   - WITH KES_STORAGE_SYNC: every write on this fd -- extent data via
+ *     kes_extent_write(), and the descriptor/bitmap writes inside
+ *     kes_storage_sync()/kes_storage_close()/kes_storage_create() --
+ *     becomes synchronous at the kernel level (O_SYNC): durable
+ *     against real power loss the moment the write() call returns, at
+ *     a real per-write latency cost.
+ *
+ * What this does NOT change: kes_storage_sync()/kes_storage_close()
+ * remain the only calls that persist storage->desc.free_blocks/
+ * used_blocks/storage->bitmap to disk at all -- O_SYNC only affects
+ * the durability of a write that already happens, it does not cause
+ * any additional writes to happen. See
+ * tests/test_kes_crash_consistency.c's test_no_sync_reopen_durability
+ * for the concrete consequence: a crash between an allocation and an
+ * explicit sync can still lose that allocation's bookkeeping even
+ * with KES_STORAGE_SYNC set, even though the extent DATA itself was
+ * already durable. (If kes_5_plan.md has been applied, this no
+ * longer applies -- kes_extent_allocate()/kes_extent_free() persist
+ * their own bookkeeping immediately regardless of this flag.)
+ */
 
 /* Allocation strategies */
 typedef enum {

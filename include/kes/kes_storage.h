@@ -59,14 +59,22 @@ int kes_storage_open( const char *device_path, uint32_t flags,
                        kes_storage_t **storage);
 
 /**
- * Close and cleanup storage instance
+ * Close and cleanup storage instance. If not opened readonly, this
+ * does the same descriptor/bitmap save + fsync() kes_storage_sync()
+ * does (KES-7's durability note in kes_types.h applies here too)
+ * before releasing resources.
  * @param storage Storage handle to close
  * @return KES_SUCCESS or error code
  */
 int kes_storage_close( kes_storage_t *storage);
 
 /**
- * Synchronize all pending changes to storage
+ * Synchronize all pending changes to storage: writes the in-memory
+ * bitmap and descriptor (free/used block counts, next_extent_id,
+ * etc.) to disk and fsync()s the file. This is what makes ALLOCATION
+ * BOOKKEEPING durable -- extent DATA written via kes_extent_write()
+ * has its own, partly independent durability story (see
+ * KES_STORAGE_SYNC's doc comment in kes_types.h, KES-7).
  * @param storage Storage handle to sync
  * @return KES_SUCCESS or error code
  */

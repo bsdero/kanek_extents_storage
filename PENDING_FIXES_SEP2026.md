@@ -280,7 +280,10 @@ consideration for any already-created storage files).
 
 ## KES-7 -- `KES_STORAGE_SYNC` flag's durability contract is undocumented
 
-**Severity: Low (docs). Status: OPEN.**
+**Severity: Low (docs). Status: CLOSED -- documented 2026-09-11, per
+`kes_7_kes_9_plan.md` (see the matching "KES-7" entry in
+`PENDING_ITEMS.md`'s `## Resolved` section). Documentation-only
+resolution, no behavior change.**
 
 `include/kes/kes_types.h`'s `KES_STORAGE_SYNC` flag doc comment is a
 single line ("Synchronous I/O") with no explicit durability promise
@@ -331,7 +334,10 @@ unless whoever picks this up decides truncation should also report
 
 ## KES-9 -- Rule 11 (log before every early-return failure path) incompletely applied
 
-**Severity: Low (observability / tech debt). Status: OPEN, ongoing.**
+**Severity: Low (observability / tech debt). Status: OPEN, ongoing --
+ad-hoc policy reaffirmed 2026-09-11, see `kes_7_kes_9_plan.md` section
+2 for the exact current boundary of what has Rule 11 logging vs. what
+doesn't, and the decision record to keep it ad-hoc rather than sweep.**
 
 `CODING_STYLE.md` Rule 11 requires `TRACE_ERR`/`TRACE_SYSERR`/
 `TRACE_ERRNO` logging before every early-return failure path.
@@ -353,9 +359,16 @@ than the current ad-hoc pace.
 
 ## KES-10 -- Partial I/O transfer not detectable by the cache layer (design limitation, not a bug)
 
-**Severity: Low (documented design gap). Status: OPEN by design,
-worth a conscious decision before new consumers rely on the callback
-contract.**
+**Severity: Low (documented design gap). Status: documented, not
+fixed -- 2026-09-11, per `kes_10_kes_11_plan.md`. Confirmed with the
+project owner: document only, do not extend the callback signature
+(see the matching "KES-10" entry in `PENDING_ITEMS.md`). The
+`struct kes_cache` and `kes_cache_set_io_callbacks()` doc comments in
+`include/kes/kes_cache.h` now state the contract precisely (a
+callback must fully transfer `size` bytes or return an error). Still
+OPEN by design if/when a downstream project actually needs
+partial-transfer detection -- `kes_10_kes_11_plan.md`'s closing note
+sketches the breaking-change shape for that.**
 
 `test_partial_transfer_not_detected`
 (`tests/test_kes_fault_injection.c`) confirmed this is structural, not
@@ -377,31 +390,53 @@ deciding now, before consumers exist, rather than later.
 
 ## KES-11 -- Performance smoke tests (§6.G) not implemented
 
-**Severity: Low. Status: OPEN, intentionally deferred, optional.**
+**Severity: Low. Status: OPEN, intentionally deferred.** Confirmed
+with the project owner on 2026-09-11: continue deferring rather than
+write synthetic smoke tests now. **Concrete trigger to revisit**:
+either downstream project (or this project's own maintainers) has a
+real, specific workload characteristic to benchmark against -- e.g.
+"extent allocate/free must sustain N ops/sec under M concurrent
+callers" or "cache get/put p99 latency must stay under X ms at Y
+entries" -- at which point write a smoke test against *that* number,
+not an invented one. Until such a number exists, a synthetic benchmark
+risks becoming a false signal: a "regression" against a baseline
+nobody asked for, or false confidence from a synthetic pattern that
+doesn't resemble either downstream project's actual access pattern.
+See `kes_10_kes_11_plan.md`.
 
 `KES_HARDENING_PLAN.md` §6.G calls for basic performance smoke tests;
 `plan_phase5.md` explicitly marks this optional/stretch and
 non-blocking, and it was skipped in favor of finishing the required
-fault-injection/crash-consistency/fuzz/soak work. Listed here only so
-it isn't forgotten entirely -- worth reconsidering once two real
-consumers exist and have actual performance expectations to smoke-test
-against, rather than inventing synthetic ones now.
+fault-injection/crash-consistency/fuzz/soak work.
 
 ---
 
 ## KES-12 -- `AGENTS.md` Ground Truth section needs reconciliation after Track B docs work
 
-**Severity: Low (bookkeeping). Status: OPEN.**
+**Severity: Low (bookkeeping). Status: CLOSED -- reconciled
+2026-09-11.** The "Phase 6 (docs, partially done)" language was
+already gone by the time this pass checked (a prior session had
+updated it to "both complete"), but two other claims in the same
+"Ground truth" section had gone stale after later fixes landed and
+needed correcting:
 
-Per `plan_phase5.md` §6, `AGENTS.md`'s "Ground truth" section should
-be updated to drop its "Phase 6 (docs, partially done)" language now
-that Phase 6 is fully complete -- not done yet because that work
-landed in an isolated worktree in parallel with other work touching
-the same file, and was left for manual reconciliation at merge time.
-Purely a documentation-sync task; worth doing in the same pass as
-whichever of the above items gets closed next, to keep `AGENTS.md`
-matching reality (the whole point of that file, per its own repeated
-warnings about drift).
+- The `test_kes_multiprocess` bullet still said unsynchronized
+  cross-process/cross-handle access to the same storage file "remains
+  an open, unguarded gap" -- stale after KES-5's fix (commit
+  `2022272`, `flock()`-based serialization). Updated to note KES-5 is
+  fixed and closed, and to mention KES-6's bitmap checksum fix
+  (commit `ffa485a`), which the section previously didn't cover at
+  all.
+- The Architecture section's extent-allocation description still said
+  `kes_extent_allocate()` "currently only implements first-fit ...
+  regardless of the `kes_allocation_strategy_t` requested" with no
+  mention that this silent substitution was fixed -- stale after
+  KES-2's fix (commit `cfa6261`, `validate_config()` now rejects any
+  non-`KES_ALLOC_FIRST_FIT` strategy). Updated accordingly; first-fit
+  is still the only strategy actually implemented, only the silent
+  substitution is gone.
+
+Purely a documentation-sync task, no behavior change.
 
 ---
 

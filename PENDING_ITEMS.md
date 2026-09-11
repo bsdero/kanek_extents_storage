@@ -924,6 +924,120 @@ deliberately -- see below for why, this is not an arbitrary pairing).**
   caller instead of returning `KES_ERROR_IO` (pre-existing behavior,
   untouched).
 
+### KES-7 -- `KES_STORAGE_SYNC` durability contract documented (CLOSED)
+
+**Closes the `KES-7` entry in `PENDING_FIXES_SEP2026.md`. Full plan:
+`kes_7_kes_9_plan.md` (Step 1). Documentation-only, no behavior
+change.**
+
+`include/kes/kes_types.h`'s `KES_STORAGE_SYNC` flag doc comment
+previously read just "Synchronous I/O" with no durability promise
+either way. Added a detailed block comment after the
+`kes_storage_flags_t` enum stating precisely what the flag does
+(adds `O_SYNC` to the backing fd's open flags, nothing more; the
+`sync_writes` struct field it also sets is otherwise unread anywhere)
+and does not do (it does not, on its own, cause
+`free_blocks`/`used_blocks`/the bitmap to be persisted any more often
+-- only `kes_storage_sync()`/`kes_storage_close()` do that), citing
+`test_no_sync_reopen_durability`
+(`tests/test_kes_crash_consistency.c`) as the concrete evidence.
+`kes_storage_sync()`'s and `kes_storage_close()`'s doc comments in
+`include/kes/kes_storage.h` were updated to cross-reference this note
+and state which of the two (bookkeeping vs. extent data) each call
+actually makes durable.
+- Verified: `make` (plain build) succeeds cleanly with no new
+  warnings; `make clean && make test` re-run to confirm no test
+  behavior changed (comment-only edit).
+
+### KES-9 -- Rule 11 ad-hoc logging policy reaffirmed (no code change)
+
+**Pointer entry for the `KES-9` item in `PENDING_FIXES_SEP2026.md`.
+Full record: `kes_7_kes_9_plan.md` (Step 2).**
+
+Not a bug fix -- there is nothing to close in the usual sense. Per
+`AGENTS.md`'s existing "no drive-by rewrites" policy, `kes_7_kes_9_plan.md`
+reaffirms (2026-09-11) the decision to keep Rule 11 logging
+(`TRACE_ERR`/`TRACE_SYSERR`/`TRACE_ERRNO` before every early-return
+failure path) applied ad-hoc -- to new functions, and to an existing
+function's error paths only when already rewriting that function's
+body for an unrelated reason -- rather than doing a dedicated sweep
+now. That plan file's section 2a records, as of this writing, the
+exact boundary of what already has this logging (`kes_cache.c`'s
+no-callback/load-failure/cache-full/start()/sweep/retry-failure
+paths; `kes_storage.c`'s double-free/invalid-extent path and the
+KES-2 strategy-rejection path) versus what's still silent (most of
+`kes_bitmap.c`, most of `kes_storage.c` outside the above, and the
+simple NULL/not-found checks throughout `kes_cache.c`) -- re-verify
+against the tree before trusting it, since it will drift as further
+work lands.
+
+### KES-10 -- partial I/O transfer limitation documented (not fixed, by design)
+
+**Pointer entry for the `KES-10` item in `PENDING_FIXES_SEP2026.md`.
+Full plan: `kes_10_kes_11_plan.md` (Step 1). Documentation-only,
+callback signatures deliberately unchanged.**
+
+`include/kes/kes_cache.h`'s `struct kes_cache` I/O callback fields and
+`kes_cache_set_io_callbacks()`'s doc comment now state explicitly that
+`read_extent`/`write_extent` have no bytes-transferred output channel
+-- a callback must fully transfer `size` bytes on success or return a
+non-`KES_SUCCESS` error code, since the cache layer cannot otherwise
+detect a partial transfer -- citing
+`test_partial_transfer_not_detected`
+(`tests/test_kes_fault_injection.c`) as the confirming test. Confirmed
+with the project owner: document only, do not extend the callback
+signature now; `kes_10_kes_11_plan.md`'s closing note sketches the
+breaking-change shape (an added bytes-transferred output parameter)
+for if/when a downstream project's own I/O callback (e.g.
+network-backed) actually needs this.
+- Verified: `make` (plain build) succeeds cleanly, no new warnings
+  (comment-only edit, no signature change).
+
+### KES-11 -- performance smoke tests deferral reworded with a concrete trigger (no code change)
+
+**Pointer entry for the `KES-11` item in `PENDING_FIXES_SEP2026.md`.
+Full record: `kes_10_kes_11_plan.md` (Step 2).**
+
+No code change, no smoke tests written. `PENDING_FIXES_SEP2026.md`'s
+`## KES-11` section was reworded (2026-09-11) to replace the vague
+"revisit once real consumers exist" with a concrete trigger condition:
+revisit once either downstream project (or this project's own
+maintainers) has a specific, real workload characteristic to
+benchmark against (e.g. a concrete ops/sec or p99-latency target),
+not before -- a synthetic benchmark written today would risk becoming
+a false signal against an invented baseline.
+
+### KES-12 -- `AGENTS.md` Ground Truth section reconciled (CLOSED)
+
+**Closes the `KES-12` entry in `PENDING_FIXES_SEP2026.md`. No plan
+file for this one -- applied directly by reading `AGENTS.md` against
+current code/`PENDING_ITEMS.md` state.**
+
+The "Phase 6 (docs, partially done)" language `plan_phase5.md` §6
+flagged for cleanup was already gone by the time this pass checked.
+Two other claims in `AGENTS.md`'s "Ground truth" section had gone
+stale after later fixes landed, though, and were corrected:
+- The `test_kes_multiprocess` bullet claimed unsynchronized
+  cross-process/cross-handle storage access "remains an open,
+  unguarded gap" -- stale after KES-5's fix (commit `2022272`,
+  `flock()`-based serialization in `kes_storage_open()`/allocate/
+  free/sync). Updated to state KES-5 is fixed and closed, and to add
+  KES-6's bitmap-checksum fix (commit `ffa485a`), which this section
+  didn't mention at all before.
+- The Architecture section's description of `kes_extent_allocate()`
+  said it implements first-fit "regardless of the
+  `kes_allocation_strategy_t` requested," with no mention that the
+  silent-substitution behavior itself was fixed -- stale after KES-2
+  (commit `cfa6261`, `validate_config()` now rejects any
+  non-`KES_ALLOC_FIRST_FIT` strategy with `KES_ERROR_INVALID` instead
+  of silently substituting). Updated accordingly -- first-fit is still
+  the only strategy actually implemented; only the silent fallback is
+  gone.
+- Confirmed both corrections against current code before writing them
+  (`grep` for `flock`/`validate_config` in `src/kes_storage.c`), not
+  just against the other planning docs, per this file's own repeated
+  warning against trusting stale claims uncritically.
+
 ### Phase 6 -- documentation truth pass (DONE)
 
 `README.md` and `docs/CONTINUATION_PROMPT.md` were corrected to
