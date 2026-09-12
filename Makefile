@@ -621,12 +621,21 @@ rebuild: clean all
 .PHONY: package
 package: clean
 	@echo "Creating package..."
+ifeq ($(UNAME_S),Darwin)
+	tar -czf $(PROJECT_NAME)-$(VERSION).tar.gz \
+		--exclude='.git' \
+		--exclude='build' \
+		--exclude='*.tar.gz' \
+		-s ',^,$(PROJECT_NAME)-$(VERSION)/,' \
+		*
+else
 	tar -czf $(PROJECT_NAME)-$(VERSION).tar.gz \
 		--exclude='.git' \
 		--exclude='build' \
 		--exclude='*.tar.gz' \
 		--transform 's,^,$(PROJECT_NAME)-$(VERSION)/,' \
 		*
+endif
 	@echo "Package created: $(PROJECT_NAME)-$(VERSION).tar.gz"
 
 # Dependencies
