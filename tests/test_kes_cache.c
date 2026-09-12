@@ -22,10 +22,72 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <errno.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/wait.h>
+
+#ifdef __APPLE__
+/*
+ * Darwin's pthread implementation has no pthread_barrier_t at all --
+ * confirmed by a real build attempt on this repo's target machine
+ * (this file's only use site is the race regression test below,
+ * originally written assuming a glibc-style pthread that has one).
+ * Minimal mutex+condvar+generation-counter shim, sufficient for that
+ * single rendezvous-then-race use.
+ */
+typedef struct {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+    unsigned int count;
+    unsigned int threshold;
+    unsigned int generation;
+} pthread_barrier_t;
+
+#define PTHREAD_BARRIER_SERIAL_THREAD (-1)
+
+static int pthread_barrier_init( pthread_barrier_t *barrier,
+                                  const void *attr,
+                                  unsigned int count) {
+    (void)attr;
+    if ( count == 0) {
+        return(EINVAL);
+    }
+    pthread_mutex_init( &barrier->mutex, NULL);
+    pthread_cond_init( &barrier->cond, NULL);
+    barrier->count = 0;
+    barrier->threshold = count;
+    barrier->generation = 0;
+    return(0);
+}
+
+static int pthread_barrier_wait( pthread_barrier_t *barrier) {
+    unsigned int my_generation;
+
+    pthread_mutex_lock( &barrier->mutex);
+    my_generation = barrier->generation;
+    barrier->count++;
+    if ( barrier->count == barrier->threshold) {
+        barrier->generation++;
+        barrier->count = 0;
+        pthread_cond_broadcast( &barrier->cond);
+        pthread_mutex_unlock( &barrier->mutex);
+        return(PTHREAD_BARRIER_SERIAL_THREAD);
+    }
+    while ( my_generation == barrier->generation) {
+        pthread_cond_wait( &barrier->cond, &barrier->mutex);
+    }
+    pthread_mutex_unlock( &barrier->mutex);
+    return(0);
+}
+
+static int pthread_barrier_destroy( pthread_barrier_t *barrier) {
+    pthread_mutex_destroy( &barrier->mutex);
+    pthread_cond_destroy( &barrier->cond);
+    return(0);
+}
+#endif /* __APPLE__ */
 
 /* Test constants */
 #define TEST_BLOCK_SIZE     8192
