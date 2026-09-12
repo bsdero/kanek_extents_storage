@@ -37,6 +37,13 @@ FOUNDATIONS_CFLAGS = -Wall -DUSER_SPACE -g -fPIC
 # fail to link its own test binaries (e.g. testrand).
 FOUNDATIONS_LDFLAGS = -L. -lkfl -rdynamic -lpthread
 
+# Platform detection. Darwin (macOS) needs different shared-library
+# naming/link flags (dylib vs. .so, no -Wl,-soname), no ldconfig, and
+# no "setarch $$(uname -m) -R" TSan wrapper (a WSL2-only workaround --
+# see the tsan target below). Everything platform-specific branches on
+# UNAME_S; the Linux path is unchanged in every such branch.
+UNAME_S := $(shell uname -s)
+
 # Compiler and flags
 #
 # -DUSER_SPACE matches kanek_foundations' own FOUNDATIONS_CFLAGS above:
@@ -75,10 +82,18 @@ CORE_SOURCES = $(SRC_DIR)/kes_storage.c \
 # Object files
 OBJECTS = $(CORE_SOURCES:$(SRC_DIR)/%.c=$(BUILD_DIR)/%.o)
 
-# Library targets
+# Library targets. Darwin's dyld has no .so/soname-symlink convention
+# at all -- it uses .dylib naming and an install_name baked into the
+# binary instead, so the artifact names themselves differ, not just
+# the link flags used to build them (see $(SHARED_LIB)'s rule below).
 STATIC_LIB = $(BUILD_DIR)/$(PROJECT_NAME).a
+ifeq ($(UNAME_S),Darwin)
+SHARED_LIB = $(BUILD_DIR)/$(PROJECT_NAME).$(VERSION).dylib
+SHARED_LIB_LINK = $(BUILD_DIR)/$(PROJECT_NAME).dylib
+else
 SHARED_LIB = $(BUILD_DIR)/$(PROJECT_NAME).so.$(VERSION)
 SHARED_LIB_LINK = $(BUILD_DIR)/$(PROJECT_NAME).so
+endif
 
 # Test sources and targets
 TEST_SOURCES = $(wildcard $(TEST_DIR)/test_*.c)
@@ -138,11 +153,19 @@ $(STATIC_LIB): $(OBJECTS)
 	ar rcs $@ $^
 	ranlib $@
 
-# Build shared library
+# Build shared library. Apple's ld has no -shared/-Wl,-soname support
+# (confirmed directly: "ld: unknown options: -soname") -- Darwin wants
+# -dynamiclib plus an install_name baked into the binary instead of a
+# soname.
 $(SHARED_LIB): $(OBJECTS) $(FOUNDATIONS_LIB)
 	@echo "Creating shared library $@"
+ifeq ($(UNAME_S),Darwin)
+	$(CC) -dynamiclib -install_name @rpath/$(notdir $(SHARED_LIB)) \
+		$(LDFLAGS) -o $@ $^ $(LIBS)
+else
 	$(CC) -shared -Wl,-soname,$(notdir $(SHARED_LIB)) \
 		$(LDFLAGS) -o $@ $^ $(LIBS)
+endif
 	ln -sf $(notdir $(SHARED_LIB)) $(SHARED_LIB_LINK)
 
 # Build tests
@@ -203,6 +226,15 @@ debug:
 ASAN_FLAGS = -fsanitize=address,undefined -fno-omit-frame-pointer -g
 TSAN_FLAGS = -fsanitize=thread -fno-omit-frame-pointer -g
 
+# "setarch $$(uname -m) -R" is a WSL2-only workaround: TSan binaries
+# crash there with an unrelated "unexpected memory mapping" error
+# without it. No-op on Darwin -- run TSan binaries directly there.
+ifeq ($(UNAME_S),Darwin)
+TSAN_RUN_WRAPPER =
+else
+TSAN_RUN_WRAPPER = setarch $$(uname -m) -R
+endif
+
 .PHONY: asan
 asan:
 	$(MAKE) clean
@@ -251,9 +283,9 @@ tsan:
 		echo "--- $$testname (tsan) ---"; \
 		if [ "$$testname" = "test_kes_fault_injection" ]; then \
 			TSAN_OPTIONS=allocator_may_return_null=1 \
-			    setarch $$(uname -m) -R $$test || exit 1; \
+			    $(TSAN_RUN_WRAPPER) $$test || exit 1; \
 		else \
-			setarch $$(uname -m) -R $$test || exit 1; \
+			$(TSAN_RUN_WRAPPER) $$test || exit 1; \
 		fi; \
 	done
 
@@ -287,7 +319,7 @@ sanitize-all: asan tsan
 #
 # Follows the asan/tsan targets' clean-rebuild pattern; must run
 # under "setarch $$(uname -m) -R" in this WSL2 environment, same
-# reason as the "tsan" target.
+# reason as the "tsan" target (no-op via TSAN_RUN_WRAPPER on Darwin).
 .PHONY: soak
 soak:
 	$(MAKE) clean
@@ -297,7 +329,7 @@ soak:
 	    FOUNDATIONS_LDFLAGS="$(FOUNDATIONS_LDFLAGS) $(TSAN_FLAGS)"
 	@echo "Running 10-minute soak test under TSan " \
 	     "(KES_SOAK_SECONDS=600)..."
-	KES_SOAK_SECONDS=600 setarch $$(uname -m) -R \
+	KES_SOAK_SECONDS=600 $(TSAN_RUN_WRAPPER) \
 	    $(BUILD_DIR)/tests/test_kes_soak
 
 # Valgrind pass: independent leak/error checker on a plain (non-
@@ -406,7 +438,7 @@ stress:
 		run=1; \
 		while [ $$run -le $(STRESS_RUNS) ]; do \
 			if [ "$(SANITIZER)" = "tsan" ]; then \
-				setarch $$(uname -m) -R $$test \
+				$(TSAN_RUN_WRAPPER) $$test \
 				    > $$logfile 2>&1; \
 			else \
 				$$test > $$logfile 2>&1; \
@@ -419,8 +451,7 @@ stress:
 				echo "--- captured output ---"; \
 				cat $$logfile; \
 				echo "--- reproduce with: $$test" \
-				     "(tsan: setarch \`uname -m\` -R" \
-				     "$$test) ---"; \
+				     "(tsan: $(TSAN_RUN_WRAPPER) $$test) ---"; \
 				exit 1; \
 			fi; \
 			run=$$((run + 1)); \
@@ -440,7 +471,9 @@ install: all
 	sudo cp $(SHARED_LIB) /usr/local/lib/
 	sudo ln -sf $(notdir $(SHARED_LIB)) /usr/local/lib/$(notdir $(SHARED_LIB_LINK))
 	sudo cp $(INC_DIR)/kes/*.h /usr/local/include/kes/
+ifneq ($(UNAME_S),Darwin)
 	sudo ldconfig
+endif
 
 # Uninstall library
 .PHONY: uninstall
@@ -448,7 +481,9 @@ uninstall:
 	@echo "Uninstalling $(PROJECT_NAME)"
 	sudo rm -f /usr/local/lib/$(PROJECT_NAME).*
 	sudo rm -rf /usr/local/include/kes
+ifneq ($(UNAME_S),Darwin)
 	sudo ldconfig
+endif
 
 # Documentation
 .PHONY: docs
@@ -481,6 +516,7 @@ clean:
 .PHONY: info
 info:
 	@echo "Build Configuration:"
+	@echo "  Platform: $(UNAME_S)"
 	@echo "  Project: $(PROJECT_NAME) $(VERSION)"
 	@echo "  Build Type: $(BUILD_TYPE)"
 	@echo "  Compiler: $(CC)"
