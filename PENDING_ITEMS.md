@@ -1122,6 +1122,110 @@ here, since this pass ran in an isolated worktree in parallel with
 other Track A (test expansion) work touching the same file; left for
 manual reconciliation at merge time.
 
+### macOS (Darwin/arm64) port -- Phases 0-5 of `plan_port.md` (DONE)
+
+**Executed on the actual target machine (MacBook Air, Apple Silicon,
+`arm64-apple-darwin25.6.0`, Apple clang via `cc`/`gcc`/`clang`), not
+inferred.** `plan_port.md` itself was blocked on `KES-2` through
+`KES-12` landing first (several touch the same files this port
+touches); by the time this pass started, KES-1 through KES-8 and
+KES-12 were all CLOSED and KES-9/10/11 were confirmed low-severity/
+deferred and non-blocking, so the plan's blocking condition was
+satisfied. Every fix below branches on `UNAME_S`/`#ifdef __APPLE__`
+(or is a platform-neutral bug fix, called out as such); the Linux
+build path was not restructured anywhere.
+
+- **`USER_SPACE` never defined for this repo's own `CFLAGS`** (found
+  during Phase 0/1, not in `plan_port.md`'s original blocker list):
+  `src/kes_bitmap.c` includes `kanek_foundations`'s `crc32c.h`, which
+  gates its type includes on `USER_SPACE` -- undefined, it falls
+  through to `<linux/types.h>`. This repo's `CFLAGS` never defined it,
+  so that fallback only ever compiled because glibc-based Linux
+  happens to expose `<linux/types.h>` in userspace; it doesn't exist
+  at all on Darwin. Fixed unconditionally (not a Darwin branch) --
+  commit `b28dc34`.
+- **`pthread_condattr_setclock()` doesn't exist on Darwin**
+  (`plan_port.md` §3.1, confirmed exactly as predicted): `src/
+  kes_cache.c`'s `bg_cond` setup falls back to plain
+  `pthread_cond_init()` + `CLOCK_REALTIME` on Darwin, reintroducing
+  the wall-clock-step exposure the original `CLOCK_MONOTONIC` choice
+  existed to avoid -- documented in-place so it isn't "fixed" back to
+  a call that doesn't exist there. Stale `_GNU_SOURCE` also stripped.
+  Commit `6905361`.
+- **Makefile `UNAME_S` platform split** (`plan_port.md` §3.2/3.4/3.5):
+  Darwin shared-lib naming/link flags (`.dylib`,
+  `-dynamiclib -install_name` in place of `-shared -Wl,-soname,...`,
+  confirmed Apple's `ld` rejects the latter outright), no `ldconfig`
+  in install/uninstall, `setarch $(uname -m) -R` (a WSL2-only
+  workaround) factored into a `TSAN_RUN_WRAPPER` variable that's a
+  no-op on Darwin. Commit `b00b159`.
+- **`tests/test_kes_multiprocess.c`'s unnamed process-shared
+  semaphores** (`plan_port.md` §3.3): macOS never implemented
+  `pshared=1` unnamed POSIX semaphores at all. Ported to named
+  `sem_open()`/`sem_close()`/`sem_unlink()`, keyed by `getpid()` to
+  avoid colliding with a leftover semaphore from an earlier crashed
+  run; turn-taking logic in `run_side()` untouched. Commit `a01e542`.
+- **`pthread_barrier_t` doesn't exist on Darwin at all** (new gap,
+  not anticipated by `plan_port.md`, found while building
+  `tests/test_kes_cache.c` in Phase 2): a minimal mutex/condvar/
+  generation-counter shim covers the file's one use site (the P0
+  duplicate-hash-entry race regression test). Commit `8d0aed9`.
+- **`tests/test_kes_fault_injection.c`'s 200GiB NOMEM case doesn't
+  reproduce on Darwin** (new gap, not anticipated by `plan_port.md`):
+  measured directly that `aligned_alloc()` succeeds there even at the
+  ~256TiB maximum size `block_count`/`block_size` (both `uint32_t`)
+  can represent -- macOS overcommits virtual memory with no observed
+  ceiling for any representable request. There is no size this test
+  can use to reach a genuine ENOMEM on this platform; actually forcing
+  physical commitment to provoke one would be slow and risks real
+  memory pressure on the test host. Skipped on Darwin with a
+  documented reason rather than forced; the `KES_ERROR_NOMEM` path
+  itself is therefore untested there. Commit `5ac31b5`.
+- **Real, non-platform-specific bug found by `make asan` on this
+  machine**: `kes_storage_get_stats()`'s fragmentation calculation did
+  `storage->stats.allocated_extents - 1` unconditionally once
+  `used_blocks > 0`. `allocated_extents` is a per-process, in-memory-
+  only counter that starts at 0 on every fresh `kes_storage_open()`
+  even when the on-disk `used_blocks` is already nonzero (from a prior
+  process/handle) -- exactly what `test_kes_crash_consistency`'s
+  reopen-durability case and `test_kes_multiprocess`'s racing-IO case
+  both legitimately do. The underflow to `UINT64_MAX`, times `100.0`,
+  overflowed the `uint64_t` cast -- real UBSan-confirmed undefined
+  behavior, reproducible on any platform once this state is reached,
+  not previously caught because no earlier `make asan` run apparently
+  exercised both of those cases together. Fixed by also requiring
+  `allocated_extents > 0`. Commit `82aedd4`.
+- **Verified clean, not assumed**: `make all`, `make test-core`,
+  `make test` (95/95 across all 12 binaries -- the total has grown
+  since the "93/93" figure elsewhere in this file/`AGENTS.md`; both
+  numbers should be re-verified independently rather than trusted
+  long-term), `make asan` (genuinely clean after the fragmentation
+  fix -- zero ASan/UBSan reports of any kind, not merely exit 0),
+  `make tsan` (genuinely clean -- zero TSan warnings; TSan on Apple
+  Silicon/this Xcode version turned out to need no workaround at all),
+  and `make check-all` (exits 0, "ALL CHECKS PASSED", Valgrind stage
+  correctly skipped with an explicit message) were all run to
+  completion on this machine with real pasted output, not inferred
+  from the fixes above "looking portable."
+- **Valgrind decision (Phase 4, repo-owner input per `plan_port.md`
+  §3.6/§4)**: skip the Valgrind stage entirely on Darwin -- Valgrind
+  has never shipped an Apple-Silicon build at all, and ASan's
+  LeakSanitizer (already exercised by `make asan`) covers the leak-
+  checking role it plays on Linux. `make valgrind` and `make
+  check-all`'s `[4/4]` stage both print an explicit skip message and
+  exit 0 on Darwin instead of failing on a missing binary; `help` text
+  updated to match. Commit `d08578f`.
+- **`make package`'s `tar --transform` gap** (`plan_port.md` §3.7,
+  picked up in this pass rather than deferred): macOS's bundled tar is
+  bsdtar, which has no `--transform`; bsdtar's own `-s` flag produces
+  an equivalent archive layout, verified directly. Commit `821c3f6`.
+- **Docs sync**: `AGENTS.md`'s "Ground truth" section and "Building
+  and Testing" section both updated with the above, evidence-first
+  (commit hashes, actual command output), matching this file's own
+  convention. `plan_port.md`'s own §7 bookkeeping updated in the same
+  pass -- see that file, not a summary repeated here, for its per-
+  phase "(DONE -- see commit ..., verified ... output ...)" notes.
+
 ---
 
 ## Phase 5 -- test expansion (P1/P2, PARTIALLY DONE)

@@ -1,26 +1,32 @@
 # macOS Port Work Plan
 
-**Status:** blocked, not started. This is an execution plan, not a
-status report — do not edit "done" language into this file casually;
-see §6 (bookkeeping) for how to mark items complete once verified.
+**Status: DONE — Phases 0-5 executed and verified on the actual
+target machine, see §7 for the per-phase bookkeeping.** This was an
+execution plan, not a status report while in progress; §7 below is
+now the record of what was actually done and re-verified, not a
+prediction.
 
-**Blocked on:** the open items in `PENDING_FIXES_SEP2026.md`
-(`KES-2` through `KES-12`; `KES-1` is already closed) are to be fixed
-on the primary development platform (Linux) first, before any of the
-work below starts. Rationale: several of those items touch the same
-files this plan touches (`src/kes_cache.c`, `src/kes_storage.c`,
-`tests/test_kes_multiprocess.c`) and fixing them first, on the
-platform where `make check-all` (ASan/TSan/Valgrind) already runs
-reliably, avoids doing this port's platform-specific work twice or
-against a moving target. **This plan should be expected to need
-rework once those fixes land** — new/changed error paths, struct
-fields, or test files from the `KES-*` fixes may shift exact line
-numbers and function shapes cited below, and may add new
-platform-portability surface of their own (e.g. any file-locking work
-for `KES-5` would need its own Darwin-vs-Linux check). Re-read
-`PENDING_FIXES_SEP2026.md`'s status before resuming this plan, and
-re-verify every citation below against the code as it exists then,
-not as captured here.
+**Was blocked on:** the open items in `PENDING_FIXES_SEP2026.md`
+(`KES-2` through `KES-12`; `KES-1` is already closed) landing on the
+primary development platform (Linux) first, before this work started.
+By the time this pass began, KES-1 through KES-8 and KES-12 were all
+CLOSED, and KES-9/10/11 were confirmed low-severity/deferred and not
+touching the cache/storage/multiprocess-test files this port touches
+in a way that would need rework — so the blocking condition below was
+satisfied.
+
+Original rationale for the block, kept for context: several of those
+items touch the same files this plan touches (`src/kes_cache.c`,
+`src/kes_storage.c`, `tests/test_kes_multiprocess.c`), and fixing them
+first, on the platform where `make check-all` (ASan/TSan/Valgrind)
+already ran reliably, avoided doing this port's platform-specific work
+twice or against a moving target. As anticipated, this plan did need
+some rework once those fixes landed and once real execution surfaced
+gaps neither the `KES-*` fixes nor this plan's original drafting had
+anticipated — see §7 for exactly what came up beyond the "Confirmed
+blockers" below (a `USER_SPACE`/`crc32c.h` compile blocker,
+`pthread_barrier_t`, the 200GiB `aligned_alloc()` NOMEM case, and one
+non-platform-specific UBSan-confirmed bug).
 
 **Audience:** any LLM coding agent or human picking up this port.
 Assume zero prior context beyond this repo: read `AGENTS.md` first
@@ -326,3 +332,64 @@ verified `<command>` output <date>)" note, same convention
 `PENDING_ITEMS.md` uses elsewhere in this repo. Do not mark anything
 done based on code review alone — every acceptance criterion above
 names a command whose actual output is the proof.
+
+**All phases DONE, 2026-09-11, on this plan's own target machine
+(MacBook Air, Apple Silicon, `arm64-apple-darwin25.6.0`).** Per-phase
+record:
+
+- **Phase 0 (Makefile platform split, §3.2/3.4/3.5)**: DONE — commit
+  `b00b159`. Verified: `make info` prints `Platform: Darwin` and sane
+  values; `make all` produces `build/libkes.1.0.0.dylib` via
+  `-dynamiclib -install_name` (Apple's `ld` confirmed to reject
+  `-shared -Wl,-soname,...` outright first). Linux path not touched
+  (no Linux machine available to re-verify directly here — every
+  change is `ifeq ($(UNAME_S),Darwin)`-gated, non-Darwin branches are
+  byte-for-byte what they were before).
+- **Phase 1 (compile, §3.1 + stale `_GNU_SOURCE`)**: DONE — commit
+  `6905361`. Also required an unplanned prerequisite fix, commit
+  `b28dc34` (`USER_SPACE` never defined for this repo's own `CFLAGS`,
+  so `src/kes_bitmap.c`'s `crc32c.h` include failed outright on
+  Darwin with "`linux/types.h` file not found" before Phase 1's own
+  blocker was even reached — not anticipated by §3/§4 above, found by
+  the first real `make all` attempt). Verified: `make all` and `make
+  test-core` (9/9) both green, pasted output captured during this
+  session.
+- **Phase 2 (full suite, §3.3)**: DONE — commit `a01e542`
+  (`test_kes_multiprocess.c` named-semaphore port). Two further
+  unplanned fixes surfaced only once every test binary actually built
+  and ran, neither anticipated by this plan: `pthread_barrier_t`
+  doesn't exist on Darwin at all (`tests/test_kes_cache.c`, commit
+  `8d0aed9`, a mutex/condvar shim), and the 200GiB `aligned_alloc()`
+  NOMEM case in `tests/test_kes_fault_injection.c` doesn't reproduce
+  on Darwin (measured up to the ~256TiB representable maximum — none
+  of it fails; commit `5ac31b5`, skipped with a documented reason
+  rather than forced). Verified: `make test` reaches **95/95** across
+  all 12 binaries (grown past the 93/93 this plan and `AGENTS.md`
+  cited at drafting time — re-verify the actual count going forward,
+  don't trust either number).
+- **Phase 3 (sanitizer parity)**: DONE, both green with no fixes
+  needed on the sanitizer/platform side — genuinely unknown going in,
+  per Ground rule 5, and turned out clean: `make asan` and `make tsan`
+  both ran to completion with zero ASan/UBSan/TSan reports of any kind
+  on Apple Silicon with this Xcode/clang version, no workaround
+  needed for either. One non-platform-specific bug was found along
+  the way by `make asan` reaching a state apparently not exercised by
+  prior sessions' runs — `kes_storage_get_stats()`'s
+  `allocated_extents - 1` underflow, a real UBSan-confirmed
+  undefined-behavior bug, unrelated to Darwin and reproducible on any
+  platform; fixed in commit `82aedd4`. Re-ran both `make asan` and
+  `make tsan` clean after that fix.
+- **Phase 4 (Valgrind decision, §3.6)**: DONE — commit `d08578f`.
+  Decision (repo owner, not a unilateral call): skip the Valgrind
+  stage entirely on Darwin; `make check-all` there means
+  normal+ASan+TSan only, relying on ASan's LeakSanitizer for the
+  leak-checking role Valgrind plays on Linux. Verified: `make
+  check-all` exits 0 with "ALL CHECKS PASSED" and the documented skip
+  message in its `[4/4]` slot.
+- **Phase 5 (docs/tracker sync)**: DONE. `AGENTS.md`'s "Ground truth"
+  and "Building and Testing" sections updated; `PENDING_ITEMS.md` got
+  a matching "macOS (Darwin/arm64) port" entry under `## Resolved`
+  citing every commit above. §3.7 (`make package`'s `tar --transform`
+  gap) was picked up here rather than deferred further — commit
+  `821c3f6` (bsdtar's `-s` flag), verified `make package` produces a
+  correctly-prefixed `libkes-1.0.0.tar.gz` on this machine.

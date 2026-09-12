@@ -165,6 +165,53 @@ sync with each other and with actual code as tasks complete — the same
 failure mode that made the old `docs/CONTINUATION_PROMPT.md`
 untrustworthy in the first place.
 
+**macOS (Darwin/arm64) is now a verified build target**, per
+`plan_port.md` (execution record, keep in sync alongside this file —
+see its own §7 bookkeeping). Verified directly on a MacBook Air,
+Apple Silicon, `arm64-apple-darwin25.6.0`, Apple clang via
+`cc`/`gcc`/`clang`: `make all`, `make test` (95/95 across all 12
+binaries — the total grew past the 93/93 figure cited above since
+Linux and Darwin are now both re-verified independently, re-check the
+actual count on either platform rather than trusting either number
+long-term), `make asan`, `make tsan`, and `make check-all` (normal +
+ASan + TSan; Valgrind has no Apple-Silicon build at all — see the
+`valgrind`/`check-all` targets' own comments in the Makefile —
+`check-all` on Darwin means these three stages, not four, by explicit
+repo-owner decision, not a silent gap) all pass cleanly. Real,
+platform-specific fixes were needed to get there (not just a Makefile
+branch): `pthread_condattr_setclock()` doesn't exist on Darwin
+(`src/kes_cache.c`'s background-thread condvar falls back to
+`CLOCK_REALTIME` there, reintroducing the wall-clock-step exposure
+the original `CLOCK_MONOTONIC` choice was written to avoid — see that
+function's comment); `pthread_barrier_t` doesn't exist on Darwin
+either (a small mutex/condvar shim in `tests/test_kes_cache.c` covers
+its one use site); macOS never implemented unnamed process-shared
+(`pshared=1`) POSIX semaphores at all
+(`tests/test_kes_multiprocess.c` uses named `sem_open()` semaphores
+instead); this repo's own `CFLAGS` never defined `USER_SPACE`, so
+`src/kes_bitmap.c`'s include of `kanek_foundations`'s `crc32c.h` only
+compiled by accident on glibc-based Linux (which happens to expose
+`<linux/types.h>` in userspace) — fixed unconditionally, not as a
+Darwin branch, since it was a latent bug on every non-glibc platform.
+One genuine, non-platform-specific bug was also found this way (not
+by hunting for one, but because `make asan` on this machine reached a
+state prior sessions' runs apparently hadn't):
+`kes_storage_get_stats()`'s fragmentation calculation underflowed
+`allocated_extents - 1` to `UINT64_MAX` whenever a freshly-reopened
+storage handle (that handle's own `allocated_extents` counter starts
+at 0, since it's in-memory-only and never persisted) had nonzero
+`used_blocks` reloaded from disk — real UBSan-confirmed undefined
+behavior on any platform, now fixed. One test-level platform gap is
+accepted, not fixed: `tests/test_kes_fault_injection.c`'s 200GiB
+`aligned_alloc()` NOMEM case is skipped on Darwin, because
+`aligned_alloc()` there overcommits virtual memory with no observed
+ceiling for any block_count/block_size combination the API can even
+express (confirmed up to the ~256TiB representable maximum) — the
+`KES_ERROR_NOMEM` code path itself is therefore untested on Darwin,
+documented rather than silently dropped. **Don't assume any of this
+stays true without rerunning it**, same standing warning as the rest
+of this section.
+
 ## `CODING_STYLE.md` is binding for all new/edited code
 
 `CODING_STYLE.md` (originally written for KFL) is now the style
@@ -276,6 +323,21 @@ test binary. In this WSL2 environment, TSan binaries must run under
 `setarch $(uname -m) -R` or they crash with an unrelated "unexpected
 memory mapping" error — the `tsan` target already does this, so use it
 rather than invoking a TSan-built test binary directly.
+
+**On macOS (Darwin)**, the Makefile detects this via
+`UNAME_S := $(shell uname -s)` and adjusts automatically, no manual
+flags needed: the shared library is `build/libkes.<ver>.dylib` (built
+with `-dynamiclib -install_name`, not `-shared -Wl,-soname,...`, which
+Apple's `ld` rejects outright); `install`/`uninstall` skip `ldconfig`
+(dyld has no such cache); the `setarch` wrapper above is a no-op
+(TSan binaries run directly, verified clean on Apple Silicon — no
+crash, no data races); and `make valgrind`/`check-all`'s Valgrind
+stage are skipped with an explicit message (Valgrind has no
+Apple-Silicon build at all — ASan's LeakSanitizer, via `make asan`,
+covers that role instead, repo-owner decision). `make package` uses
+bsdtar's `-s` flag in place of GNU tar's `--transform`. See
+`plan_port.md` for the full port writeup and evidence trail, and this
+file's "Ground truth" section above for what's been verified there.
 
 `make all`/`make asan`/`make tsan` first run `foundations-fetch`,
 which clones the sibling `kanek_foundations` (KFL) repo to
