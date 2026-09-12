@@ -335,8 +335,25 @@ soak:
 # Valgrind pass: independent leak/error checker on a plain (non-
 # sanitized) build -- ASan and Valgrind's instrumentation conflict,
 # so this always starts from a clean, unsanitized rebuild.
+#
+# Valgrind has never shipped an Apple-Silicon/arm64-macOS build at
+# all (confirmed: no binary, no Homebrew formula for this
+# architecture) -- this is a genuine, permanent platform gap, not a
+# missing install step. Decision (repo owner, macOS port): skip this
+# stage entirely on Darwin rather than substitute another tool: ASan's
+# LeakSanitizer (exercised by the "asan" target) already covers the
+# leak-checking role Valgrind plays on Linux. Darwin's check-all is
+# therefore normal+ASan+TSan only -- see AGENTS.md's Ground Truth
+# section for the same note.
 .PHONY: valgrind
 valgrind:
+ifeq ($(UNAME_S),Darwin)
+	@echo "valgrind: skipped on Darwin -- Valgrind has no Apple-" \
+	     "Silicon build (see this target's comment in the Makefile" \
+	     "and AGENTS.md's Ground Truth section). ASan's" \
+	     "LeakSanitizer ('make asan') covers the leak-checking role" \
+	     "Valgrind plays on Linux."
+else
 	$(MAKE) clean
 	$(MAKE) tests
 	@echo "Running tests under Valgrind..."
@@ -347,6 +364,7 @@ valgrind:
 		    --track-origins=yes \
 		    --suppressions=valgrind.supp $$test || exit 1; \
 	done
+endif
 
 # Single gate: normal build+tests, ASan, TSan, Valgrind, in sequence.
 # Any failing step aborts (non-zero exit) via make's default
@@ -361,8 +379,16 @@ check-all:
 	$(MAKE) asan
 	@echo "=== [3/4] TSan ==="
 	$(MAKE) tsan
+ifeq ($(UNAME_S),Darwin)
+	@echo "=== [4/4] Valgrind: SKIPPED on Darwin (no Apple-Silicon" \
+	     "build exists) -- ASan's LeakSanitizer above already" \
+	     "covers the leak-checking role Valgrind plays on Linux." \
+	     "check-all here means normal+ASan+TSan only; see AGENTS.md" \
+	     "Ground Truth section. ==="
+else
 	@echo "=== [4/4] Valgrind ==="
 	$(MAKE) valgrind
+endif
 	$(MAKE) clean
 	$(MAKE) all
 	@echo "check-all: ALL CHECKS PASSED"
@@ -565,8 +591,10 @@ help:
 	@echo "  asan          - Clean rebuild + run tests under ASan+UBSan"
 	@echo "  tsan          - Clean rebuild + run tests under TSan"
 	@echo "  sanitize-all  - asan + tsan, then a plain rebuild"
-	@echo "  valgrind      - Clean rebuild + run tests under Valgrind"
-	@echo "  check-all     - normal + asan + tsan + valgrind, gated"
+	@echo "  valgrind      - Clean rebuild + run tests under Valgrind" \
+	     "(skipped on Darwin -- no Apple-Silicon build exists)"
+	@echo "  check-all     - normal + asan + tsan + valgrind, gated" \
+	     "(Darwin: normal + asan + tsan only, valgrind skipped)"
 	@echo "  stress        - repeat test_kes_cache/test_kes_multiprocess" \
 	     "STRESS_RUNS times (default 100); SANITIZER=asan|tsan to" \
 	     "layer a sanitizer on top"
