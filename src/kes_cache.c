@@ -1,5 +1,3 @@
-#define _GNU_SOURCE  /* For aligned_alloc, clock_gettime */
-
 #include <kes/kes_cache.h>
 #include <stdlib.h>
 #include <string.h>
@@ -729,13 +727,28 @@ kes_cache_t *kes_cache_create( const kes_cache_config_t *config) {
      * early or absurdly late. Switch to CLOCK_MONOTONIC here, before
      * any timed wait is ever added, per
      * KES_HARDENING_PLAN.md S4.4 -- retrofitting this later would
-     * mean auditing every timed wait added in the meantime. */
+     * mean auditing every timed wait added in the meantime.
+     *
+     * Darwin has no pthread_condattr_setclock() at all -- there is no
+     * clock-selection mechanism for pthread_cond_t timed waits on
+     * that platform, so a timed wait is always relative to
+     * CLOCK_REALTIME there regardless of what is requested here. On
+     * Darwin this reintroduces the exact wall-clock-step exposure
+     * the CLOCK_MONOTONIC switch above exists to avoid; that is a
+     * known, accepted platform gap, not something to "fix" by
+     * re-adding a call that does not exist on that platform. The
+     * matching deadline computation in cache_bg_thread_func() below
+     * uses CLOCK_REALTIME to match on Darwin. */
     pthread_mutex_init( &cache->cache_lock, NULL);
+#ifdef __APPLE__
+    pthread_cond_init( &cache->bg_cond, NULL);
+#else
     pthread_condattr_t cond_attr;
     pthread_condattr_init( &cond_attr);
     pthread_condattr_setclock( &cond_attr, CLOCK_MONOTONIC);
     pthread_cond_init( &cache->bg_cond, &cond_attr);
     pthread_condattr_destroy( &cond_attr);
+#endif
 
     /* Initialize LRU list pointers */
     cache->mru_head = NULL;
@@ -1578,7 +1591,8 @@ int kes_cache_reset_stats( kes_cache_t *cache) {
  * Background thread loop: wakes every config.sync_interval_ms (or
  * on kes_cache_stop()'s broadcast) and runs the same sweep
  * kes_cache_sync() runs manually. See cache->cache_lock/bg_cond's
- * CLOCK_MONOTONIC setup in kes_cache_create().
+ * CLOCK_MONOTONIC setup in kes_cache_create() (CLOCK_REALTIME on
+ * Darwin -- see that function's comment for why).
  */
 static void *cache_bg_thread_func( void *arg) {
     kes_cache_t *cache = (kes_cache_t *)arg;
@@ -1588,7 +1602,11 @@ static void *cache_bg_thread_func( void *arg) {
     while ( !cache->shutdown) {
         struct timespec deadline;
 
+#ifdef __APPLE__
+        clock_gettime( CLOCK_REALTIME, &deadline);
+#else
         clock_gettime( CLOCK_MONOTONIC, &deadline);
+#endif
         deadline.tv_sec += cache->config.sync_interval_ms / 1000;
         deadline.tv_nsec +=
             (cache->config.sync_interval_ms % 1000) * 1000000L;
