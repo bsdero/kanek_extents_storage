@@ -53,18 +53,6 @@ static int make_storage( const char *path, kes_storage_t **out){
     return(kes_storage_create( &cfg, out));
 }
 
-/*
- * Turn-based IPC state shared between the parent and forked child via
- * an anonymous MAP_SHARED mapping. Only synchronization primitives
- * live here -- the payload each side writes to the extent is fully
- * deterministic from the step index (see build_step_payload()), so no
- * content needs to cross the shared-memory boundary, only turns.
- */
-typedef struct{
-    sem_t parent_turn;
-    sem_t child_turn;
-} sync_state_t;
-
 static void build_step_payload( int step, char *out, size_t out_size){
     memset( out, 0, out_size);
     snprintf( out, out_size, "step=%d writer=%s", step,
@@ -187,7 +175,28 @@ static bool test_kes_cross_process_sync_io(void){
         .block_count = EXTENT_BLOCKS, .alignment = 0,
         .hint_block = 0, .flags = 0,
     };
-    sync_state_t *sync_mem;
+    /* Turn-based IPC between the parent and forked child uses two
+     * *named* POSIX semaphores (sem_open()), not the unnamed,
+     * process-shared form (sem_init(..., pshared=1, ...) inside an
+     * anonymous MAP_SHARED mapping) this test used originally.
+     * Confirmed directly: macOS never implemented pshared=1 unnamed
+     * semaphores at all (sem_init() with a nonzero pshared argument
+     * fails outright there) -- a long-standing, well-documented
+     * platform gap, not a missing header/flag. Named semaphores are
+     * kernel-managed by name rather than by shared memory location,
+     * so no mmap()/MAP_SHARED region is needed for them; per-PID
+     * names avoid colliding with a leftover semaphore from an earlier
+     * crashed run (e.g. under `make stress`, which re-runs this
+     * binary many times), and sem_unlink() before sem_open()
+     * defensively clears any such leftover before creating a fresh
+     * one. Semaphore descriptors returned by sem_open() before
+     * fork() are shared with (not merely copied to) the child per
+     * POSIX, so both processes coordinate through the same two
+     * semaphores exactly as the original mmap-based design did. */
+    char parent_sem_name[64];
+    char child_sem_name[64];
+    sem_t *parent_turn;
+    sem_t *child_turn;
     pid_t pid;
     int status;
     bool parent_ok;
@@ -205,13 +214,19 @@ static bool test_kes_cross_process_sync_io(void){
                 "storage closed before fork");
     storage = NULL;
 
-    sync_mem = mmap( NULL, sizeof( sync_state_t), PROT_READ | PROT_WRITE,
-                      MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    TEST_ASSERT( sync_mem != MAP_FAILED, "shared memory mapped");
-    TEST_ASSERT( sem_init( &sync_mem->parent_turn, 1, 1) == 0,
-                "parent_turn semaphore initialized");
-    TEST_ASSERT( sem_init( &sync_mem->child_turn, 1, 0) == 0,
-                "child_turn semaphore initialized");
+    snprintf( parent_sem_name, sizeof( parent_sem_name),
+              "/kes_mp_parent_%d", (int)getpid());
+    snprintf( child_sem_name, sizeof( child_sem_name),
+              "/kes_mp_child_%d", (int)getpid());
+    sem_unlink( parent_sem_name);
+    sem_unlink( child_sem_name);
+
+    parent_turn = sem_open( parent_sem_name, O_CREAT | O_EXCL, 0600, 1);
+    TEST_ASSERT( parent_turn != SEM_FAILED,
+                "parent_turn semaphore created");
+    child_turn = sem_open( child_sem_name, O_CREAT | O_EXCL, 0600, 0);
+    TEST_ASSERT( child_turn != SEM_FAILED,
+                "child_turn semaphore created");
 
     pid = fork();
     TEST_ASSERT( pid >= 0, "fork succeeded");
@@ -226,9 +241,10 @@ static bool test_kes_cross_process_sync_io(void){
             _exit( 1);
         }
         child_ok = run_side( child_storage, &extent,
-                              &sync_mem->child_turn,
-                              &sync_mem->parent_turn, false);
+                              child_turn, parent_turn, false);
         kes_storage_close( child_storage);
+        sem_close( parent_turn);
+        sem_close( child_turn);
         _exit( child_ok ? 0 : 1);
     }
 
@@ -236,8 +252,8 @@ static bool test_kes_cross_process_sync_io(void){
         kes_storage_open( TEST_FILE, 0, &storage) == KES_SUCCESS,
         "parent re-opened storage independently after fork");
 
-    parent_ok = run_side( storage, &extent, &sync_mem->parent_turn,
-                           &sync_mem->child_turn, true);
+    parent_ok = run_side( storage, &extent, parent_turn,
+                           child_turn, true);
 
     kes_storage_close( storage);
 
@@ -248,9 +264,10 @@ static bool test_kes_cross_process_sync_io(void){
     TEST_ASSERT( parent_ok, "parent side completed its steps without "
                 "mismatch");
 
-    sem_destroy( &sync_mem->parent_turn);
-    sem_destroy( &sync_mem->child_turn);
-    munmap( sync_mem, sizeof( sync_state_t));
+    sem_close( parent_turn);
+    sem_close( child_turn);
+    sem_unlink( parent_sem_name);
+    sem_unlink( child_sem_name);
     cleanup();
 
     TEST_SUCCESS( "cross-process synchronized extent read/write "
