@@ -727,8 +727,21 @@ int kes_storage_get_stats( kes_storage_t *storage,
     stats->free_blocks = storage->desc.free_blocks;
     stats->used_blocks = storage->desc.used_blocks;
 
-    /* Calculate fragmentation (simplified) */
-    if ( stats->used_blocks > 0) {
+    /* Calculate fragmentation (simplified). allocated_extents is a
+     * per-process, in-memory-only counter (incremented/decremented by
+     * this handle's own kes_extent_allocate()/kes_extent_free()
+     * calls, never persisted or reloaded from disk) -- a freshly
+     * kes_storage_open()'d handle starts it at 0 even when
+     * used_blocks (reloaded from the on-disk descriptor) is already
+     * nonzero from allocations made through a different handle or a
+     * prior process. Without this guard, allocated_extents == 0 made
+     * "- 1" wrap to UINT64_MAX, and 100.0 * UINT64_MAX overflowed the
+     * uint64_t cast below -- real, UBSan-confirmed undefined behavior
+     * (caught by test_kes_crash_consistency's reopen-durability case
+     * and test_kes_multiprocess's racing-IO case, both of which
+     * legitimately reach this exact state). */
+    if ( stats->used_blocks > 0 &&
+         storage->stats.allocated_extents > 0) {
         stats->fragmentation =
             (uint64_t)(100.0 * (storage->stats.allocated_extents - 1) /
                       stats->used_blocks);
