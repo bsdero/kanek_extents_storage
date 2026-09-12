@@ -38,8 +38,20 @@ FOUNDATIONS_CFLAGS = -Wall -DUSER_SPACE -g -fPIC
 FOUNDATIONS_LDFLAGS = -L. -lkfl -rdynamic -lpthread
 
 # Compiler and flags
+#
+# -DUSER_SPACE matches kanek_foundations' own FOUNDATIONS_CFLAGS above:
+# crc32c.h (included by src/kes_bitmap.c for the kfl_crc32c() prototype)
+# gates its type includes on USER_SPACE -- defined, it pulls in
+# <stdint.h>/<stddef.h>; undefined, it falls through to the
+# kernel-only <linux/types.h>/<linux/string.h>. Without this flag
+# here, that fallback path only happened to compile on Linux because
+# glibc-based distros ship linux/types.h as a userspace-visible
+# header; it has no equivalent on any other platform (confirmed: it
+# does not exist on Darwin). This is a real latent bug, not a
+# Darwin-only concern, so it is fixed unconditionally rather than
+# behind a uname -s branch.
 CC = gcc
-CFLAGS = -std=c99 -Wall -Wextra -Werror -fPIC
+CFLAGS = -std=c99 -Wall -Wextra -Werror -fPIC -DUSER_SPACE
 LDFLAGS =
 LIBS = -lpthread
 
